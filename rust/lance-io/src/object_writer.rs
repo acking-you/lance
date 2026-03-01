@@ -577,6 +577,15 @@ impl Writer for LocalWriter {
         })?;
         let path_clone = self.path.clone();
         let e_tag = tokio::task::spawn_blocking(move || -> Result<String> {
+            // Get metadata BEFORE persist (rename) — on WSL2 9p/drvfs mounts,
+            // fstat on the destination path fails with ENOENT after rename().
+            let metadata = std::fs::metadata(temp_path.as_ref() as &std::path::Path).map_err(|e| {
+                Error::io(
+                    format!("failed to read metadata for {}: {}", path_clone, e),
+                    location!(),
+                )
+            })?;
+
             temp_path.persist(&final_path).map_err(|e| {
                 Error::io(
                     format!("failed to persist temp file to {}: {}", final_path, e.error),
@@ -584,12 +593,6 @@ impl Writer for LocalWriter {
                 )
             })?;
 
-            let metadata = std::fs::metadata(&final_path).map_err(|e| {
-                Error::io(
-                    format!("failed to read metadata for {}: {}", path_clone, e),
-                    location!(),
-                )
-            })?;
             Ok(get_etag(&metadata))
         })
         .await
