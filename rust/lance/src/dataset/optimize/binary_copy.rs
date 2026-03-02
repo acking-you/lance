@@ -518,10 +518,10 @@ async fn flush_footer(
                 let encoded_encoding = match &page_info.encoding {
                     PageEncoding::Legacy(array_encoding) => {
                         Any::from_msg(array_encoding)?.encode_to_vec()
-                    }
+                    },
                     PageEncoding::Structural(page_layout) => {
                         Any::from_msg(page_layout)?.encode_to_vec()
-                    }
+                    },
                 };
                 let (buffer_offsets, buffer_sizes): (Vec<_>, Vec<_>) = page_info
                     .buffer_offsets_and_sizes
@@ -534,9 +534,7 @@ async fn flush_footer(
                     buffer_sizes,
                     encoding: Some(pbfile::Encoding {
                         location: Some(pbfile::encoding::Location::Direct(
-                            pbfile::DirectEncoding {
-                                encoding: encoded_encoding,
-                            },
+                            pbfile::DirectEncoding { encoding: encoded_encoding },
                         )),
                     }),
                     length: page_info.num_rows,
@@ -561,10 +559,7 @@ async fn flush_footer(
     }
     let mut file_writer = FileWriter::new_lazy(
         writer,
-        FileWriterOptions {
-            format_version: Some(version),
-            ..Default::default()
-        },
+        FileWriterOptions { format_version: Some(version), ..Default::default() },
     );
     file_writer.initialize_with_external_metadata(
         schema.clone(),

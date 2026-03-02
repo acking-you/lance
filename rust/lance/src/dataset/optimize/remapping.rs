@@ -170,12 +170,8 @@ pub fn transpose_row_ids_from_digest(
     new_fragments: &[FragDigest],
 ) -> HashMap<u64, Option<u64>> {
     let new_addrs = new_fragments.iter().flat_map(|frag| {
-        (0..frag.physical_rows as u32).map(|offset| {
-            Some(u64::from(RowAddress::new_from_parts(
-                frag.id as u32,
-                offset,
-            )))
-        })
+        (0..frag.physical_rows as u32)
+            .map(|offset| Some(u64::from(RowAddress::new_from_parts(frag.id as u32, offset))))
     });
     // The hashmap will have an entry for each row addr to map plus all rows that
     // were deleted.
@@ -263,7 +259,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
                     }
                 }
                 (should_remap, Some(index_frag_bitmap))
-            }
+            },
             // if there is no fragment bitmap for the index,
             // we attempt remapping but will not update the fragment bitmap.
             None => (true, None),
@@ -348,7 +344,7 @@ pub async fn remap_column_index(
                 message: format!("Index with name {} not found", index_name),
                 location: location!(),
             });
-        }
+        },
         Some(index) => {
             if index.fields != [field.id] {
                 Err(Error::Index {
@@ -361,7 +357,7 @@ pub async fn remap_column_index(
             } else {
                 Ok(index)
             }
-        }
+        },
     }?;
 
     remap_index(dataset, &index.uuid).await
@@ -376,16 +372,8 @@ mod tests {
         // Sanity test to make sure MissingIds works.  Does not test actual functionality so
         // feel free to remove if it becomes inconvenient
         let frags = vec![
-            FragDigest {
-                id: 0,
-                physical_rows: 5,
-                num_deleted_rows: 0,
-            },
-            FragDigest {
-                id: 3,
-                physical_rows: 3,
-                num_deleted_rows: 0,
-            },
+            FragDigest { id: 0, physical_rows: 5, num_deleted_rows: 0 },
+            FragDigest { id: 3, physical_rows: 3, num_deleted_rows: 0 },
         ];
         let rows = [(0, 1), (0, 3), (0, 4), (3, 0), (3, 2)]
             .into_iter()
@@ -406,34 +394,13 @@ mod tests {
         // test fragment ids out of order
 
         let fragments = vec![
-            FragDigest {
-                id: 0,
-                physical_rows: 5,
-                num_deleted_rows: 0,
-            },
-            FragDigest {
-                id: 3,
-                physical_rows: 3,
-                num_deleted_rows: 0,
-            },
-            FragDigest {
-                id: 1,
-                physical_rows: 3,
-                num_deleted_rows: 0,
-            },
+            FragDigest { id: 0, physical_rows: 5, num_deleted_rows: 0 },
+            FragDigest { id: 3, physical_rows: 3, num_deleted_rows: 0 },
+            FragDigest { id: 1, physical_rows: 3, num_deleted_rows: 0 },
         ];
 
         // Written as pairs of (fragment_id, offset)
-        let row_addrs = vec![
-            (0, 1),
-            (0, 3),
-            (0, 4),
-            (3, 0),
-            (3, 2),
-            (1, 0),
-            (1, 1),
-            (1, 2),
-        ];
+        let row_addrs = vec![(0, 1), (0, 3), (0, 4), (3, 0), (3, 2), (1, 0), (1, 1), (1, 2)];
         let row_addrs = row_addrs
             .into_iter()
             .map(|(frag, offset)| RowAddress::new_from_parts(frag, offset).into());

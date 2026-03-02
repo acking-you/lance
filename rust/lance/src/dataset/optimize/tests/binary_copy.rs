@@ -38,10 +38,7 @@ async fn do_test_binary_copy_merge_small_files(version: LanceFileVersion) {
     };
     let metrics = compact_files(&mut dataset, options, None).await.unwrap();
     assert!(metrics.fragments_added >= 1);
-    assert_eq!(
-        dataset.count_rows(None).await.unwrap() as usize,
-        before.num_rows()
-    );
+    assert_eq!(dataset.count_rows(None).await.unwrap() as usize, before.num_rows());
     let after = dataset.scan().try_into_batch().await.unwrap();
     assert_eq!(before, after);
 }
@@ -86,10 +83,7 @@ async fn do_test_binary_copy_with_defer_remap(version: LanceFileVersion) {
         .col("i", array::step::<Int32Type>())
         .col("meta", array::rand_struct(meta_fields))
         .col("nested", array::rand_struct(nested_fields))
-        .col(
-            "events",
-            array::rand_list_any(array::rand_struct(event_fields), true),
-        )
+        .col("events", array::rand_list_any(array::rand_struct(event_fields), true))
         .into_reader_rows(RowCount::from(6_000), BatchCount::from(1));
 
     let mut dataset = Dataset::write(
@@ -129,9 +123,7 @@ async fn test_binary_copy_preserves_stable_row_ids() {
 async fn do_binary_copy_preserves_stable_row_ids(version: LanceFileVersion) {
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
     let mut data_gen = BatchGenerator::new()
-        .col(Box::new(
-            RandomVector::new().vec_width(8).named("vec".to_owned()),
-        ))
+        .col(Box::new(RandomVector::new().vec_width(8).named("vec".to_owned())))
         .col(Box::new(IncrementingInt32::new().named("i".to_owned())));
 
     let mut dataset = Dataset::write(
@@ -159,13 +151,7 @@ async fn do_binary_copy_preserves_stable_row_ids(version: LanceFileVersion) {
         .unwrap();
     let params = VectorIndexParams::ivf_pq(1, 8, 1, MetricType::L2, 50);
     dataset
-        .create_index(
-            &["vec"],
-            IndexType::Vector,
-            Some("vector".into()),
-            &params,
-            false,
-        )
+        .create_index(&["vec"], IndexType::Vector, Some("vector".into()), &params, false)
         .await
         .unwrap();
 
@@ -262,9 +248,7 @@ async fn test_binary_copy_remaps_unstable_row_ids() {
 
 async fn do_binary_copy_remaps_unstable_row_ids(version: LanceFileVersion) {
     let mut data_gen = BatchGenerator::new()
-        .col(Box::new(
-            RandomVector::new().vec_width(8).named("vec".to_owned()),
-        ))
+        .col(Box::new(RandomVector::new().vec_width(8).named("vec".to_owned())))
         .col(Box::new(IncrementingInt32::new().named("i".to_owned())));
 
     let mut dataset = Dataset::write(
@@ -292,13 +276,7 @@ async fn do_binary_copy_remaps_unstable_row_ids(version: LanceFileVersion) {
         .unwrap();
     let params = VectorIndexParams::ivf_pq(1, 8, 1, MetricType::L2, 50);
     dataset
-        .create_index(
-            &["vec"],
-            IndexType::Vector,
-            Some("vector".into()),
-            &params,
-            false,
-        )
+        .create_index(&["vec"], IndexType::Vector, Some("vector".into()), &params, false)
         .await
         .unwrap();
 
@@ -376,13 +354,7 @@ async fn test_binary_copy_preserves_zonemap_queries() {
 
     let zonemap_params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
     dataset
-        .create_index(
-            &["a"],
-            IndexType::Scalar,
-            Some("zonemap".into()),
-            &zonemap_params,
-            false,
-        )
+        .create_index(&["a"], IndexType::Scalar, Some("zonemap".into()), &zonemap_params, false)
         .await
         .unwrap();
 
@@ -439,19 +411,10 @@ async fn test_binary_copy_preserves_bloom_filter_queries() {
         number_of_items: u64,
         probability: f64,
     }
-    let bloom_params =
-        ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter).with_params(&BloomParams {
-            number_of_items: 500,
-            probability: 0.01,
-        });
+    let bloom_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter)
+        .with_params(&BloomParams { number_of_items: 500, probability: 0.01 });
     dataset
-        .create_index(
-            &["val"],
-            IndexType::Scalar,
-            Some("bloom".into()),
-            &bloom_params,
-            false,
-        )
+        .create_index(&["val"], IndexType::Scalar, Some("bloom".into()), &bloom_params, false)
         .await
         .unwrap();
 
@@ -489,10 +452,7 @@ async fn test_binary_copy_fallback_to_common_compaction() {
     let test_uri = &test_dir;
     let data = sample_data();
     let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
-    let write_params = WriteParams {
-        max_rows_per_file: 500,
-        ..Default::default()
-    };
+    let write_params = WriteParams { max_rows_per_file: 500, ..Default::default() };
     let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
         .await
         .unwrap();
@@ -526,10 +486,7 @@ async fn test_can_use_binary_copy_schema_consistency_ok() {
     let data = sample_data();
     let reader1 = RecordBatchIterator::new(vec![Ok(data.slice(0, 5_000))], data.schema());
     let reader2 = RecordBatchIterator::new(vec![Ok(data.slice(5_000, 5_000))], data.schema());
-    let write_params = WriteParams {
-        max_rows_per_file: 1_000,
-        ..Default::default()
-    };
+    let write_params = WriteParams { max_rows_per_file: 1_000, ..Default::default() };
     let mut dataset = Dataset::write(reader1, test_uri, Some(write_params.clone()))
         .await
         .unwrap();
@@ -554,18 +511,12 @@ async fn test_can_use_binary_copy_schema_mismatch() {
     let test_uri = &test_dir;
     let data = sample_data();
     let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
-    let write_params = WriteParams {
-        max_rows_per_file: 1_000,
-        ..Default::default()
-    };
+    let write_params = WriteParams { max_rows_per_file: 1_000, ..Default::default() };
     let dataset = Dataset::write(reader, test_uri, Some(write_params))
         .await
         .unwrap();
 
-    let options = CompactionOptions {
-        enable_binary_copy: true,
-        ..Default::default()
-    };
+    let options = CompactionOptions { enable_binary_copy: true, ..Default::default() };
     let mut frags: Vec<Fragment> = dataset
         .get_fragments()
         .into_iter()
@@ -607,19 +558,13 @@ async fn test_can_use_binary_copy_version_mismatch() {
     let reader_append = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
     dataset.append(reader_append, None).await.unwrap();
 
-    let options = CompactionOptions {
-        enable_binary_copy: true,
-        ..Default::default()
-    };
+    let options = CompactionOptions { enable_binary_copy: true, ..Default::default() };
     let mut frags: Vec<Fragment> = dataset
         .get_fragments()
         .into_iter()
         .map(Into::into)
         .collect();
-    assert!(
-        frags.len() >= 2,
-        "expected multiple fragments for version mismatch test"
-    );
+    assert!(frags.len() >= 2, "expected multiple fragments for version mismatch test");
 
     // Simulate mixed file versions by marking the second fragment as v2.1.
     let (v21_major, v21_minor) = LanceFileVersion::V2_1.to_numbers();
@@ -637,19 +582,13 @@ async fn test_can_use_binary_copy_reject_deletions() {
     let test_uri = &test_dir;
     let data = sample_data();
     let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
-    let write_params = WriteParams {
-        max_rows_per_file: 1_000,
-        ..Default::default()
-    };
+    let write_params = WriteParams { max_rows_per_file: 1_000, ..Default::default() };
     let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
         .await
         .unwrap();
     dataset.delete("a < 10").await.unwrap();
 
-    let options = CompactionOptions {
-        enable_binary_copy: true,
-        ..Default::default()
-    };
+    let options = CompactionOptions { enable_binary_copy: true, ..Default::default() };
     let frags: Vec<Fragment> = dataset
         .get_fragments()
         .into_iter()
@@ -696,23 +635,11 @@ async fn do_test_binary_copy_compaction_with_complex_schema(version: LanceFileVe
         .col("bool", array::cycle_bool(vec![false, true]))
         .col("date32", array::rand_date32())
         .col("date64", array::rand_date64())
-        .col(
-            "ts_ms",
-            array::rand_timestamp(&DataType::Timestamp(TimeUnit::Millisecond, None)),
-        )
-        .col(
-            "utf8",
-            array::rand_utf8(lance_datagen::ByteCount::from(16), false),
-        )
+        .col("ts_ms", array::rand_timestamp(&DataType::Timestamp(TimeUnit::Millisecond, None)))
+        .col("utf8", array::rand_utf8(lance_datagen::ByteCount::from(16), false))
         .col("large_utf8", array::random_sentence(1, 6, true))
-        .col(
-            "bin",
-            array::rand_fixedbin(lance_datagen::ByteCount::from(24), false),
-        )
-        .col(
-            "large_bin",
-            array::rand_fixedbin(lance_datagen::ByteCount::from(24), true),
-        )
+        .col("bin", array::rand_fixedbin(lance_datagen::ByteCount::from(24), false))
+        .col("large_bin", array::rand_fixedbin(lance_datagen::ByteCount::from(24), true))
         .col(
             "varbin",
             array::rand_varbin(
@@ -721,16 +648,10 @@ async fn do_test_binary_copy_compaction_with_complex_schema(version: LanceFileVe
             ),
         )
         .col("fsb16", array::rand_fsb(16))
-        .col(
-            "fsl4",
-            array::cycle_vec(array::rand::<Float32Type>(), Dimension::from(4)),
-        )
+        .col("fsl4", array::cycle_vec(array::rand::<Float32Type>(), Dimension::from(4)))
         .col("struct_simple", array::rand_struct(inner_fields.clone()))
         .col("struct_nested", array::rand_struct(nested_fields))
-        .col(
-            "events",
-            array::rand_list_any(array::rand_struct(event_fields.clone()), true),
-        )
+        .col("events", array::rand_list_any(array::rand_struct(event_fields.clone()), true))
         .into_reader_rows(RowCount::from(row_num), BatchCount::from(10));
 
     let full_dir = TempStrDir::default();
@@ -747,10 +668,7 @@ async fn do_test_binary_copy_compaction_with_complex_schema(version: LanceFileVe
     .await
     .unwrap();
 
-    let opt_full = CompactionOptions {
-        enable_binary_copy: false,
-        ..Default::default()
-    };
+    let opt_full = CompactionOptions { enable_binary_copy: false, ..Default::default() };
     let opt_binary = CompactionOptions {
         enable_binary_copy: true,
         enable_binary_copy_force: true,

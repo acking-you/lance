@@ -133,11 +133,8 @@ impl BlobPreprocessor {
         data_file_key: String,
         schema: &lance_core::datatypes::Schema,
     ) -> Self {
-        let pack_writer = PackWriter::new(
-            object_store.clone(),
-            data_dir.clone(),
-            data_file_key.clone(),
-        );
+        let pack_writer =
+            PackWriter::new(object_store.clone(), data_dir.clone(), data_file_key.clone());
         let arrow_schema = arrow_schema::Schema::from(schema);
         let fields = arrow_schema.fields();
         let blob_v2_cols = fields.iter().map(|field| field.is_blob_v2()).collect();
@@ -223,6 +220,23 @@ impl BlobPreprocessor {
                 .ok_or_else(|| {
                     Error::invalid_input("Blob column was not a struct array", location!())
                 })?;
+
+            // Passthrough: batch already in 6-field preprocessor format
+            // (from compaction descriptor_to_preprocessor_batch), skip reprocessing.
+            if struct_arr.column_by_name("kind").is_some()
+                && struct_arr.column_by_name("blob_size").is_some()
+            {
+                new_columns.push(array.clone());
+                new_fields.push(Arc::new(
+                    arrow_schema::Field::new(
+                        field.name(),
+                        array.data_type().clone(),
+                        field.is_nullable(),
+                    )
+                    .with_metadata(self.writer_metadata[idx].clone()),
+                ));
+                continue;
+            }
 
             let data_col = struct_arr
                 .column_by_name("data")
@@ -414,6 +428,275 @@ pub async fn preprocess_blob_batches(
     Ok(out)
 }
 
+/// One sidecar .blob file that needs to be copied during compaction.
+#[derive(Debug, Clone)]
+pub struct SidecarCopyEntry {
+    pub old_data_file_key: String,
+    pub old_blob_id: u32,
+    pub new_blob_id: u32,
+}
+
+/// Convert a scanner `BlobsDescriptions` batch (5-field descriptor per blob column)
+/// into the 6-field preprocessor format that `BlobPreprocessor` normally produces.
+///
+/// For **Inline** blobs the raw data is read back from the source `.lance` file
+/// via `object_store.get_range()`.  For **Dedicated**/**Packed** blobs a
+/// `SidecarCopyEntry` is recorded so the caller can copy the sidecar `.blob`
+/// file.  **External** blobs are passed through unchanged.
+pub async fn descriptor_to_preprocessor_batch(
+    batch: &RecordBatch,
+    schema: &lance_core::datatypes::Schema,
+    blob_id_counter: &std::sync::atomic::AtomicU32,
+    object_store: &ObjectStore,
+    _source_data_file_key: &str,
+    source_data_file_path: &Path,
+) -> Result<(RecordBatch, Vec<SidecarCopyEntry>)> {
+    let mut sidecar_copies = Vec::new();
+    let mut new_columns: Vec<Arc<dyn arrow_array::Array>> = Vec::with_capacity(batch.num_columns());
+    let mut new_fields: Vec<arrow_schema::FieldRef> = Vec::with_capacity(batch.num_columns());
+
+    let batch_schema = batch.schema();
+    let batch_fields = batch_schema.fields();
+
+    // Build a set of blob column names from the Lance schema
+    let blob_col_names: std::collections::HashSet<&str> = schema
+        .fields
+        .iter()
+        .filter(|f| f.is_blob_v2())
+        .map(|f| f.name.as_str())
+        .collect();
+
+    for idx in 0..batch.num_columns() {
+        let array = batch.column(idx);
+        let field = &batch_fields[idx];
+
+        if !blob_col_names.contains(field.name().as_str()) {
+            // Non-blob column: pass through
+            new_columns.push(array.clone());
+            new_fields.push(field.clone());
+            continue;
+        }
+
+        // Blob column: 5-field descriptor struct → 6-field preprocessor struct
+        let struct_arr = array
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| {
+                Error::invalid_input("Blob column was not a struct array", location!())
+            })?;
+
+        // Extract the 5 descriptor columns (order from BLOB_V2_DESC_FIELDS)
+        let kind_col = struct_arr.column(0).as_primitive::<UInt8Type>();
+        let position_col = struct_arr.column(1).as_primitive::<UInt64Type>();
+        let size_col = struct_arr.column(2).as_primitive::<UInt64Type>();
+        let blob_id_col = struct_arr.column(3).as_primitive::<UInt32Type>();
+        let blob_uri_col = struct_arr.column(4).as_string::<i32>();
+
+        let n = struct_arr.len();
+        let mut kind_builder = PrimitiveBuilder::<UInt8Type>::with_capacity(n);
+        let mut data_builder = LargeBinaryBuilder::with_capacity(n, 0);
+        let mut uri_builder = StringBuilder::with_capacity(n, 0);
+        let mut new_blob_id_builder =
+            PrimitiveBuilder::<arrow_array::types::UInt32Type>::with_capacity(n);
+        let mut blob_size_builder =
+            PrimitiveBuilder::<arrow_array::types::UInt64Type>::with_capacity(n);
+        let mut new_position_builder =
+            PrimitiveBuilder::<arrow_array::types::UInt64Type>::with_capacity(n);
+
+        let struct_nulls = struct_arr.nulls();
+
+        for i in 0..n {
+            if struct_arr.is_null(i) {
+                kind_builder.append_null();
+                data_builder.append_null();
+                uri_builder.append_null();
+                new_blob_id_builder.append_null();
+                blob_size_builder.append_null();
+                new_position_builder.append_null();
+                continue;
+            }
+
+            let kind_val = kind_col.value(i);
+            let kind = BlobKind::try_from(kind_val)?;
+            let size = size_col.value(i);
+
+            match kind {
+                BlobKind::Inline => {
+                    // Read the actual data from the old .lance file
+                    let position = position_col.value(i);
+
+                    // Zero position + zero size = null row sentinel
+                    if position == 0 && size == 0 {
+                        kind_builder.append_null();
+                        data_builder.append_null();
+                        uri_builder.append_null();
+                        new_blob_id_builder.append_null();
+                        blob_size_builder.append_null();
+                        new_position_builder.append_null();
+                        continue;
+                    }
+
+                    let data = object_store
+                        .inner
+                        .get_range(source_data_file_path, position..(position + size))
+                        .await
+                        .map_err(|e| Error::IO { source: Box::new(e), location: location!() })?;
+
+                    kind_builder.append_value(BlobKind::Inline as u8);
+                    data_builder.append_value(&data);
+                    uri_builder.append_null();
+                    new_blob_id_builder.append_value(0);
+                    blob_size_builder.append_value(size);
+                    new_position_builder.append_null(); // encoder recalculates
+                },
+                BlobKind::Packed => {
+                    // Fallback: treat as Dedicated for sidecar copy
+                    let old_blob_id = blob_id_col.value(i);
+                    let new_id = blob_id_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    sidecar_copies.push(SidecarCopyEntry {
+                        old_data_file_key: _source_data_file_key.to_string(),
+                        old_blob_id,
+                        new_blob_id: new_id,
+                    });
+
+                    kind_builder.append_value(BlobKind::Packed as u8);
+                    data_builder.append_null();
+                    uri_builder.append_null();
+                    new_blob_id_builder.append_value(new_id);
+                    blob_size_builder.append_value(size);
+                    new_position_builder.append_value(position_col.value(i));
+                },
+                BlobKind::Dedicated => {
+                    let old_blob_id = blob_id_col.value(i);
+                    let new_id = blob_id_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    sidecar_copies.push(SidecarCopyEntry {
+                        old_data_file_key: _source_data_file_key.to_string(),
+                        old_blob_id,
+                        new_blob_id: new_id,
+                    });
+
+                    kind_builder.append_value(BlobKind::Dedicated as u8);
+                    data_builder.append_null();
+                    uri_builder.append_null();
+                    new_blob_id_builder.append_value(new_id);
+                    blob_size_builder.append_value(size);
+                    new_position_builder.append_null();
+                },
+                BlobKind::External => {
+                    let uri_val = blob_uri_col.value(i);
+                    kind_builder.append_value(BlobKind::External as u8);
+                    data_builder.append_null();
+                    if uri_val.is_empty() {
+                        uri_builder.append_null();
+                    } else {
+                        uri_builder.append_value(uri_val);
+                    }
+                    new_blob_id_builder.append_value(0);
+                    blob_size_builder.append_value(size);
+                    new_position_builder.append_value(position_col.value(i));
+                },
+            }
+        }
+
+        let child_fields = vec![
+            arrow_schema::Field::new("kind", ArrowDataType::UInt8, true),
+            arrow_schema::Field::new("data", ArrowDataType::LargeBinary, true),
+            arrow_schema::Field::new("uri", ArrowDataType::Utf8, true),
+            arrow_schema::Field::new("blob_id", ArrowDataType::UInt32, true),
+            arrow_schema::Field::new("blob_size", ArrowDataType::UInt64, true),
+            arrow_schema::Field::new("position", ArrowDataType::UInt64, true),
+        ];
+
+        let struct_array = StructArray::try_new(
+            child_fields.clone().into(),
+            vec![
+                Arc::new(kind_builder.finish()),
+                Arc::new(data_builder.finish()),
+                Arc::new(uri_builder.finish()),
+                Arc::new(new_blob_id_builder.finish()),
+                Arc::new(blob_size_builder.finish()),
+                Arc::new(new_position_builder.finish()),
+            ],
+            struct_nulls.cloned(),
+        )?;
+
+        // Preserve the original field metadata (contains ARROW_EXT_NAME_KEY)
+        let original_metadata = field.metadata().clone();
+        new_columns.push(Arc::new(struct_array));
+        new_fields.push(Arc::new(
+            arrow_schema::Field::new(
+                field.name(),
+                ArrowDataType::Struct(child_fields.into()),
+                field.is_nullable(),
+            )
+            .with_metadata(original_metadata),
+        ));
+    }
+
+    let new_schema = Arc::new(arrow_schema::Schema::new_with_metadata(
+        new_fields
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect::<Vec<_>>(),
+        batch_schema.metadata().clone(),
+    ));
+
+    let result = RecordBatch::try_new(new_schema, new_columns)
+        .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
+    Ok((result, sidecar_copies))
+}
+
+/// Build a Lance Schema for compaction writes: logical 2-field blob structs are
+/// replaced by the 6-field preprocessor layout so `BlobPreprocessor` can write
+/// them correctly via its passthrough path.
+pub fn compaction_write_schema(
+    dataset_schema: &lance_core::datatypes::Schema,
+) -> lance_core::datatypes::Schema {
+    use lance_core::datatypes::Field;
+
+    let max_field_id = dataset_schema.max_field_id().unwrap_or(0);
+    let mut next_id = max_field_id + 1;
+
+    let mut schema = dataset_schema.clone();
+    for field in &mut schema.fields {
+        if !field.is_blob_v2() {
+            continue;
+        }
+        let parent_id = field.id;
+
+        // 6-field preprocessor children (order must match BlobPreprocessor output)
+        let child_defs: &[(&str, &str)] = &[
+            ("kind", "uint8"),
+            ("data", "large_binary"),
+            ("uri", "string"),
+            ("blob_id", "uint32"),
+            ("blob_size", "uint64"),
+            ("position", "uint64"),
+        ];
+
+        let mut new_children = Vec::with_capacity(6);
+        for (name, logical_type) in child_defs {
+            let child = Field {
+                name: name.to_string(),
+                id: next_id,
+                parent_id,
+                logical_type: lance_core::datatypes::LogicalType::from(*logical_type),
+                metadata: HashMap::new(),
+                encoding: None,
+                nullable: true,
+                children: Vec::new(),
+                dictionary: None,
+                unenforced_primary_key_position: None,
+            };
+            next_id += 1;
+            new_children.push(child);
+        }
+        field.children = new_children;
+    }
+
+    schema
+}
+
 /// Current state of the reader.  Held in a mutex for easy sharing
 ///
 /// The u64 is the cursor in the file that the reader is currently at
@@ -494,11 +777,7 @@ impl BlobFile {
     ) -> Result<Self> {
         let (object_store, path) =
             ObjectStore::from_uri_and_params(registry, &uri, &params).await?;
-        let size = if size > 0 {
-            size
-        } else {
-            object_store.size(&path).await?
-        };
+        let size = if size > 0 { size } else { object_store.size(&path).await? };
         Ok(Self {
             object_store,
             path,
@@ -541,11 +820,10 @@ impl BlobFile {
                 let (new_cursor, data) = func(*cursor, reader.clone()).await?;
                 *cursor = new_cursor;
                 Ok(data)
-            }
-            ReaderState::Closed => Err(Error::invalid_input(
-                "Blob file is already closed".to_string(),
-                location!(),
-            )),
+            },
+            ReaderState::Closed => {
+                Err(Error::invalid_input("Blob file is already closed".to_string(), location!()))
+            },
             _ => unreachable!(),
         }
     }
@@ -590,15 +868,14 @@ impl BlobFile {
             ReaderState::Open((cursor, _)) => {
                 *cursor = new_cursor;
                 Ok(())
-            }
-            ReaderState::Closed => Err(Error::invalid_input(
-                "Blob file is already closed".to_string(),
-                location!(),
-            )),
+            },
+            ReaderState::Closed => {
+                Err(Error::invalid_input("Blob file is already closed".to_string(), location!()))
+            },
             ReaderState::Uninitialized(cursor) => {
                 *cursor = new_cursor;
                 Ok(())
-            }
+            },
         }
     }
 
@@ -607,10 +884,9 @@ impl BlobFile {
         let reader = self.reader.lock().await;
         match *reader {
             ReaderState::Open((cursor, _)) => Ok(cursor),
-            ReaderState::Closed => Err(Error::invalid_input(
-                "Blob file is already closed".to_string(),
-                location!(),
-            )),
+            ReaderState::Closed => {
+                Err(Error::invalid_input("Blob file is already closed".to_string(), location!()))
+            },
             ReaderState::Uninitialized(cursor) => Ok(cursor),
         }
     }
@@ -664,7 +940,7 @@ pub(super) async fn take_blobs(
         BlobVersion::V1 => collect_blob_files_v1(dataset, blob_field_id, descriptions, row_addrs),
         BlobVersion::V2 => {
             collect_blob_files_v2(dataset, blob_field_id, descriptions, row_addrs).await
-        }
+        },
     }
 }
 
@@ -710,10 +986,10 @@ pub async fn take_blobs_by_addresses(
     match blob_version_from_descriptions(descriptions)? {
         BlobVersion::V1 => {
             collect_blob_files_v1(dataset, blob_field_id, descriptions, row_addrs_result)
-        }
+        },
         BlobVersion::V2 => {
             collect_blob_files_v2(dataset, blob_field_id, descriptions, row_addrs_result).await
-        }
+        },
     }
 }
 
@@ -798,7 +1074,7 @@ async fn collect_blob_files_v2(
                     position,
                     size,
                 ));
-            }
+            },
             BlobKind::Dedicated => {
                 let blob_id = blob_ids.value(idx);
                 let size = sizes.value(idx);
@@ -820,7 +1096,7 @@ async fn collect_blob_files_v2(
                 let data_file_key = data_file_key_from_path(data_file.path.as_str());
                 let path = blob_path(&dataset.data_dir(), data_file_key, blob_id);
                 files.push(BlobFile::new_dedicated(dataset.clone(), path, size));
-            }
+            },
             BlobKind::Packed => {
                 let blob_id = blob_ids.value(idx);
                 let size = sizes.value(idx);
@@ -842,7 +1118,7 @@ async fn collect_blob_files_v2(
                 let data_file_key = data_file_key_from_path(data_file.path.as_str());
                 let path = blob_path(&dataset.data_dir(), data_file_key, blob_id);
                 files.push(BlobFile::new_packed(dataset.clone(), path, position, size));
-            }
+            },
             BlobKind::External => {
                 let uri = blob_uris.value(idx).to_string();
                 let position = positions.value(idx);
@@ -854,14 +1130,14 @@ async fn collect_blob_files_v2(
                     .map(|p| Arc::new((**p).clone()))
                     .unwrap_or_else(|| Arc::new(ObjectStoreParams::default()));
                 files.push(BlobFile::new_external(uri, position, size, registry, params).await?);
-            }
+            },
         }
     }
 
     Ok(files)
 }
 
-fn data_file_key_from_path(path: &str) -> &str {
+pub fn data_file_key_from_path(path: &str) -> &str {
     let filename = path.rsplit('/').next().unwrap_or(path);
     filename.strip_suffix(".lance").unwrap_or(filename)
 }
@@ -915,11 +1191,7 @@ mod tests {
                     .await,
             );
 
-            Self {
-                _test_dir: test_dir,
-                dataset,
-                data,
-            }
+            Self { _test_dir: test_dir, dataset, data }
         }
     }
 
@@ -1103,11 +1375,7 @@ mod tests {
 
         // Verify we have multiple fragments
         let fragments = dataset.fragments();
-        assert!(
-            fragments.len() >= 2,
-            "Expected at least 2 fragments, got {}",
-            fragments.len()
-        );
+        assert!(fragments.len() >= 2, "Expected at least 2 fragments, got {}", fragments.len());
 
         // Test first fragment (indices 0, 1, 2) - this always worked
         let blobs = dataset
@@ -1217,10 +1485,7 @@ mod tests {
         )
         .await;
 
-        assert!(
-            result.is_err(),
-            "Blob v2 should be rejected for file version 2.1"
-        );
+        assert!(result.is_err(), "Blob v2 should be rejected for file version 2.1");
         assert!(result
             .unwrap_err()
             .to_string()
@@ -1240,10 +1505,8 @@ mod tests {
 
         let mut field = blob_field("blob", true);
         let mut metadata = field.metadata().clone();
-        metadata.insert(
-            BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY.to_string(),
-            metadata_value.to_string(),
-        );
+        metadata
+            .insert(BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY.to_string(), metadata_value.to_string());
         field = field.with_metadata(metadata);
 
         let writer_arrow_schema = Schema::new(vec![field.clone()]);
