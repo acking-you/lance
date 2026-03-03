@@ -51,9 +51,10 @@ async fn test_binary_copy_with_defer_remap() {
 }
 
 async fn do_test_binary_copy_with_defer_remap(version: LanceFileVersion) {
+    use std::sync::Arc;
+
     use arrow_schema::{DataType, Field, Fields, TimeUnit};
     use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
-    use std::sync::Arc;
 
     let fixed_list_dt =
         DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4);
@@ -411,8 +412,11 @@ async fn test_binary_copy_preserves_bloom_filter_queries() {
         number_of_items: u64,
         probability: f64,
     }
-    let bloom_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter)
-        .with_params(&BloomParams { number_of_items: 500, probability: 0.01 });
+    let bloom_params =
+        ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter).with_params(&BloomParams {
+            number_of_items: 500,
+            probability: 0.01,
+        });
     dataset
         .create_index(&["val"], IndexType::Scalar, Some("bloom".into()), &bloom_params, false)
         .await
@@ -452,7 +456,10 @@ async fn test_binary_copy_fallback_to_common_compaction() {
     let test_uri = &test_dir;
     let data = sample_data();
     let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
-    let write_params = WriteParams { max_rows_per_file: 500, ..Default::default() };
+    let write_params = WriteParams {
+        max_rows_per_file: 500,
+        ..Default::default()
+    };
     let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
         .await
         .unwrap();
@@ -486,7 +493,10 @@ async fn test_can_use_binary_copy_schema_consistency_ok() {
     let data = sample_data();
     let reader1 = RecordBatchIterator::new(vec![Ok(data.slice(0, 5_000))], data.schema());
     let reader2 = RecordBatchIterator::new(vec![Ok(data.slice(5_000, 5_000))], data.schema());
-    let write_params = WriteParams { max_rows_per_file: 1_000, ..Default::default() };
+    let write_params = WriteParams {
+        max_rows_per_file: 1_000,
+        ..Default::default()
+    };
     let mut dataset = Dataset::write(reader1, test_uri, Some(write_params.clone()))
         .await
         .unwrap();
@@ -511,12 +521,18 @@ async fn test_can_use_binary_copy_schema_mismatch() {
     let test_uri = &test_dir;
     let data = sample_data();
     let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
-    let write_params = WriteParams { max_rows_per_file: 1_000, ..Default::default() };
+    let write_params = WriteParams {
+        max_rows_per_file: 1_000,
+        ..Default::default()
+    };
     let dataset = Dataset::write(reader, test_uri, Some(write_params))
         .await
         .unwrap();
 
-    let options = CompactionOptions { enable_binary_copy: true, ..Default::default() };
+    let options = CompactionOptions {
+        enable_binary_copy: true,
+        ..Default::default()
+    };
     let mut frags: Vec<Fragment> = dataset
         .get_fragments()
         .into_iter()
@@ -554,11 +570,15 @@ async fn test_can_use_binary_copy_version_mismatch() {
         .await
         .unwrap();
 
-    // Append additional data and then mark its files as a newer format version (v2.1).
+    // Append additional data and then mark its files as a newer format version
+    // (v2.1).
     let reader_append = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
     dataset.append(reader_append, None).await.unwrap();
 
-    let options = CompactionOptions { enable_binary_copy: true, ..Default::default() };
+    let options = CompactionOptions {
+        enable_binary_copy: true,
+        ..Default::default()
+    };
     let mut frags: Vec<Fragment> = dataset
         .get_fragments()
         .into_iter()
@@ -582,13 +602,19 @@ async fn test_can_use_binary_copy_reject_deletions() {
     let test_uri = &test_dir;
     let data = sample_data();
     let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
-    let write_params = WriteParams { max_rows_per_file: 1_000, ..Default::default() };
+    let write_params = WriteParams {
+        max_rows_per_file: 1_000,
+        ..Default::default()
+    };
     let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
         .await
         .unwrap();
     dataset.delete("a < 10").await.unwrap();
 
-    let options = CompactionOptions { enable_binary_copy: true, ..Default::default() };
+    let options = CompactionOptions {
+        enable_binary_copy: true,
+        ..Default::default()
+    };
     let frags: Vec<Fragment> = dataset
         .get_fragments()
         .into_iter()
@@ -668,7 +694,10 @@ async fn do_test_binary_copy_compaction_with_complex_schema(version: LanceFileVe
     .await
     .unwrap();
 
-    let opt_full = CompactionOptions { enable_binary_copy: false, ..Default::default() };
+    let opt_full = CompactionOptions {
+        enable_binary_copy: false,
+        ..Default::default()
+    };
     let opt_binary = CompactionOptions {
         enable_binary_copy: true,
         enable_binary_copy_force: true,

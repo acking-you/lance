@@ -13,7 +13,9 @@ use arrow_buffer::Buffer;
 use arrow_schema::{DataType, Field as ArrowField, Fields};
 use futures::{future::BoxFuture, FutureExt};
 use lance_core::{
-    datatypes::Field, datatypes::BLOB_V2_DESC_FIELDS, error::LanceOptionExt, Error, Result,
+    datatypes::{BlobKind, Field, BLOB_V2_DESC_FIELDS},
+    error::LanceOptionExt,
+    Error, Result,
 };
 use snafu::location;
 
@@ -26,7 +28,6 @@ use crate::{
     format::ProtobufUtils21,
     repdef::{DefinitionInterpretation, RepDefBuilder},
 };
-use lance_core::datatypes::BlobKind;
 
 /// Blob structural encoder - stores large binary data in external buffers
 ///
@@ -144,10 +145,10 @@ impl FieldEncoder for BlobStructuralEncoder {
         match self.def_meaning.as_ref() {
             None => {
                 self.def_meaning = Some(def_meaning.clone());
-            }
+            },
             Some(existing) => {
                 debug_assert_eq!(existing, &def_meaning);
-            }
+            },
         }
 
         // Collect positions and sizes
@@ -210,8 +211,9 @@ impl FieldEncoder for BlobStructuralEncoder {
     fn flush(&mut self, external_buffers: &mut OutOfLineBuffers) -> Result<Vec<EncodeTask>> {
         let encode_tasks = self.descriptor_encoder.flush(external_buffers)?;
 
-        // Use the cached def meaning.  If we haven't seen any data yet then we can just use a dummy
-        // value (not clear there would be any encode tasks in that case)
+        // Use the cached def meaning.  If we haven't seen any data yet then we can just
+        // use a dummy value (not clear there would be any encode tasks in that
+        // case)
         let def_meaning = self
             .def_meaning
             .clone()
@@ -262,7 +264,9 @@ impl BlobV2StructuralEncoder {
             Arc::new(HashMap::new()),
         )?);
 
-        Ok(Self { descriptor_encoder })
+        Ok(Self {
+            descriptor_encoder,
+        })
     }
 }
 
@@ -340,13 +344,18 @@ impl FieldEncoder for BlobV2StructuralEncoder {
                 } else {
                     let kind_val = BlobKind::try_from(kind_col.value(i))?;
                     match kind_val {
-                        BlobKind::Dedicated => (
-                            BlobKind::Dedicated as u8,
-                            0,
-                            blob_size_col.value(i),
-                            blob_id_col.value(i),
-                            "".to_string(),
-                        ),
+                        BlobKind::Dedicated => {
+                            // Preserve blob_uri if set (zero-copy compaction stores
+                            // the source data_file_key here).
+                            let uri = uri_col.value(i).to_string();
+                            (
+                                BlobKind::Dedicated as u8,
+                                0,
+                                blob_size_col.value(i),
+                                blob_id_col.value(i),
+                                uri,
+                            )
+                        },
                         BlobKind::External => {
                             let uri = uri_col.value(i).to_string();
                             let position = if packed_position_col.is_null(i) {
@@ -354,34 +363,30 @@ impl FieldEncoder for BlobV2StructuralEncoder {
                             } else {
                                 packed_position_col.value(i)
                             };
-                            let size = if blob_size_col.is_null(i) {
-                                0
-                            } else {
-                                blob_size_col.value(i)
-                            };
+                            let size =
+                                if blob_size_col.is_null(i) { 0 } else { blob_size_col.value(i) };
                             (BlobKind::External as u8, position, size, 0, uri)
-                        }
-                        BlobKind::Packed => (
-                            BlobKind::Packed as u8,
-                            packed_position_col.value(i),
-                            blob_size_col.value(i),
-                            blob_id_col.value(i),
-                            "".to_string(),
-                        ),
+                        },
+                        BlobKind::Packed => {
+                            // Preserve blob_uri if set (zero-copy compaction stores
+                            // the source data_file_key here).
+                            let uri = uri_col.value(i).to_string();
+                            (
+                                BlobKind::Packed as u8,
+                                packed_position_col.value(i),
+                                blob_size_col.value(i),
+                                blob_id_col.value(i),
+                                uri,
+                            )
+                        },
                         BlobKind::Inline => {
                             let data_val = data_col.value(i);
                             let blob_len = data_val.len() as u64;
                             let position = external_buffers
                                 .add_buffer(LanceBuffer::from(Buffer::from(data_val)));
 
-                            (
-                                BlobKind::Inline as u8,
-                                position,
-                                blob_len,
-                                0,
-                                "".to_string(),
-                            )
-                        }
+                            (BlobKind::Inline as u8, position, blob_len, 0, "".to_string())
+                        },
                     }
                 };
 
@@ -399,11 +404,9 @@ impl FieldEncoder for BlobV2StructuralEncoder {
             Arc::new(uri_builder.finish()),
         ];
 
-        let descriptor_array = Arc::new(StructArray::try_new(
-            BLOB_V2_DESC_FIELDS.clone(),
-            children,
-            None,
-        )?) as ArrayRef;
+        let descriptor_array =
+            Arc::new(StructArray::try_new(BLOB_V2_DESC_FIELDS.clone(), children, None)?)
+                as ArrayRef;
 
         self.descriptor_encoder.maybe_encode(
             descriptor_array,
@@ -432,6 +435,11 @@ impl FieldEncoder for BlobV2StructuralEncoder {
 
 #[cfg(test)]
 mod tests {
+    use arrow_array::{
+        ArrayRef, LargeBinaryArray, StringArray, StructArray, UInt32Array, UInt64Array, UInt8Array,
+    };
+    use arrow_schema::{DataType, Field as ArrowField};
+
     use super::*;
     use crate::{
         compression::DefaultCompressionStrategy,
@@ -442,10 +450,6 @@ mod tests {
         },
         version::LanceFileVersion,
     };
-    use arrow_array::{
-        ArrayRef, LargeBinaryArray, StringArray, StructArray, UInt32Array, UInt64Array, UInt8Array,
-    };
-    use arrow_schema::{DataType, Field as ArrowField};
 
     #[test]
     fn test_blob_encoder_creation() {
@@ -502,10 +506,7 @@ mod tests {
 
         // Verify external buffers were used for large data
         let buffers = external_buffers.take_buffers();
-        assert!(
-            !buffers.is_empty(),
-            "Large blobs should be stored in external buffers"
-        );
+        assert!(!buffers.is_empty(), "Large blobs should be stored in external buffers");
     }
 
     #[tokio::test]
@@ -518,12 +519,8 @@ mod tests {
         let val1: &[u8] = &vec![1u8; 1024]; // 1KB
         let val2: &[u8] = &vec![2u8; 10240]; // 10KB
         let val3: &[u8] = &vec![3u8; 102400]; // 100KB
-        let array = Arc::new(LargeBinaryArray::from(vec![
-            Some(val1),
-            None,
-            Some(val2),
-            Some(val3),
-        ]));
+        let array =
+            Arc::new(LargeBinaryArray::from(vec![Some(val1), None, Some(val2), Some(val3)]));
 
         // Use the standard test harness
         check_round_trip_encoding_of_data(
@@ -645,10 +642,8 @@ mod tests {
         let expected_descriptor = StructArray::from(vec![
             (
                 Arc::new(ArrowField::new("kind", DataType::UInt8, false)),
-                Arc::new(UInt8Array::from(vec![
-                    BlobKind::Dedicated as u8,
-                    BlobKind::Inline as u8,
-                ])) as ArrayRef,
+                Arc::new(UInt8Array::from(vec![BlobKind::Dedicated as u8, BlobKind::Inline as u8]))
+                    as ArrayRef,
             ),
             (
                 Arc::new(ArrowField::new("position", DataType::UInt64, false)),

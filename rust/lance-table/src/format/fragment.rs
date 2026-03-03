@@ -4,21 +4,22 @@
 use std::num::NonZero;
 
 use deepsize::DeepSizeOf;
-use lance_core::Error;
-use lance_file::format::{MAJOR_VERSION, MINOR_VERSION};
-use lance_file::version::LanceFileVersion;
+use lance_core::{datatypes::Schema, error::Result, Error};
+use lance_file::{
+    format::{MAJOR_VERSION, MINOR_VERSION},
+    version::LanceFileVersion,
+};
 use lance_io::utils::CachedFileSize;
 use object_store::path::Path;
 use serde::{Deserialize, Serialize};
 use snafu::location;
 
-use crate::format::pb;
-
-use crate::rowids::version::{
-    created_at_version_meta_to_pb, last_updated_at_version_meta_to_pb, RowDatasetVersionMeta,
+use crate::{
+    format::pb,
+    rowids::version::{
+        created_at_version_meta_to_pb, last_updated_at_version_meta_to_pb, RowDatasetVersionMeta,
+    },
 };
-use lance_core::datatypes::Schema;
-use lance_core::error::Result;
 
 /// Lance Data File
 ///
@@ -75,7 +76,8 @@ impl DataFile {
         }
     }
 
-    /// Create a new `DataFile` with the expectation that fields and column_indices will be set later
+    /// Create a new `DataFile` with the expectation that fields and
+    /// column_indices will be set later
     pub fn new_unstarted(
         path: impl Into<String>,
         file_major_version: u32,
@@ -97,15 +99,7 @@ impl DataFile {
         fields: Vec<i32>,
         base_id: Option<u32>,
     ) -> Self {
-        Self::new(
-            path,
-            fields,
-            vec![],
-            MAJOR_VERSION as u32,
-            MINOR_VERSION as u32,
-            None,
-            base_id,
-        )
+        Self::new(path, fields, vec![], MAJOR_VERSION as u32, MINOR_VERSION as u32, None, base_id)
     }
 
     pub fn new_legacy(
@@ -226,13 +220,10 @@ impl TryFrom<pb::DeletionFile> for DeletionFile {
                     source: "Unknown deletion file type".into(),
                     location: location!(),
                 })
-            }
+            },
         };
-        let num_deleted_rows = if value.num_deleted_rows == 0 {
-            None
-        } else {
-            Some(value.num_deleted_rows as usize)
-        };
+        let num_deleted_rows =
+            if value.num_deleted_rows == 0 { None } else { Some(value.num_deleted_rows as usize) };
         Ok(Self {
             read_version: value.read_version,
             id: value.id,
@@ -270,15 +261,16 @@ impl TryFrom<pb::data_fragment::RowIdSequence> for RowIdMeta {
                     offset: file.offset,
                     size: file.size,
                 }))
-            }
+            },
         }
     }
 }
 
 /// Data fragment.
 ///
-/// A fragment is a set of files which represent the different columns of the same rows.
-/// If column exists in the schema, but the related file does not exist, treat this column as `nulls`.
+/// A fragment is a set of files which represent the different columns of the
+/// same rows. If column exists in the schema, but the related file does not
+/// exist, treat this column as `nulls`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
 pub struct Fragment {
     /// Fragment ID
@@ -307,6 +299,13 @@ pub struct Fragment {
     /// Created at version metadata
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at_version_meta: Option<RowDatasetVersionMeta>,
+
+    /// Data file keys whose blob sidecar files are referenced by this fragment.
+    /// Created during zero-copy blob v2 compaction to keep old sidecar
+    /// directories alive across GC. Empty for non-compacted fragments or
+    /// pre-v2 data.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blob_source_keys: Vec<String>,
 }
 
 impl Fragment {
@@ -319,6 +318,7 @@ impl Fragment {
             physical_rows: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            blob_source_keys: Vec::new(),
         }
     }
 
@@ -330,8 +330,7 @@ impl Fragment {
             (
                 Some(len),
                 Some(DeletionFile {
-                    num_deleted_rows: Some(num_deleted_rows),
-                    ..
+                    num_deleted_rows: Some(num_deleted_rows), ..
                 }),
             ) => Some(len - num_deleted_rows),
             _ => None,
@@ -358,6 +357,7 @@ impl Fragment {
             row_id_meta: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            blob_source_keys: Vec::new(),
         }
     }
 
@@ -370,15 +370,8 @@ impl Fragment {
         file_size_bytes: Option<NonZero<u64>>,
     ) -> Self {
         let (major, minor) = version.to_numbers();
-        let data_file = DataFile::new(
-            path,
-            field_ids,
-            column_indices,
-            major,
-            minor,
-            file_size_bytes,
-            None,
-        );
+        let data_file =
+            DataFile::new(path, field_ids, column_indices, major, minor, file_size_bytes, None);
         self.files.push(data_file);
         self
     }
@@ -464,11 +457,7 @@ impl TryFrom<pb::DataFragment> for Fragment {
     type Error = Error;
 
     fn try_from(p: pb::DataFragment) -> Result<Self> {
-        let physical_rows = if p.physical_rows > 0 {
-            Some(p.physical_rows as usize)
-        } else {
-            None
-        };
+        let physical_rows = if p.physical_rows > 0 { Some(p.physical_rows as usize) } else { None };
         Ok(Self {
             id: p.id,
             files: p
@@ -487,6 +476,7 @@ impl TryFrom<pb::DataFragment> for Fragment {
                 .created_at_version_sequence
                 .map(RowDatasetVersionMeta::try_from)
                 .transpose()?,
+            blob_source_keys: p.blob_source_keys,
         })
     }
 }
@@ -515,7 +505,7 @@ impl From<&Fragment> for pb::DataFragment {
                     offset: file.offset,
                     size: file.size,
                 })
-            }
+            },
         });
         let last_updated_at_version_sequence =
             last_updated_at_version_meta_to_pb(&f.last_updated_at_version_meta);
@@ -528,18 +518,20 @@ impl From<&Fragment> for pb::DataFragment {
             physical_rows: f.physical_rows.unwrap_or_default() as u64,
             last_updated_at_version_sequence,
             created_at_version_sequence,
+            blob_source_keys: f.blob_source_keys.clone(),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use arrow_schema::{
         DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
     };
     use object_store::path::Path;
     use serde_json::{json, Value};
+
+    use super::*;
 
     #[test]
     fn test_new_fragment() {
@@ -560,14 +552,11 @@ mod tests {
         let fragment = Fragment::with_file_legacy(123, path, &schema, Some(10));
 
         assert_eq!(123, fragment.id);
-        assert_eq!(
-            fragment.files,
-            vec![DataFile::new_legacy_from_fields(
-                path.to_string(),
-                vec![0, 1, 2, 3],
-                None,
-            )]
-        )
+        assert_eq!(fragment.files, vec![DataFile::new_legacy_from_fields(
+            path.to_string(),
+            vec![0, 1, 2, 3],
+            None,
+        )])
     }
 
     #[test]

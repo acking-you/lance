@@ -33,19 +33,18 @@ mod test {
         Client,
     };
     use futures::future::join_all;
-    use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
-    use object_store::local::LocalFileSystem;
-    use object_store::path::Path;
-
-    use crate::{
-        dataset::{builder::DatasetBuilder, ReadParams, WriteMode, WriteParams},
-        Dataset,
-    };
     use lance_core::utils::tempfile::TempStrDir;
     use lance_table::io::commit::{
         dynamodb::DynamoDBExternalManifestStore,
         external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore},
         CommitHandler, ManifestNamingScheme,
+    };
+    use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
+    use object_store::{local::LocalFileSystem, path::Path};
+
+    use crate::{
+        dataset::{builder::DatasetBuilder, ReadParams, WriteMode, WriteParams},
+        Dataset,
     };
 
     fn read_params(handler: Arc<dyn CommitHandler>) -> ReadParams {
@@ -177,10 +176,7 @@ mod test {
             .is_ok());
 
         // latest should see update
-        assert_eq!(
-            store.get_latest_version("test").await.unwrap(),
-            Some((2, "test".to_string()))
-        );
+        assert_eq!(store.get_latest_version("test").await.unwrap(), Some((2, "test".to_string())));
         // get should see new data
         assert_eq!(store.get("test", 2).await.unwrap(), "test");
 
@@ -204,9 +200,14 @@ mod test {
             external_manifest_store: store,
         };
         let options = read_params(Arc::new(handler));
-        DatasetBuilder::from_uri(ds_uri).with_read_params(options).load().await.expect(
-            "If this fails, it means the external store handler does not correctly handle the case when a dataset exist, but it has never used external store before."
-        );
+        DatasetBuilder::from_uri(ds_uri)
+            .with_read_params(options)
+            .load()
+            .await
+            .expect(
+                "If this fails, it means the external store handler does not correctly handle the \
+                 case when a dataset exist, but it has never used external store before.",
+            );
     }
 
     #[tokio::test]
@@ -248,13 +249,9 @@ mod test {
         let dir = TempStrDir::default();
         let ds_uri = &dir;
 
-        Dataset::write(
-            data_gen.batch(10),
-            ds_uri,
-            Some(write_params(handler.clone())),
-        )
-        .await
-        .unwrap();
+        Dataset::write(data_gen.batch(10), ds_uri, Some(write_params(handler.clone())))
+            .await
+            .unwrap();
 
         // we have 5 retries by default, more than this will just fail
         let write_futs = (0..5)
@@ -333,13 +330,7 @@ mod test {
             .unwrap()
             .size;
         store
-            .put_if_exists(
-                ds.base.as_ref(),
-                6,
-                version_six_staging_location.as_ref(),
-                size,
-                None,
-            )
+            .put_if_exists(ds.base.as_ref(), 6, version_six_staging_location.as_ref(), size, None)
             .await
             .unwrap();
 

@@ -2,25 +2,30 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Utilities for remapping row ids. Necessary before stable row ids.
-//!
 
-use crate::dataset::transaction::{Operation, Transaction};
-use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
-use crate::Result;
-use crate::{index, Dataset};
+use std::{collections::HashMap, sync::Arc};
+
 use async_trait::async_trait;
-use lance_core::utils::address::RowAddress;
-use lance_core::Error;
-use lance_index::frag_reuse::{FragDigest, FRAG_REUSE_INDEX_NAME};
-use lance_index::DatasetIndexExt;
-use lance_table::format::{Fragment, IndexMetadata};
-use lance_table::io::manifest::read_manifest_indexes;
+use lance_core::{utils::address::RowAddress, Error};
+use lance_index::{
+    frag_reuse::{FragDigest, FRAG_REUSE_INDEX_NAME},
+    DatasetIndexExt,
+};
+use lance_table::{
+    format::{Fragment, IndexMetadata},
+    io::manifest::read_manifest_indexes,
+};
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
 use snafu::location;
-use std::collections::HashMap;
-use std::sync::Arc;
 use uuid::Uuid;
+
+use crate::{
+    dataset::transaction::{Operation, Transaction},
+    index,
+    index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index},
+    Dataset, Result,
+};
 
 /// The result of remapping an index
 #[derive(Debug, Clone, PartialEq)]
@@ -57,8 +62,8 @@ pub trait IndexRemapper: Send + Sync {
 
 /// Options for creating an [IndexRemapper]
 ///
-/// Currently we don't have any options but we may need options in the future and so we
-/// want to keep a placeholder
+/// Currently we don't have any options but we may need options in the future
+/// and so we want to keep a placeholder
 pub trait IndexRemapperOptions: Send + Sync {
     fn create_remapper(&self, dataset: &Dataset) -> Result<Box<dyn IndexRemapper>>;
 }
@@ -180,9 +185,9 @@ pub fn transpose_row_ids_from_digest(
             .iter()
             .map(|frag| frag.num_deleted_rows)
             .sum::<usize>();
-    // We expect row addrs to be unique, so we should already not get many collisions.
-    // The default hasher is designed to be resistance to DoS attacks, which is
-    // more than we need for this use case.
+    // We expect row addrs to be unique, so we should already not get many
+    // collisions. The default hasher is designed to be resistance to DoS
+    // attacks, which is more than we need for this use case.
     let mut mapping: HashMap<u64, Option<u64>> = HashMap::with_capacity(expected_size);
     mapping.extend(row_addrs.iter().zip(new_addrs));
     MissingAddrs::new(row_addrs.into_iter(), old_fragments).for_each(|addr| {
@@ -192,8 +197,9 @@ pub fn transpose_row_ids_from_digest(
 }
 
 /// Remap a given index using the fragment reuse index if possible.
-/// If the frag reuse index does not exist, the operation fails with [Error::NotSupported]
-/// If the frag reuse index exists but is empty, the operation succeeds without a commit.
+/// If the frag reuse index does not exist, the operation fails with
+/// [Error::NotSupported] If the frag reuse index exists but is empty, the
+/// operation succeeds without a commit.
 async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
     let indices = dataset.load_indices().await.unwrap();
     let frag_reuse_index_meta = match indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) {
@@ -245,13 +251,19 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
 
                     if old_frag_in_index > 0 {
                         if old_frag_in_index != group.old_frags.len() {
-                            // this should never happen because we always commit a full rewrite group
-                            // and we always reindex either the entire group or nothing.
-                            // We use invalid input to be consistent with
+                            // this should never happen because we always commit a full rewrite
+                            // group and we always reindex either the
+                            // entire group or nothing. We use invalid
+                            // input to be consistent with
                             // dataset::transaction::recalculate_fragment_bitmap
                             return Err(Error::invalid_input(
-                                format!("The compaction plan included a rewrite group that was a split of indexed and non-indexed data: {:?}", group.old_frags),
-                                location!()));
+                                format!(
+                                    "The compaction plan included a rewrite group that was a \
+                                     split of indexed and non-indexed data: {:?}",
+                                    group.old_frags
+                                ),
+                                location!(),
+                            ));
                         }
                         index_frag_bitmap
                             .extend(group.new_frags.clone().into_iter().map(|f| f.id as u32));
@@ -369,11 +381,19 @@ mod tests {
 
     #[test]
     fn test_missing_indices() {
-        // Sanity test to make sure MissingIds works.  Does not test actual functionality so
-        // feel free to remove if it becomes inconvenient
+        // Sanity test to make sure MissingIds works.  Does not test actual
+        // functionality so feel free to remove if it becomes inconvenient
         let frags = vec![
-            FragDigest { id: 0, physical_rows: 5, num_deleted_rows: 0 },
-            FragDigest { id: 3, physical_rows: 3, num_deleted_rows: 0 },
+            FragDigest {
+                id: 0,
+                physical_rows: 5,
+                num_deleted_rows: 0,
+            },
+            FragDigest {
+                id: 3,
+                physical_rows: 3,
+                num_deleted_rows: 0,
+            },
         ];
         let rows = [(0, 1), (0, 3), (0, 4), (3, 0), (3, 2)]
             .into_iter()
@@ -394,9 +414,21 @@ mod tests {
         // test fragment ids out of order
 
         let fragments = vec![
-            FragDigest { id: 0, physical_rows: 5, num_deleted_rows: 0 },
-            FragDigest { id: 3, physical_rows: 3, num_deleted_rows: 0 },
-            FragDigest { id: 1, physical_rows: 3, num_deleted_rows: 0 },
+            FragDigest {
+                id: 0,
+                physical_rows: 5,
+                num_deleted_rows: 0,
+            },
+            FragDigest {
+                id: 3,
+                physical_rows: 3,
+                num_deleted_rows: 0,
+            },
+            FragDigest {
+                id: 1,
+                physical_rows: 3,
+                num_deleted_rows: 0,
+            },
         ];
 
         // Written as pairs of (fragment_id, offset)

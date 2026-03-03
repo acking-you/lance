@@ -3,14 +3,7 @@
 
 use std::{collections::HashSet, sync::Arc};
 
-use super::fragment::FileFragment;
-use super::{
-    transaction::{Operation, Transaction},
-    Dataset,
-};
-use crate::{io::exec::Planner, Error, Result};
-use arrow::compute::can_cast_types;
-use arrow::compute::CastOptions;
+use arrow::compute::{can_cast_types, CastOptions};
 use arrow_array::{Array, RecordBatch, RecordBatchReader};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use datafusion::execution::SendableRecordBatchStream;
@@ -18,10 +11,19 @@ use futures::stream::{StreamExt, TryStreamExt};
 use lance_arrow::SchemaExt;
 use lance_core::datatypes::{Field, Schema};
 use lance_datafusion::utils::StreamingWriteSource;
-use lance_encoding::constants::{PACKED_STRUCT_LEGACY_META_KEY, PACKED_STRUCT_META_KEY};
-use lance_encoding::version::LanceFileVersion;
+use lance_encoding::{
+    constants::{PACKED_STRUCT_LEGACY_META_KEY, PACKED_STRUCT_META_KEY},
+    version::LanceFileVersion,
+};
 use lance_table::format::Fragment;
 use snafu::location;
+
+use super::{
+    fragment::FileFragment,
+    transaction::{Operation, Transaction},
+    Dataset,
+};
+use crate::{io::exec::Planner, Error, Result};
 
 mod optimize;
 
@@ -46,7 +48,8 @@ async fn validate_no_nulls_before_making_non_nullable(dataset: &Dataset, path: &
     let mut stream = scanner.try_into_stream().await?;
     while let Some(batch) = stream.try_next().await? {
         // `path` can be a nested path (e.g. "b.c") which will not be found by
-        // `RecordBatch::column_by_name`. We project exactly one column and validate it directly.
+        // `RecordBatch::column_by_name`. We project exactly one column and validate it
+        // directly.
         if batch.num_columns() != 1 {
             return Err(Error::Internal {
                 message: format!(
@@ -60,10 +63,7 @@ async fn validate_no_nulls_before_making_non_nullable(dataset: &Dataset, path: &
         let col = batch.column(0);
         if col.null_count() > 0 {
             return Err(Error::invalid_input(
-                format!(
-                    "Column \"{}\" contains NULL values and cannot be made non-nullable",
-                    path
-                ),
+                format!("Column \"{}\" contains NULL values and cannot be made non-nullable", path),
                 location!(),
             ));
         }
@@ -101,8 +101,9 @@ pub struct BatchUDF {
 /// A way to define one or more new columns in a dataset
 pub enum NewColumnTransform {
     /// A UDF that takes a RecordBatch of existing data and returns a
-    /// RecordBatch with the new columns for those corresponding rows. The returned
-    /// batch must return the same number of rows as the input batch.
+    /// RecordBatch with the new columns for those corresponding rows. The
+    /// returned batch must return the same number of rows as the input
+    /// batch.
     BatchUDF(BatchUDF),
     /// A set of SQL expressions that define new columns.
     SqlExpressions(Vec<(String, String)>),
@@ -118,11 +119,14 @@ pub enum NewColumnTransform {
 pub struct ColumnAlteration {
     /// Path to the existing column to be altered.
     pub path: String,
-    /// The new name of the column. If None, the column name will not be changed.
+    /// The new name of the column. If None, the column name will not be
+    /// changed.
     pub rename: Option<String>,
-    /// Whether the column is nullable. If None, the nullability will not be changed.
+    /// Whether the column is nullable. If None, the nullability will not be
+    /// changed.
     pub nullable: Option<bool>,
-    /// The new data type of the column. If None, the data type will not be changed.
+    /// The new data type of the column. If None, the data type will not be
+    /// changed.
     pub data_type: Option<DataType>,
 }
 
@@ -165,11 +169,11 @@ fn is_upcast_downcast(from_type: &DataType, to_type: &DataType) -> bool {
         Binary | LargeBinary => matches!(to_type, Binary | LargeBinary),
         Decimal128(_, _) | Decimal256(_, _) => {
             matches!(to_type, Decimal128(_, _) | Decimal256(_, _))
-        }
+        },
         List(from_field) | LargeList(from_field) | FixedSizeList(from_field, _) => match to_type {
             List(to_field) | LargeList(to_field) | FixedSizeList(to_field, _) => {
                 is_upcast_downcast(from_field.data_type(), to_field.data_type())
-            }
+            },
             _ => false,
         },
         _ => false,
@@ -203,7 +207,12 @@ fn check_field_conflict(
         (DataType::Struct(fl), DataType::Struct(fr)) => {
             if !version.support_add_sub_column() {
                 return Err(Error::invalid_input(
-                    format!("Column {} is a struct col, add sub column is not supported in Lance file version {}", left.name(), version),
+                    format!(
+                        "Column {} is a struct col, add sub column is not supported in Lance file \
+                         version {}",
+                        left.name(),
+                        version
+                    ),
                     location!(),
                 ));
             }
@@ -224,12 +233,12 @@ fn check_field_conflict(
                 }
             }
             Ok(())
-        }
+        },
         (DataType::List(fl), DataType::List(fr)) => check_field_conflict(fl, fr, version),
         (DataType::LargeList(fl), DataType::LargeList(fr)) => check_field_conflict(fl, fr, version),
         (DataType::FixedSizeList(fl, _), DataType::FixedSizeList(fr, _)) => {
             check_field_conflict(fl, fr, version)
-        }
+        },
         (l_type, r_type) if l_type == r_type => Err(Error::invalid_input(
             format!("Column {} already exists in the dataset", left.name()),
             location!(),
@@ -288,7 +297,7 @@ pub(super) async fn add_columns_to_fragments(
             )
             .await?;
             Result::Ok((udf.output_schema, fragments))
-        }
+        },
         NewColumnTransform::SqlExpressions(expressions) => {
             // We just transform the SQL expression into a UDF backed by DataFusion
             // physical expressions.
@@ -353,24 +362,25 @@ pub(super) async fn add_columns_to_fragments(
             let fragments =
                 add_columns_impl(fragments, read_columns, mapper, batch_size, None, None).await?;
             Ok((output_schema, fragments))
-        }
+        },
         NewColumnTransform::Stream(stream) => {
             let output_schema = stream.schema();
             check_names(output_schema.as_ref())?;
             let fragments = add_columns_from_stream(fragments, stream, None, batch_size).await?;
             Ok((output_schema, fragments))
-        }
+        },
         NewColumnTransform::Reader(reader) => {
             let output_schema = reader.schema();
             check_names(output_schema.as_ref())?;
             let stream = reader.into_stream();
             let fragments = add_columns_from_stream(fragments, stream, None, batch_size).await?;
             Ok((output_schema, fragments))
-        }
+        },
         NewColumnTransform::AllNulls(output_schema) => {
             check_names(output_schema.as_ref())?;
 
-            // Check that the schema is compatible considering all the new columns must be nullable
+            // Check that the schema is compatible considering all the new columns must be
+            // nullable
             let schema = Schema::try_from(output_schema.as_ref())?;
             if !schema.all_fields_nullable() {
                 return Err(Error::InvalidInput {
@@ -384,10 +394,11 @@ pub(super) async fn add_columns_to_fragments(
                 .map(|f| f.metadata.clone())
                 .collect::<Vec<_>>();
 
-            // Check if any of the fragment's files are using the legacy dataset version if so, we
-            // can't add all-null columns as a metadata-only operation. The reason is because we
-            // use the NullReader for fragments that have missing columns and we can't mix legacy
-            // and non-legacy readers when reading the fragment.
+            // Check if any of the fragment's files are using the legacy dataset version if
+            // so, we can't add all-null columns as a metadata-only operation.
+            // The reason is because we use the NullReader for fragments that
+            // have missing columns and we can't mix legacy and non-legacy
+            // readers when reading the fragment.
             if dataset.is_legacy_storage() {
                 return Err(Error::NotSupported {
                     source: "Cannot add all-null columns to legacy dataset version.".into(),
@@ -396,7 +407,7 @@ pub(super) async fn add_columns_to_fragments(
             }
 
             Ok((output_schema, fragments))
-        }
+        },
     }?;
 
     let mut schema = dataset.schema().merge(output_schema.as_ref())?;
@@ -420,7 +431,10 @@ pub(super) async fn add_columns(
     )
     .await?;
 
-    let operation = Operation::Merge { fragments, schema };
+    let operation = Operation::Merge {
+        fragments,
+        schema,
+    };
     let transaction = Transaction::new(dataset.manifest.version, operation, None);
     dataset
         .apply_commit(transaction, &Default::default(), &Default::default())
@@ -577,10 +591,7 @@ pub(super) async fn alter_columns(
     for alteration in alterations {
         let field_src = dataset.schema().field(&alteration.path).ok_or_else(|| {
             Error::invalid_input(
-                format!(
-                    "Column \"{}\" does not exist in the dataset",
-                    alteration.path
-                ),
+                format!("Column \"{}\" does not exist in the dataset", alteration.path),
                 location!(),
             )
         })?;
@@ -614,11 +625,8 @@ pub(super) async fn alter_columns(
                 ));
             }
 
-            let arrow_field = ArrowField::new(
-                field_dest.name.clone(),
-                data_type.clone(),
-                field_dest.nullable,
-            );
+            let arrow_field =
+                ArrowField::new(field_dest.name.clone(), data_type.clone(), field_dest.nullable);
             *field_dest = Field::try_from(&arrow_field)?;
             field_dest.set_id(field_src.parent_id, &mut next_field_id);
 
@@ -632,9 +640,12 @@ pub(super) async fn alter_columns(
     let transaction = if cast_fields.is_empty() {
         Transaction::new(
             dataset.manifest.version,
-            Operation::Project { schema: new_schema },
+            Operation::Project {
+                schema: new_schema,
+            },
             // TODO: Make it possible to alter blob columns
-            /*blob_op= */ None,
+            // blob_op=
+            None,
         )
     } else {
         // Otherwise, we need to re-write the relevant fields.
@@ -651,7 +662,8 @@ pub(super) async fn alter_columns(
             .iter()
             .map(|(_old, new)| new.id)
             .collect::<Vec<_>>();
-        // This schema contains the exact field ids we want to write the new fields with.
+        // This schema contains the exact field ids we want to write the new fields
+        // with.
         let new_col_schema = new_schema.project_by_ids(&new_ids, true);
 
         let mapper = move |batch: &RecordBatch| {
@@ -686,8 +698,9 @@ pub(super) async fn alter_columns(
         )
         .await?;
 
-        // Some data files may no longer contain any columns in the dataset (e.g. if every
-        // remaining column has been altered into a different data file) and so we remove them
+        // Some data files may no longer contain any columns in the dataset (e.g. if
+        // every remaining column has been altered into a different data file)
+        // and so we remove them
         let schema_field_ids = new_schema.field_ids().into_iter().collect::<Vec<_>>();
         let fragments = fragments
             .into_iter()
@@ -707,7 +720,8 @@ pub(super) async fn alter_columns(
                 schema: new_schema,
                 fragments,
             },
-            /*blob_op= */ None,
+            // blob_op=
+            None,
         )
     };
 
@@ -742,16 +756,16 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
     let new_schema = exclude(&dataset.manifest.schema, &columns_to_remove, &version)?;
 
     if new_schema.fields.is_empty() {
-        return Err(Error::invalid_input(
-            "Cannot drop all columns from a dataset",
-            location!(),
-        ));
+        return Err(Error::invalid_input("Cannot drop all columns from a dataset", location!()));
     }
 
     let transaction = Transaction::new(
         dataset.manifest.version,
-        Operation::Project { schema: new_schema },
-        /*blob_op= */ None,
+        Operation::Project {
+            schema: new_schema,
+        },
+        // blob_op=
+        None,
     );
 
     dataset
@@ -787,19 +801,18 @@ pub fn exclude(source: &Schema, other: &Schema, version: &LanceFileVersion) -> R
 
 #[cfg(test)]
 mod test {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
+    use std::{collections::HashMap, sync::Mutex};
 
-    use crate::dataset::WriteParams;
     use arrow_array::{
         ArrayRef, Int32Array, ListArray, RecordBatchIterator, StringArray, StructArray,
     };
-
-    use super::*;
     use arrow_schema::Fields as ArrowFields;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_file::version::LanceFileVersion;
     use rstest::rstest;
+
+    use super::*;
+    use crate::dataset::WriteParams;
 
     // Used to validate that futures returned are Send.
     fn require_send<T: Send>(t: T) -> T {
@@ -809,15 +822,11 @@ mod test {
     #[tokio::test]
     async fn test_append_columns_exprs() -> Result<()> {
         let num_rows = 5;
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "id",
-            DataType::Int32,
-            false,
-        )]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(0..num_rows as i32))],
-        )?;
+        let schema =
+            Arc::new(ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(
+            Int32Array::from_iter_values(0..num_rows as i32),
+        )])?;
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
 
         let test_dir = TempStrDir::default();
@@ -898,16 +907,12 @@ mod test {
         use arrow_array::Float64Array;
 
         let num_rows = 5;
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "id",
-            DataType::Int32,
-            false,
-        )]));
+        let schema =
+            Arc::new(ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]));
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(0..num_rows as i32))],
-        )?;
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(
+            Int32Array::from_iter_values(0..num_rows as i32),
+        )])?;
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
 
         let test_dir = TempStrDir::default();
@@ -937,19 +942,13 @@ mod test {
         assert!(matches!(res, Err(Error::InvalidInput { .. })));
 
         // Can add a column that independent (empty read_schema)
-        let output_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "value",
-            DataType::Float64,
-            true,
-        )]));
+        let output_schema =
+            Arc::new(ArrowSchema::new(vec![ArrowField::new("value", DataType::Float64, true)]));
         let output_schema_ref = output_schema.clone();
         let mapper = move |batch: &RecordBatch| {
-            Ok(RecordBatch::try_new(
-                output_schema_ref.clone(),
-                vec![Arc::new(Float64Array::from_iter_values(
-                    (0..batch.num_rows()).map(|i| i as f64),
-                ))],
-            )?)
+            Ok(RecordBatch::try_new(output_schema_ref.clone(), vec![Arc::new(
+                Float64Array::from_iter_values((0..batch.num_rows()).map(|i| i as f64)),
+            )])?)
         };
         let transforms = NewColumnTransform::BatchUDF(BatchUDF {
             mapper: Box::new(mapper),
@@ -959,11 +958,8 @@ mod test {
         dataset.add_columns(transforms, None, None).await?;
 
         // Can add a column that depends on another column (double id)
-        let output_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "double_id",
-            DataType::Int32,
-            false,
-        )]));
+        let output_schema =
+            Arc::new(ArrowSchema::new(vec![ArrowField::new("double_id", DataType::Int32, false)]));
         let output_schema_ref = output_schema.clone();
         let mapper = move |batch: &RecordBatch| {
             let id = batch
@@ -971,12 +967,9 @@ mod test {
                 .as_any()
                 .downcast_ref::<Int32Array>()
                 .unwrap();
-            Ok(RecordBatch::try_new(
-                output_schema_ref.clone(),
-                vec![Arc::new(Int32Array::from_iter_values(
-                    id.values().iter().map(|i| i * 2),
-                ))],
-            )?)
+            Ok(RecordBatch::try_new(output_schema_ref.clone(), vec![Arc::new(
+                Int32Array::from_iter_values(id.values().iter().map(|i| i * 2)),
+            )])?)
         };
         let transforms = NewColumnTransform::BatchUDF(BatchUDF {
             mapper: Box::new(mapper),
@@ -1002,16 +995,12 @@ mod test {
     #[tokio::test]
     async fn test_append_columns_udf_cache() -> Result<()> {
         let num_rows = 100;
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "id",
-            DataType::Int32,
-            false,
-        )]));
+        let schema =
+            Arc::new(ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]));
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(0..num_rows))],
-        )?;
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(
+            Int32Array::from_iter_values(0..num_rows),
+        )])?;
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
 
         let test_dir = TempStrDir::default();
@@ -1071,6 +1060,7 @@ mod test {
                         physical_rows: Some(50),
                         last_updated_at_version_meta: None,
                         created_at_version_meta: None,
+                        blob_source_keys: Vec::new(),
                     }))
                 } else {
                     Ok(None)
@@ -1088,11 +1078,8 @@ mod test {
 
         let request_counter = Arc::new(RequestCounter::default());
 
-        let output_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "double_id",
-            DataType::Int32,
-            false,
-        )]));
+        let output_schema =
+            Arc::new(ArrowSchema::new(vec![ArrowField::new("double_id", DataType::Int32, false)]));
         let output_schema_ref = output_schema.clone();
         let mapper = move |batch: &RecordBatch| {
             let id = batch
@@ -1100,12 +1087,9 @@ mod test {
                 .as_any()
                 .downcast_ref::<Int32Array>()
                 .unwrap();
-            Ok(RecordBatch::try_new(
-                output_schema_ref.clone(),
-                vec![Arc::new(Int32Array::from_iter_values(
-                    id.values().iter().map(|i| i * 2),
-                ))],
-            )?)
+            Ok(RecordBatch::try_new(output_schema_ref.clone(), vec![Arc::new(
+                Int32Array::from_iter_values(id.values().iter().map(|i| i * 2)),
+            )])?)
         };
         let transforms = NewColumnTransform::BatchUDF(BatchUDF {
             mapper: Box::new(mapper),
@@ -1123,7 +1107,8 @@ mod test {
                 .as_slice(),
             &[0, 1]
         );
-        // Should have only inserted the second fragment, since the first one was already cached
+        // Should have only inserted the second fragment, since the first one was
+        // already cached
         assert_eq!(
             request_counter
                 .insert_fragment_requests
@@ -1133,7 +1118,8 @@ mod test {
             &[1]
         );
 
-        // Should have only requested the second two batches, since the first fragment was already cached
+        // Should have only requested the second two batches, since the first fragment
+        // was already cached
         assert_eq!(
             request_counter
                 .get_batch_requests
@@ -1151,7 +1137,8 @@ mod test {
                 },
             ]
         );
-        // Should have only saved the last batch, since the first batch of second fragment was already cached
+        // Should have only saved the last batch, since the first batch of second
+        // fragment was already cached
         assert_eq!(
             request_counter
                 .insert_batch_requests
@@ -1170,16 +1157,12 @@ mod test {
     #[tokio::test]
     async fn test_add_column_all_nulls() -> Result<()> {
         let num_rows = 100;
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "id",
-            DataType::Int32,
-            false,
-        )]));
+        let schema =
+            Arc::new(ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]));
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(0..num_rows))],
-        )?;
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(
+            Int32Array::from_iter_values(0..num_rows),
+        )])?;
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
 
         let test_dir = TempStrDir::default();
@@ -1247,16 +1230,12 @@ mod test {
     #[tokio::test]
     async fn test_add_column_all_nulls_legacy() -> Result<()> {
         let num_rows = 100;
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "id",
-            DataType::Int32,
-            false,
-        )]));
+        let schema =
+            Arc::new(ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]));
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(0..num_rows))],
-        )?;
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(
+            Int32Array::from_iter_values(0..num_rows),
+        )])?;
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
 
         let test_dir = TempStrDir::default();
@@ -1301,11 +1280,8 @@ mod test {
             ArrowField::new("city", DataType::Utf8, false),
         ]));
 
-        let list_of_struct_type = DataType::List(Arc::new(ArrowField::new(
-            "item",
-            person_struct_type.clone(),
-            false,
-        )));
+        let list_of_struct_type =
+            DataType::List(Arc::new(ArrowField::new("item", person_struct_type.clone(), false)));
 
         let schema = Arc::new(ArrowSchema::new_with_metadata(
             vec![
@@ -1350,10 +1326,10 @@ mod test {
         );
 
         let ids = Int32Array::from(vec![1, 2, 3]);
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(ids) as ArrayRef, Arc::new(all_people) as ArrayRef],
-        )?;
+        let batch = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(ids) as ArrayRef,
+            Arc::new(all_people) as ArrayRef,
+        ])?;
 
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
         let dataset = Dataset::write(
@@ -1509,16 +1485,13 @@ mod test {
             metadata.clone(),
         ));
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2])),
-                Arc::new(StructArray::from(vec![(
-                    Arc::new(ArrowField::new("c", DataType::Int32, true)),
-                    Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
-                )])),
-            ],
-        )?;
+        let batch = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(StructArray::from(vec![(
+                Arc::new(ArrowField::new("c", DataType::Int32, true)),
+                Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+            )])),
+        ])?;
 
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
@@ -1604,16 +1577,12 @@ mod test {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) -> Result<()> {
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "a",
-            DataType::Int32,
-            true,
-        )]));
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new("a", DataType::Int32, true)]));
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values([1, 2, 3]))],
-        )?;
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from_iter_values([
+                1, 2, 3,
+            ]))])?;
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
         let mut dataset = Dataset::write(
@@ -1652,21 +1621,15 @@ mod test {
 
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "b",
-            DataType::Struct(ArrowFields::from(vec![ArrowField::new(
-                "c",
-                DataType::Int32,
-                true,
-            )])),
+            DataType::Struct(ArrowFields::from(vec![ArrowField::new("c", DataType::Int32, true)])),
             false,
         )]));
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(StructArray::from(vec![(
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(StructArray::from(vec![(
                 Arc::new(ArrowField::new("c", DataType::Int32, true)),
                 Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
-            )]))],
-        )?;
+            )]))])?;
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
         let mut dataset = Dataset::write(
@@ -1707,16 +1670,13 @@ mod test {
     async fn test_set_not_null_fails_with_nulls(
         #[values(LanceFileVersion::Stable)] data_storage_version: LanceFileVersion,
     ) -> Result<()> {
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "a",
-            DataType::Int32,
-            true,
-        )]));
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new("a", DataType::Int32, true)]));
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from(vec![Some(1), None, Some(3)]))],
-        )?;
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![
+            Some(1),
+            None,
+            Some(3),
+        ]))])?;
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
         let mut dataset = Dataset::write(
@@ -1751,21 +1711,15 @@ mod test {
 
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "b",
-            DataType::Struct(ArrowFields::from(vec![ArrowField::new(
-                "c",
-                DataType::Int32,
-                true,
-            )])),
+            DataType::Struct(ArrowFields::from(vec![ArrowField::new("c", DataType::Int32, true)])),
             false,
         )]));
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(StructArray::from(vec![(
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(StructArray::from(vec![(
                 Arc::new(ArrowField::new("c", DataType::Int32, true)),
                 Arc::new(Int32Array::from(vec![Some(1), None, Some(3)])) as ArrayRef,
-            )]))],
-        )?;
+            )]))])?;
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
         let mut dataset = Dataset::write(
@@ -1831,23 +1785,20 @@ mod test {
         ]));
 
         let nrows = 512;
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from_iter_values(0..nrows)),
-                Arc::new(Float32Array::from_iter_values((0..nrows).map(|i| i as f32))),
-                Arc::new(
-                    <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
-                        generate_random_array(128 * nrows as usize),
-                        128,
-                    )
-                    .unwrap(),
-                ),
-                Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(
-                    (0..nrows).map(|i| Some(vec![Some(i), Some(i + 1)])),
-                )),
-            ],
-        )?;
+        let batch = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(Int32Array::from_iter_values(0..nrows)),
+            Arc::new(Float32Array::from_iter_values((0..nrows).map(|i| i as f32))),
+            Arc::new(
+                <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
+                    generate_random_array(128 * nrows as usize),
+                    128,
+                )
+                .unwrap(),
+            ),
+            Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(
+                (0..nrows).map(|i| Some(vec![Some(i), Some(i + 1)])),
+            )),
+        ])?;
 
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
@@ -1867,13 +1818,7 @@ mod test {
             .create_index(&["vec"], IndexType::Vector, None, &params, false)
             .await?;
         dataset
-            .create_index(
-                &["i"],
-                IndexType::Scalar,
-                None,
-                &ScalarIndexParams::default(),
-                false,
-            )
+            .create_index(&["i"], IndexType::Scalar, None, &ScalarIndexParams::default(), false)
             .await?;
         dataset.validate().await?;
 
@@ -1939,12 +1884,10 @@ mod test {
 
         // Cast vector column, should not keep index (TODO: keep it)
         dataset
-            .alter_columns(&[
-                ColumnAlteration::new("vec".into()).cast_to(DataType::FixedSizeList(
-                    Arc::new(ArrowField::new("item", DataType::Float16, true)),
-                    128,
-                )),
-            ])
+            .alter_columns(&[ColumnAlteration::new("vec".into()).cast_to(DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float16, true)),
+                128,
+            ))])
             .await?;
         dataset.validate().await?;
 
@@ -1974,31 +1917,27 @@ mod test {
         let indices = dataset.load_indices().await?;
         assert_eq!(indices.len(), 0);
 
-        // Each fragment gains a file with the new columns, but then the original file is dropped
+        // Each fragment gains a file with the new columns, but then the original file
+        // is dropped
         dataset.fragments().iter().for_each(|f| {
             assert_eq!(f.files.len(), 4);
         });
 
-        let expected_data = RecordBatch::try_new(
-            Arc::new(expected_schema),
-            vec![
-                Arc::new(Int64Array::from_iter_values(0..nrows as i64)),
-                Arc::new(Float16Array::from_iter_values(
-                    (0..nrows).map(|i| f16::from_f32(i as f32)),
-                )),
-                lance_arrow::cast::cast_with_options(
-                    batch["vec"].as_ref(),
-                    &DataType::FixedSizeList(
-                        Arc::new(ArrowField::new("item", DataType::Float16, true)),
-                        128,
-                    ),
-                    &Default::default(),
-                )?,
-                Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>(
-                    (0..nrows as i64).map(|i| Some(vec![Some(i), Some(i + 1)])),
-                )),
-            ],
-        )?;
+        let expected_data = RecordBatch::try_new(Arc::new(expected_schema), vec![
+            Arc::new(Int64Array::from_iter_values(0..nrows as i64)),
+            Arc::new(Float16Array::from_iter_values((0..nrows).map(|i| f16::from_f32(i as f32)))),
+            lance_arrow::cast::cast_with_options(
+                batch["vec"].as_ref(),
+                &DataType::FixedSizeList(
+                    Arc::new(ArrowField::new("item", DataType::Float16, true)),
+                    128,
+                ),
+                &Default::default(),
+            )?,
+            Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>(
+                (0..nrows as i64).map(|i| Some(vec![Some(i), Some(i + 1)])),
+            )),
+        ])?;
         let actual_data = dataset.scan().try_into_batch().await?;
         assert_eq!(actual_data, expected_data);
 
@@ -2033,23 +1972,20 @@ mod test {
             metadata.clone(),
         ));
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2])),
-                Arc::new(StructArray::from(vec![
-                    (
-                        Arc::new(ArrowField::new("d", DataType::Int32, true)),
-                        Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
-                    ),
-                    (
-                        Arc::new(ArrowField::new("l", DataType::Int32, true)),
-                        Arc::new(Int32Array::from(vec![1, 2])),
-                    ),
-                ])),
-                Arc::new(Float32Array::from(vec![1.0, 2.0])),
-            ],
-        )?;
+        let batch = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(StructArray::from(vec![
+                (
+                    Arc::new(ArrowField::new("d", DataType::Int32, true)),
+                    Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+                ),
+                (
+                    Arc::new(ArrowField::new("l", DataType::Int32, true)),
+                    Arc::new(Int32Array::from(vec![1, 2])),
+                ),
+            ])),
+            Arc::new(Float32Array::from(vec![1.0, 2.0])),
+        ])?;
 
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
@@ -2083,16 +2019,14 @@ mod test {
         let expected_schema = expected_schema.project(&["i", "s.l"])?;
         assert_eq!(dataset.schema(), &expected_schema);
 
-        let expected_data = RecordBatch::try_new(
-            Arc::new(ArrowSchema::from(&expected_schema)),
-            vec![
+        let expected_data =
+            RecordBatch::try_new(Arc::new(ArrowSchema::from(&expected_schema)), vec![
                 Arc::new(Int32Array::from(vec![1, 2])),
                 Arc::new(StructArray::from(vec![(
                     Arc::new(ArrowField::new("l", DataType::Int32, true)),
                     Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
                 )])),
-            ],
-        )?;
+            ])?;
         let actual_data = dataset.scan().try_into_batch().await?;
         assert_eq!(actual_data, expected_data);
 
@@ -2108,11 +2042,7 @@ mod test {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) -> Result<()> {
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "i",
-            DataType::Int32,
-            false,
-        )]));
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new("i", DataType::Int32, false)]));
         let batch =
             RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))])?;
 
@@ -2157,10 +2087,7 @@ mod test {
         let data = dataset.scan().try_into_batch().await?;
         let expected_data = RecordBatch::try_new(
             Arc::new(schema.try_with_column(ArrowField::new("y", DataType::Int32, false))?),
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2])),
-                Arc::new(Int32Array::from(vec![2, 4])),
-            ],
+            vec![Arc::new(Int32Array::from(vec![1, 2])), Arc::new(Int32Array::from(vec![2, 4]))],
         )?;
         assert_eq!(data, expected_data);
         dataset.drop_columns(&["y"]).await?;
@@ -2200,14 +2127,11 @@ mod test {
             ArrowField::new("a", DataType::Int32, false),
             ArrowField::new("c", DataType::Int32, false),
         ]));
-        let expected_data = RecordBatch::try_new(
-            expected_schema,
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2])),
-                Arc::new(Int32Array::from(vec![4, 5])),
-                Arc::new(Int32Array::from(vec![12, 13])),
-            ],
-        )?;
+        let expected_data = RecordBatch::try_new(expected_schema, vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(Int32Array::from(vec![4, 5])),
+            Arc::new(Int32Array::from(vec![12, 13])),
+        ])?;
         assert_eq!(data, expected_data);
 
         Ok(())
@@ -2215,17 +2139,11 @@ mod test {
 
     #[tokio::test]
     async fn test_new_column_sql_to_all_nulls_transform_optimizer() {
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "a",
-            DataType::Int32,
-            false,
-        )]));
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new("a", DataType::Int32, false)]));
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from_iter(0..100))],
-        )
-        .unwrap();
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from_iter(0..100))])
+                .unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
@@ -2272,17 +2190,11 @@ mod test {
 
     #[tokio::test]
     async fn test_new_column_sql_to_all_nulls_transform_optimizer_legacy() {
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "a",
-            DataType::Int32,
-            false,
-        )]));
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new("a", DataType::Int32, false)]));
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from_iter(0..100))],
-        )
-        .unwrap();
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from_iter(0..100))])
+                .unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
@@ -2600,11 +2512,8 @@ mod test {
             false,
         )
         .with_metadata(packed_meta.clone());
-        let field3 = ArrowField::new(
-            "test",
-            DataType::Struct(vec![new_packed_field].into()),
-            false,
-        );
+        let field3 =
+            ArrowField::new("test", DataType::Struct(vec![new_packed_field].into()), false);
         assert!(check_field_conflict(&field1, &field3, &LanceFileVersion::V2_2).is_ok());
 
         let conflict_field = ArrowField::new(

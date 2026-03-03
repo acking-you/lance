@@ -4,28 +4,24 @@
 /// Keep the tests in `lance` crate because it has dependency on [Dataset].
 #[cfg(test)]
 mod test {
-    use std::sync::Arc;
-    use std::{collections::HashMap, time::Duration};
+    use std::{collections::HashMap, sync::Arc, time::Duration};
 
     use async_trait::async_trait;
     use futures::{future::join_all, StreamExt, TryStreamExt};
-    use lance_core::{Error, Result};
-    use lance_table::io::commit::external_manifest::{
-        ExternalManifestCommitHandler, ExternalManifestStore,
+    use lance_core::{utils::tempfile::TempStrDir, Error, Result};
+    use lance_table::io::commit::{
+        external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore},
+        CommitHandler, ManifestNamingScheme,
     };
-    use lance_table::io::commit::{CommitHandler, ManifestNamingScheme};
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
-    use object_store::local::LocalFileSystem;
-    use object_store::path::Path;
+    use object_store::{local::LocalFileSystem, path::Path};
     use snafu::location;
     use tokio::sync::Mutex;
 
-    use crate::dataset::builder::DatasetBuilder;
     use crate::{
-        dataset::{ReadParams, WriteMode, WriteParams},
+        dataset::{builder::DatasetBuilder, ReadParams, WriteMode, WriteParams},
         Dataset,
     };
-    use lance_core::utils::tempfile::TempStrDir;
 
     // sleep for 1 second to simulate a slow external store on write
     #[derive(Debug)]
@@ -58,21 +54,23 @@ mod test {
         /// Get the latest version of a dataset at the path
         async fn get_latest_version(&self, uri: &str) -> Result<Option<(u64, String)>> {
             let store = self.store.lock().await;
-            let max_version = store
-                .iter()
-                .filter_map(|((stored_uri, version), manifest_uri)| {
-                    if stored_uri == uri {
-                        Some((version, manifest_uri))
-                    } else {
-                        None
-                    }
-                })
-                .max_by_key(|v| v.0);
+            let max_version =
+                store
+                    .iter()
+                    .filter_map(|((stored_uri, version), manifest_uri)| {
+                        if stored_uri == uri {
+                            Some((version, manifest_uri))
+                        } else {
+                            None
+                        }
+                    })
+                    .max_by_key(|v| v.0);
 
             Ok(max_version.map(|(version, uri)| (*version, uri.clone())))
         }
 
-        /// Put the manifest path for a given uri and version, should fail if the version already exists
+        /// Put the manifest path for a given uri and version, should fail if
+        /// the version already exists
         async fn put_if_not_exists(
             &self,
             uri: &str,
@@ -86,20 +84,18 @@ mod test {
             let mut store = self.store.lock().await;
             match store.get(&(uri.to_string(), version)) {
                 Some(_) => Err(Error::io(
-                    format!(
-                        "manifest already exists for uri: {}, version: {}",
-                        uri, version
-                    ),
+                    format!("manifest already exists for uri: {}, version: {}", uri, version),
                     location!(),
                 )),
                 None => {
                     store.insert((uri.to_string(), version), path.to_string());
                     Ok(())
-                }
+                },
             }
         }
 
-        /// Put the manifest path for a given uri and version, should fail if the version already exists
+        /// Put the manifest path for a given uri and version, should fail if
+        /// the version already exists
         async fn put_if_exists(
             &self,
             uri: &str,
@@ -115,12 +111,9 @@ mod test {
                 Some(_) => {
                     store.insert((uri.to_string(), version), path.to_string());
                     Ok(())
-                }
+                },
                 None => Err(Error::io(
-                    format!(
-                        "manifest already exists for uri: {}, version: {}",
-                        uri, version
-                    ),
+                    format!("manifest already exists for uri: {}, version: {}", uri, version),
                     location!(),
                 )),
             }
@@ -219,13 +212,9 @@ mod test {
             let dir = TempStrDir::default();
             let ds_uri = &dir;
 
-            Dataset::write(
-                data_gen.batch(10),
-                ds_uri,
-                Some(write_params(handler.clone())),
-            )
-            .await
-            .unwrap();
+            Dataset::write(data_gen.batch(10), ds_uri, Some(write_params(handler.clone())))
+                .await
+                .unwrap();
 
             // we have 5 retries by default, more than this will just fail
             let write_futs = (0..5)
@@ -328,10 +317,10 @@ mod test {
             .await
             .unwrap();
         {
-            inner_store.lock().await.insert(
-                (ds.base.to_string(), 6),
-                version_six_staging_location.to_string(),
-            );
+            inner_store
+                .lock()
+                .await
+                .insert((ds.base.to_string(), 6), version_six_staging_location.to_string());
         }
         // set the store back to dataset path with -{uuid} suffix
         let mut version_six = localfs
@@ -346,10 +335,10 @@ mod test {
         assert_eq!(version_six.len(), 1);
         let version_six_staging_location = version_six.pop().unwrap().unwrap().location;
         {
-            inner_store.lock().await.insert(
-                (ds.base.to_string(), 6),
-                version_six_staging_location.to_string(),
-            );
+            inner_store
+                .lock()
+                .await
+                .insert((ds.base.to_string(), 6), version_six_staging_location.to_string());
         }
 
         // Open without external store handler, should not see the out-of-sync commit

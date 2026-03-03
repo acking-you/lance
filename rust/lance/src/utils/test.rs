@@ -3,24 +3,24 @@
 
 use std::sync::Arc;
 
-use lance_core::utils::tempfile::{TempDir, TempStrDir};
-use snafu::location;
-
 use arrow_array::{RecordBatch, RecordBatchIterator};
 use arrow_schema::Schema as ArrowSchema;
 use datafusion_physical_plan::ExecutionPlan;
 use lance_arrow::RecordBatchExt;
-use lance_core::datatypes::Schema;
+use lance_core::{
+    datatypes::Schema,
+    utils::tempfile::{TempDir, TempStrDir},
+};
 use lance_datagen::{BatchCount, BatchGeneratorBuilder, ByteCount, RowCount};
 use lance_file::version::LanceFileVersion;
 use lance_table::format::Fragment;
-use rand::prelude::SliceRandom;
-use rand::{Rng, SeedableRng};
+use rand::{prelude::SliceRandom, Rng, SeedableRng};
+use snafu::location;
 
-use crate::dataset::fragment::write::FragmentCreateBuilder;
-use crate::dataset::transaction::Operation;
-use crate::dataset::WriteParams;
-use crate::Dataset;
+use crate::{
+    dataset::{fragment::write::FragmentCreateBuilder, transaction::Operation, WriteParams},
+    Dataset,
+};
 
 mod throttle_store;
 
@@ -52,7 +52,8 @@ impl TestDatasetGenerator {
 
     /// Set the seed for the random number generator.
     ///
-    /// If not set, a random seed will be generated on each call to [`Self::make_hostile`].
+    /// If not set, a random seed will be generated on each call to
+    /// [`Self::make_hostile`].
     #[allow(dead_code)]
     pub fn seed(mut self, seed: u64) -> Self {
         self.seed = Some(seed);
@@ -61,7 +62,8 @@ impl TestDatasetGenerator {
 
     /// Make a new dataset that has a "hostile" layout.
     ///
-    /// For this to be effective, there should be at least two top-level columns.
+    /// For this to be effective, there should be at least two top-level
+    /// columns.
     ///
     /// By "hostile", we mean that:
     /// 1. Top-level columns are randomly split into different files. If there
@@ -71,7 +73,6 @@ impl TestDatasetGenerator {
     /// 2. The field ids are not in sorted order, and have at least one hole.
     /// 3. The order of fields across the data files is random, and not
     ///    consistent across fragments.
-    ///
     pub async fn make_hostile(&self, uri: &str) -> Dataset {
         let seed = self.seed.unwrap_or_else(|| rand::rng().random());
         let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
@@ -116,17 +117,9 @@ impl TestDatasetGenerator {
             initial_bases: None,
         };
 
-        Dataset::commit(
-            uri,
-            operation,
-            None,
-            Default::default(),
-            None,
-            Default::default(),
-            false,
-        )
-        .await
-        .unwrap()
+        Dataset::commit(uri, operation, None, Default::default(), None, Default::default(), false)
+            .await
+            .unwrap()
     }
 
     fn make_schema(&self, rng: &mut impl Rng) -> Schema {
@@ -192,13 +185,7 @@ impl TestDatasetGenerator {
             let columns = column_names
                 .iter()
                 .zip(file_assignments.iter())
-                .filter_map(|(name, &file)| {
-                    if file == file_id {
-                        Some(name.clone())
-                    } else {
-                        None
-                    }
-                })
+                .filter_map(|(name, &file)| if file == file_id { Some(name.clone()) } else { None })
                 .collect::<Vec<_>>();
             let file_schema = schema.project(&columns).unwrap();
             let file_arrow_schema = Arc::new(ArrowSchema::from(&file_schema));
@@ -247,6 +234,7 @@ impl TestDatasetGenerator {
             physical_rows: Some(batch.num_rows()),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            blob_source_keys: Vec::new(),
         }
     }
 }
@@ -350,7 +338,8 @@ impl DatagenExt for BatchGeneratorBuilder {
         rows_per_fragment: FragmentRowCount,
         write_params: Option<WriteParams>,
     ) -> lance_core::Result<Dataset> {
-        // Need to verify that max_rows_per_file has been set otherwise the frag_count won't be respected
+        // Need to verify that max_rows_per_file has been set otherwise the frag_count
+        // won't be respected
         if let Some(write_params) = &write_params {
             if write_params.max_rows_per_file != rows_per_fragment.0 as usize {
                 panic!(
@@ -389,15 +378,8 @@ impl NoContextTestFixture {
         runtime.block_on(async move {
             let tempdir = TempStrDir::default();
             let dataset = lance_datagen::gen_batch()
-                .col(
-                    "text",
-                    lance_datagen::array::rand_utf8(ByteCount::from(10), false),
-                )
-                .into_dataset(
-                    tempdir.as_str(),
-                    FragmentCount::from(4),
-                    FragmentRowCount::from(100),
-                )
+                .col("text", lance_datagen::array::rand_utf8(ByteCount::from(10), false))
+                .into_dataset(tempdir.as_str(), FragmentCount::from(4), FragmentRowCount::from(100))
                 .await
                 .unwrap();
             Self {
@@ -464,8 +446,8 @@ fn trim_whitespace(s: &str) -> String {
 
 /// Asserts that the actual string matches the expected pattern.
 /// The pattern can contain "..." to match any content between specified pieces.
-/// The first piece must match from the start, middle pieces can appear anywhere,
-/// and the last piece must match at the end.
+/// The first piece must match from the start, middle pieces can appear
+/// anywhere, and the last piece must match at the end.
 pub fn assert_string_matches(actual: &str, expected_pattern: &str) -> lance_core::Result<()> {
     let actual_cleaned = trim_whitespace(actual);
     let expected = trim_whitespace(expected_pattern);
@@ -512,10 +494,8 @@ pub async fn assert_plan_node_equals(
     plan_node: Arc<dyn ExecutionPlan>,
     raw_expected: &str,
 ) -> lance_core::Result<()> {
-    let raw_plan_desc = format!(
-        "{}",
-        datafusion::physical_plan::displayable(plan_node.as_ref()).indent(true)
-    );
+    let raw_plan_desc =
+        format!("{}", datafusion::physical_plan::displayable(plan_node.as_ref()).indent(true));
 
     // Use the extracted string matching logic
     assert_string_matches(&raw_plan_desc, raw_expected)
@@ -525,13 +505,13 @@ pub async fn assert_plan_node_equals(
 mod tests {
     use std::sync::Arc;
 
-    use crate::dataset::WriteDestination;
-
-    use super::*;
     use arrow_array::{ArrayRef, BooleanArray, Float64Array, Int32Array, StringArray, StructArray};
     use arrow_schema::{DataType, Field as ArrowField, Fields as ArrowFields};
     use lance_core::utils::tempfile::TempStrDir;
     use rstest::rstest;
+
+    use super::*;
+    use crate::dataset::WriteDestination;
 
     #[rstest]
     #[test]
@@ -596,21 +576,18 @@ mod tests {
             ArrowField::new("b", DataType::Struct(struct_fields.clone()), true),
             ArrowField::new("c", DataType::Float64, false),
         ]));
-        let data = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2, 3])),
-                Arc::new(StructArray::new(
-                    struct_fields,
-                    vec![
-                        Arc::new(StringArray::from(vec!["foo", "bar", "baz"])) as ArrayRef,
-                        Arc::new(BooleanArray::from(vec![true, false, true])),
-                    ],
-                    None,
-                )),
-                Arc::new(Float64Array::from(vec![1.1, 2.2, 3.3])),
-            ],
-        )
+        let data = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(StructArray::new(
+                struct_fields,
+                vec![
+                    Arc::new(StringArray::from(vec!["foo", "bar", "baz"])) as ArrayRef,
+                    Arc::new(BooleanArray::from(vec![true, false, true])),
+                ],
+                None,
+            )),
+            Arc::new(Float64Array::from(vec![1.1, 2.2, 3.3])),
+        ])
         .unwrap();
 
         let generator = TestDatasetGenerator::new(vec![data.clone()], data_storage_version);
@@ -660,23 +637,17 @@ mod tests {
             ArrowField::new("c", DataType::Float64, false),
         ]));
         let data = vec![
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int32Array::from(vec![1, 2, 3])),
-                    Arc::new(Int32Array::from(vec![10, 20, 30])),
-                    Arc::new(Float64Array::from(vec![1.1, 2.2, 3.3])),
-                ],
-            )
+            RecordBatch::try_new(schema.clone(), vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![10, 20, 30])),
+                Arc::new(Float64Array::from(vec![1.1, 2.2, 3.3])),
+            ])
             .unwrap(),
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int32Array::from(vec![4, 5, 6])),
-                    Arc::new(Int32Array::from(vec![40, 50, 60])),
-                    Arc::new(Float64Array::from(vec![4.4, 5.5, 6.6])),
-                ],
-            )
+            RecordBatch::try_new(schema.clone(), vec![
+                Arc::new(Int32Array::from(vec![4, 5, 6])),
+                Arc::new(Int32Array::from(vec![40, 50, 60])),
+                Arc::new(Float64Array::from(vec![4.4, 5.5, 6.6])),
+            ])
             .unwrap(),
         ];
 

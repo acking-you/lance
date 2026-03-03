@@ -3,6 +3,11 @@
 use std::sync::Arc;
 
 use arrow::datatypes::Int32Type;
+use aws_config::{BehaviorVersion, ConfigLoader, Region, SdkConfig};
+use aws_sdk_s3::{config::Credentials, Client as S3Client};
+use futures::future::try_join_all;
+use lance_datagen::{array, gen_batch, RowCount};
+use lance_io::{assert_io_eq, utils::tracking_store::IOTracker};
 
 use crate::{
     dataset::{
@@ -10,12 +15,6 @@ use crate::{
     },
     io::{ObjectStoreParams, StorageOptionsAccessor},
 };
-use aws_config::{BehaviorVersion, ConfigLoader, Region, SdkConfig};
-use aws_sdk_s3::{config::Credentials, Client as S3Client};
-use futures::future::try_join_all;
-use lance_datagen::{array, gen_batch, RowCount};
-use lance_io::assert_io_eq;
-use lance_io::utils::tracking_store::IOTracker;
 
 const CONFIG: &[(&str, &str)] = &[
     ("access_key_id", "ACCESS_KEY"),
@@ -63,7 +62,7 @@ impl S3Bucket {
         match res {
             Err(e) if e.is_no_such_bucket() => return,
             Err(e) => panic!("Failed to list objects in bucket: {}", e),
-            _ => {}
+            _ => {},
         }
         let objects = res.unwrap().contents.unwrap_or_default();
         for object in objects {
@@ -157,8 +156,8 @@ impl DynamoDBCommitTable {
             .await
             .map_err(|err| err.into_service_error())
         {
-            Ok(_) => {}
-            Err(e) if e.is_resource_not_found_exception() => {}
+            Ok(_) => {},
+            Err(e) if e.is_resource_not_found_exception() => {},
             Err(e) => panic!("Failed to delete table: {}", e),
         };
     }
@@ -180,7 +179,8 @@ async fn test_concurrent_writers() {
     let datagen = gen_batch().col("values", array::step::<Int32Type>());
     let data = datagen.into_batch_rows(RowCount::from(100)).unwrap();
 
-    // We want to track IOs prior to creating the dataset, so need to explicitly create the tracker
+    // We want to track IOs prior to creating the dataset, so need to explicitly
+    // create the tracker
     let io_tracker = Arc::new(IOTracker::default());
 
     // Create a table
@@ -334,8 +334,8 @@ async fn test_ddb_open_iops() {
     let io_stats = dataset.object_store().io_stats_incremental();
     // Append: 5 IOPS: data file, transaction file, 3x manifest file
     assert_io_eq!(io_stats, write_iops, 5);
-    // TODO: we can reduce this by implementing a specialized CommitHandler::list_manifest_locations()
-    // for the DDB commit handler.
+    // TODO: we can reduce this by implementing a specialized
+    // CommitHandler::list_manifest_locations() for the DDB commit handler.
     assert_io_eq!(io_stats, read_iops, 1);
 
     // Checkout original version

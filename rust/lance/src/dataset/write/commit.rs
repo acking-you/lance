@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
-use lance_core::utils::mask::RowAddrTreeMap;
+use lance_core::utils::{
+    mask::RowAddrTreeMap,
+    tracing::{DATASET_COMMITTED_EVENT, TRACE_DATASET_EVENTS},
+};
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_table::{
@@ -12,28 +14,26 @@ use lance_table::{
     io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
 };
 use snafu::location;
+use tracing::info;
 
+use super::{resolve_commit_handler, WriteDestination};
 use crate::{
     dataset::{
+        branch_location::BranchLocation,
         builder::DatasetBuilder,
         commit_detached_transaction, commit_new_dataset, commit_transaction,
         refs::Refs,
-        transaction::{Operation, Transaction},
+        transaction::{validate_operation, Operation, Transaction},
         ManifestWriteConfig, ReadParams,
     },
     session::Session,
     Dataset, Error, Result,
 };
 
-use super::{resolve_commit_handler, WriteDestination};
-use crate::dataset::branch_location::BranchLocation;
-use crate::dataset::transaction::validate_operation;
-use lance_core::utils::tracing::{DATASET_COMMITTED_EVENT, TRACE_DATASET_EVENTS};
-use tracing::info;
-
 /// Create a new commit from a [`Transaction`].
 ///
-/// Transactions can be created using a write method like [`super::InsertBuilder::execute_uncommitted`].
+/// Transactions can be created using a write method like
+/// [`super::InsertBuilder::execute_uncommitted`].
 #[derive(Debug, Clone)]
 pub struct CommitBuilder<'a> {
     dest: WriteDestination<'a>,
@@ -82,8 +82,8 @@ impl<'a> CommitBuilder<'a> {
 
     /// Pass the storage format to use for the dataset.
     ///
-    /// This is only needed when creating a new empty table. If any data files are
-    /// passed, the storage format will be inferred from the data files.
+    /// This is only needed when creating a new empty table. If any data files
+    /// are passed, the storage format will be inferred from the data files.
     ///
     /// All data files must use the same storage format as the existing dataset.
     /// If a different format is passed, an error will be returned.
@@ -126,9 +126,10 @@ impl<'a> CommitBuilder<'a> {
     }
 
     ///  If set to true, and this is a new dataset, uses the new v2 manifest
-    ///  paths. These allow constant-time lookups for the latest manifest on object storage.
-    ///  This parameter has no effect on existing datasets. To migrate an existing
-    ///  dataset, use the [`Dataset::migrate_manifest_paths_v2`] method. **Default is True.**
+    ///  paths. These allow constant-time lookups for the latest manifest on
+    /// object storage.  This parameter has no effect on existing datasets.
+    /// To migrate an existing  dataset, use the
+    /// [`Dataset::migrate_manifest_paths_v2`] method. **Default is True.**
     ///
     /// <div class="warning">
     ///  WARNING: turning this on will make the dataset unreadable for older
@@ -152,7 +153,8 @@ impl<'a> CommitBuilder<'a> {
 
     /// Set the maximum number of retries for commit operations.
     ///
-    /// If a commit operation fails, it will be retried up to `max_retries` times.
+    /// If a commit operation fails, it will be retried up to `max_retries`
+    /// times.
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
         self.commit_config.num_retries = max_retries;
         self
@@ -171,8 +173,9 @@ impl<'a> CommitBuilder<'a> {
     }
 
     /// provide Configuration key-value pairs associated with this transaction.
-    /// This is used to store metadata about the transaction, such as commit messages, engine information, etc.
-    /// this properties map will be persisted as a part of the transaction object
+    /// This is used to store metadata about the transaction, such as commit
+    /// messages, engine information, etc. this properties map will be
+    /// persisted as a part of the transaction object
     pub fn with_transaction_properties(
         mut self,
         transaction_properties: HashMap<String, String>,
@@ -188,11 +191,9 @@ impl<'a> CommitBuilder<'a> {
             .unwrap_or_default();
 
         let (object_store, base_path, commit_handler) = match &self.dest {
-            WriteDestination::Dataset(dataset) => (
-                dataset.object_store.clone(),
-                dataset.base.clone(),
-                dataset.commit_handler.clone(),
-            ),
+            WriteDestination::Dataset(dataset) => {
+                (dataset.object_store.clone(), dataset.base.clone(), dataset.commit_handler.clone())
+            },
             WriteDestination::Uri(uri) => {
                 let commit_handler = if self.commit_handler.is_some() && self.object_store.is_some()
                 {
@@ -215,7 +216,7 @@ impl<'a> CommitBuilder<'a> {
                     .await?
                 };
                 (object_store, base_path, commit_handler)
-            }
+            },
         };
 
         let dest = match &self.dest {
@@ -239,12 +240,17 @@ impl<'a> CommitBuilder<'a> {
 
                 match builder.load().await {
                     Ok(dataset) => WriteDestination::Dataset(Arc::new(dataset)),
-                    Err(Error::DatasetNotFound { .. } | Error::NotFound { .. }) => {
-                        WriteDestination::Uri(uri)
-                    }
+                    Err(
+                        Error::DatasetNotFound {
+                            ..
+                        }
+                        | Error::NotFound {
+                            ..
+                        },
+                    ) => WriteDestination::Uri(uri),
                     Err(e) => return Err(e),
                 }
-            }
+            },
         };
 
         if dest.dataset().is_none()
@@ -261,7 +267,8 @@ impl<'a> CommitBuilder<'a> {
         }
 
         // Validate the operation before proceeding with the commit
-        // This ensures that operations like Merge have proper validation for data integrity
+        // This ensures that operations like Merge have proper validation for data
+        // integrity
         if let Some(dataset) = dest.dataset() {
             validate_operation(Some(&dataset.manifest), &transaction.operation)?;
         } else {
@@ -299,10 +306,11 @@ impl<'a> CommitBuilder<'a> {
                 {
                     return Err(Error::InvalidInput {
                         source: format!(
-                            "Storage format mismatch. Existing dataset uses {:?}, but new data uses {:?}",
-                            ds.manifest.data_storage_format,
-                            passed_storage_format
-                        ).into(),
+                            "Storage format mismatch. Existing dataset uses {:?}, but new data \
+                             uses {:?}",
+                            ds.manifest.data_storage_format, passed_storage_format
+                        )
+                        .into(),
                         location: location!(),
                     });
                 }
@@ -346,7 +354,8 @@ impl<'a> CommitBuilder<'a> {
                 .await?
             }
         } else if self.detached {
-            // I think we may eventually want this, and we can probably handle it, but leaving a TODO for now
+            // I think we may eventually want this, and we can probably handle it, but
+            // leaving a TODO for now
             return Err(Error::NotSupported {
                 source: "detached commits cannot currently be used to create new datasets".into(),
                 location: location!(),
@@ -386,15 +395,12 @@ impl<'a> CommitBuilder<'a> {
                 ..dataset.as_ref().clone()
             }),
             WriteDestination::Uri(uri) => {
-                let refs = Refs::new(
-                    object_store.clone(),
-                    commit_handler.clone(),
-                    BranchLocation {
+                let refs =
+                    Refs::new(object_store.clone(), commit_handler.clone(), BranchLocation {
                         path: base_path.clone(),
                         uri: uri.to_string(),
                         branch: manifest.branch.clone(),
-                    },
-                );
+                    });
 
                 Ok(Dataset {
                     object_store,
@@ -411,15 +417,15 @@ impl<'a> CommitBuilder<'a> {
                     file_reader_options: None,
                     store_params: self.store_params.clone().map(Box::new),
                 })
-            }
+            },
         }
     }
 
     /// Commit a set of transactions as a single new version.
     ///
     /// <div class="warning">
-    ///   Only works for append transactions right now. Other kinds of transactions
-    ///   will be supported in the future.
+    ///   Only works for append transactions right now. Other kinds of
+    /// transactions   will be supported in the future.
     /// </div>
     pub async fn execute_batch(self, transactions: Vec<Transaction>) -> Result<BatchCommitResult> {
         if transactions.is_empty() {
@@ -446,18 +452,23 @@ impl<'a> CommitBuilder<'a> {
                 fragments: transactions
                     .iter()
                     .flat_map(|t| match &t.operation {
-                        Operation::Append { fragments } => fragments.clone(),
+                        Operation::Append {
+                            fragments,
+                        } => fragments.clone(),
                         _ => unreachable!(),
                     })
                     .collect(),
             },
             read_version,
             tag: None,
-            //TODO: handle batch transaction merges in the future
+            // TODO: handle batch transaction merges in the future
             transaction_properties: None,
         };
         let dataset = self.execute(merged.clone()).await?;
-        Ok(BatchCommitResult { dataset, merged })
+        Ok(BatchCommitResult {
+            dataset,
+            merged,
+        })
     }
 }
 
@@ -472,21 +483,19 @@ pub struct BatchCommitResult {
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::{Int32Array, RecordBatch};
-    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-
-    use lance_io::utils::CachedFileSize;
-    use lance_io::{assert_io_eq, assert_io_gt};
-    use lance_table::format::{DataFile, Fragment};
     use std::time::Duration;
 
+    use arrow::array::{Int32Array, RecordBatch};
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use lance_io::{assert_io_eq, assert_io_gt, utils::CachedFileSize};
+    use lance_table::format::{DataFile, Fragment};
     use object_store::throttle::ThrottleConfig;
 
-    use crate::utils::test::ThrottledStoreWrapper;
-
-    use crate::dataset::{InsertBuilder, WriteParams};
-
     use super::*;
+    use crate::{
+        dataset::{InsertBuilder, WriteParams},
+        utils::test::ThrottledStoreWrapper,
+    };
 
     fn sample_fragment() -> Fragment {
         let (major_version, minor_version) = LanceFileVersion::Stable.to_numbers();
@@ -506,6 +515,7 @@ mod tests {
             physical_rows: Some(10),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            blob_source_keys: Vec::new(),
         }
     }
 
@@ -526,15 +536,10 @@ mod tests {
         // Need to use in-memory for accurate IOPS tracking.
         let session = Arc::new(Session::default());
         // Create new dataset
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "i",
-            DataType::Int32,
-            false,
-        )]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
-        )
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new("i", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(
+            Int32Array::from_iter_values(0..10_i32),
+        )])
         .unwrap();
         let dataset = InsertBuilder::new("memory://test")
             .with_params(&WriteParams {
@@ -612,11 +617,7 @@ mod tests {
             ..Default::default()
         };
         let data = RecordBatch::try_new(
-            Arc::new(ArrowSchema::new(vec![ArrowField::new(
-                "a",
-                DataType::Int32,
-                false,
-            )])),
+            Arc::new(ArrowSchema::new(vec![ArrowField::new("a", DataType::Int32, false)])),
             vec![Arc::new(Int32Array::from(vec![0; 5]))],
         )
         .unwrap();
@@ -669,11 +670,7 @@ mod tests {
             ..Default::default()
         };
         let data = RecordBatch::try_new(
-            Arc::new(ArrowSchema::new(vec![ArrowField::new(
-                "a",
-                DataType::Int32,
-                false,
-            )])),
+            Arc::new(ArrowSchema::new(vec![ArrowField::new("a", DataType::Int32, false)])),
             vec![Arc::new(Int32Array::from(vec![0; 5]))],
         )
         .unwrap();
@@ -701,14 +698,16 @@ mod tests {
 
         let io_stats = new_ds.object_store().io_stats_incremental();
 
-        // If there is a conflict with two transaction, the retry should require io requests:
+        // If there is a conflict with two transaction, the retry should require io
+        // requests:
         // * 1 list version
         // * num_other_txns read manifests (cache-able)
         // * num_other_txns read txn files (cache-able)
         // * 1 write txn file
         // * 1 write manifest
-        // For total of 3 + 2 * num_other_txns io requests. If we have caching enabled, we can skip 2 * num_other_txns
-        // of those. We should be able to read in 5 hops.
+        // For total of 3 + 2 * num_other_txns io requests. If we have caching enabled,
+        // we can skip 2 * num_other_txns of those. We should be able to read in
+        // 5 hops.
         if use_cache {
             assert_io_eq!(io_stats, read_iops, 1); // Just list versions
             assert_io_eq!(io_stats, num_stages, 3);
@@ -728,15 +727,10 @@ mod tests {
     #[tokio::test]
     async fn test_commit_batch() {
         // Create a dataset
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "i",
-            DataType::Int32,
-            false,
-        )]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
-        )
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new("i", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(
+            Int32Array::from_iter_values(0..10_i32),
+        )])
         .unwrap();
         let dataset = InsertBuilder::new("memory://test")
             .execute(vec![batch])
@@ -776,10 +770,16 @@ mod tests {
         let append1 = sample_transaction(1);
         let append2 = sample_transaction(2);
         let mut expected_fragments = vec![];
-        if let Operation::Append { fragments } = &append1.operation {
+        if let Operation::Append {
+            fragments,
+        } = &append1.operation
+        {
             expected_fragments.extend(fragments.clone());
         }
-        if let Operation::Append { fragments } = &append2.operation {
+        if let Operation::Append {
+            fragments,
+        } = &append2.operation
+        {
             expected_fragments.extend(fragments.clone());
         }
         let res = CommitBuilder::new(dataset.clone())

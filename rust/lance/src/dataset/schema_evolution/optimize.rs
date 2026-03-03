@@ -4,14 +4,11 @@
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
-use datafusion::prelude::Expr;
-use datafusion::scalar::ScalarValue;
+use datafusion::{prelude::Expr, scalar::ScalarValue};
 use lance_datafusion::planner::Planner;
 
-use crate::Dataset;
-use crate::Result;
-
 use super::NewColumnTransform;
+use crate::{Dataset, Result};
 
 /// Optimizes a `NewColumnTransform` into
 pub(super) trait NewColumnTransformOptimizer: Send + Sync {
@@ -23,14 +20,17 @@ pub(super) trait NewColumnTransformOptimizer: Send + Sync {
     ) -> Result<NewColumnTransform>;
 }
 
-/// A `NewColumnTransformOptimizer` that chains multiple `NewColumnTransformOptimizer`s together.
+/// A `NewColumnTransformOptimizer` that chains multiple
+/// `NewColumnTransformOptimizer`s together.
 pub(super) struct ChainedNewColumnTransformOptimizer {
     optimizers: Vec<Box<dyn NewColumnTransformOptimizer>>,
 }
 
 impl ChainedNewColumnTransformOptimizer {
     pub(super) fn new(optimizers: Vec<Box<dyn NewColumnTransformOptimizer>>) -> Self {
-        Self { optimizers }
+        Self {
+            optimizers,
+        }
     }
 
     pub(super) fn add_optimizer(&mut self, optimizer: Box<dyn NewColumnTransformOptimizer>) {
@@ -38,7 +38,8 @@ impl ChainedNewColumnTransformOptimizer {
     }
 }
 
-/// A `NewColumnTransformOptimizer` that chains multiple `NewColumnTransformOptimizer`s together.
+/// A `NewColumnTransformOptimizer` that chains multiple
+/// `NewColumnTransformOptimizer`s together.
 impl NewColumnTransformOptimizer for ChainedNewColumnTransformOptimizer {
     fn optimize(
         &self,
@@ -53,12 +54,12 @@ impl NewColumnTransformOptimizer for ChainedNewColumnTransformOptimizer {
     }
 }
 
-/// Optimizes a `NewColumnTransform` that is a SQL expression to a `NewColumnTransform::AllNulls` if
-/// the SQL expression is "NULL". For example
+/// Optimizes a `NewColumnTransform` that is a SQL expression to a
+/// `NewColumnTransform::AllNulls` if the SQL expression is "NULL". For example
 /// `NewColumnTransform::SqlExpression(vec![("new_col", "CAST(NULL AS int)"])`
 /// would be optimized to
-/// `NewColumnTransform::AllNulls(Schema::new(vec![Field::new("new_col", DataType::Int)]))`.
-///
+/// `NewColumnTransform::AllNulls(Schema::new(vec![Field::new("new_col",
+/// DataType::Int)]))`.
 pub(super) struct SqlToAllNullsOptimizer;
 
 impl SqlToAllNullsOptimizer {
@@ -75,7 +76,7 @@ impl SqlToAllNullsOptimizer {
                 } else {
                     AllNullsResult::NotAllNulls
                 }
-            }
+            },
             _ => AllNullsResult::NotAllNulls,
         }
     }
@@ -109,7 +110,7 @@ impl NewColumnTransformOptimizer for SqlToAllNullsOptimizer {
 
                 let all_null_schema = Schema::new(all_null_schema_fields);
                 Ok(NewColumnTransform::AllNulls(Arc::new(all_null_schema)))
-            }
+            },
             _ => Ok(transform),
         }
     }
@@ -117,9 +118,9 @@ impl NewColumnTransformOptimizer for SqlToAllNullsOptimizer {
 
 #[cfg(test)]
 mod test {
-    use super::*;
-
     use arrow_array::RecordBatchIterator;
+
+    use super::*;
 
     #[tokio::test]
     async fn test_sql_to_all_null_transform() {

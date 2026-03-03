@@ -3,26 +3,30 @@
 
 use std::{collections::HashMap, future::Future, ops::DerefMut, sync::Arc};
 
-use arrow::array::AsArray;
-use arrow::datatypes::{UInt32Type, UInt64Type, UInt8Type};
-use arrow_array::builder::{LargeBinaryBuilder, PrimitiveBuilder, StringBuilder};
-use arrow_array::Array;
-use arrow_array::RecordBatch;
+use arrow::{
+    array::AsArray,
+    datatypes::{UInt32Type, UInt64Type, UInt8Type},
+};
+use arrow_array::{
+    builder::{LargeBinaryBuilder, PrimitiveBuilder, StringBuilder},
+    Array, RecordBatch, StructArray,
+};
 use arrow_schema::DataType as ArrowDataType;
 use lance_arrow::{FieldExt, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY};
-use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
+use lance_core::{
+    datatypes::{BlobKind, BlobVersion},
+    utils::{address::RowAddress, blob::blob_path},
+    Error, Result,
+};
+use lance_io::{
+    object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry},
+    traits::{Reader, Writer},
+};
 use object_store::path::Path;
 use snafu::location;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
+use tokio::{io::AsyncWriteExt, sync::Mutex};
 
-use super::take::TakeBuilder;
-use super::{Dataset, ProjectionRequest};
-use arrow_array::StructArray;
-use lance_core::datatypes::{BlobKind, BlobVersion};
-use lance_core::utils::blob::blob_path;
-use lance_core::{utils::address::RowAddress, Error, Result};
-use lance_io::traits::{Reader, Writer};
+use super::{take::TakeBuilder, Dataset, ProjectionRequest};
 
 const INLINE_MAX: usize = 64 * 1024; // 64KB inline cutoff
 const DEDICATED_THRESHOLD: usize = 4 * 1024 * 1024; // 4MB dedicated cutoff
@@ -110,10 +114,13 @@ impl PackWriter {
     }
 }
 
-/// Preprocesses blob v2 columns on the write path so the encoder only sees lightweight descriptors:
+/// Preprocesses blob v2 columns on the write path so the encoder only sees
+/// lightweight descriptors:
 ///
-/// - Spills large blobs to sidecar files before encoding, reducing memory/CPU and avoiding copying huge payloads through page builders.
-/// - Emits `blob_id/blob_size` tied to the data file stem, giving readers a stable path independent of temporary fragment IDs assigned during write.
+/// - Spills large blobs to sidecar files before encoding, reducing memory/CPU
+///   and avoiding copying huge payloads through page builders.
+/// - Emits `blob_id/blob_size` tied to the data file stem, giving readers a
+///   stable path independent of temporary fragment IDs assigned during write.
 /// - Leaves small inline blobs and URI rows unchanged for compatibility.
 pub struct BlobPreprocessor {
     object_store: ObjectStore,
@@ -428,30 +435,27 @@ pub async fn preprocess_blob_batches(
     Ok(out)
 }
 
-/// One sidecar .blob file that needs to be copied during compaction.
-#[derive(Debug, Clone)]
-pub struct SidecarCopyEntry {
-    pub old_data_file_key: String,
-    pub old_blob_id: u32,
-    pub new_blob_id: u32,
-}
-
-/// Convert a scanner `BlobsDescriptions` batch (5-field descriptor per blob column)
-/// into the 6-field preprocessor format that `BlobPreprocessor` normally produces.
+/// Convert a scanner `BlobsDescriptions` batch (5-field descriptor per blob
+/// column) into the 6-field preprocessor format that `BlobPreprocessor`
+/// normally produces.
 ///
 /// For **Inline** blobs the raw data is read back from the source `.lance` file
-/// via `object_store.get_range()`.  For **Dedicated**/**Packed** blobs a
-/// `SidecarCopyEntry` is recorded so the caller can copy the sidecar `.blob`
-/// file.  **External** blobs are passed through unchanged.
+/// via `object_store.get_range()`.  For **Dedicated**/**Packed** blobs the
+/// `blob_uri` field is set to the source `data_file_key` so the sidecar `.blob`
+/// file stays in place (zero-copy compaction).  **External** blobs are passed
+/// through unchanged.
+///
+/// Returns the transformed batch and a set of `data_file_key`s whose blob
+/// sidecar directories are referenced — these must be recorded in the new
+/// fragment's `blob_source_keys` for GC protection.
 pub async fn descriptor_to_preprocessor_batch(
     batch: &RecordBatch,
     schema: &lance_core::datatypes::Schema,
-    blob_id_counter: &std::sync::atomic::AtomicU32,
     object_store: &ObjectStore,
-    _source_data_file_key: &str,
+    source_data_file_key: &str,
     source_data_file_path: &Path,
-) -> Result<(RecordBatch, Vec<SidecarCopyEntry>)> {
-    let mut sidecar_copies = Vec::new();
+) -> Result<(RecordBatch, std::collections::HashSet<String>)> {
+    let mut blob_source_keys = std::collections::HashSet::new();
     let mut new_columns: Vec<Arc<dyn arrow_array::Array>> = Vec::with_capacity(batch.num_columns());
     let mut new_fields: Vec<arrow_schema::FieldRef> = Vec::with_capacity(batch.num_columns());
 
@@ -540,7 +544,10 @@ pub async fn descriptor_to_preprocessor_batch(
                         .inner
                         .get_range(source_data_file_path, position..(position + size))
                         .await
-                        .map_err(|e| Error::IO { source: Box::new(e), location: location!() })?;
+                        .map_err(|e| Error::IO {
+                            source: Box::new(e),
+                            location: location!(),
+                        })?;
 
                     kind_builder.append_value(BlobKind::Inline as u8);
                     data_builder.append_value(&data);
@@ -550,35 +557,42 @@ pub async fn descriptor_to_preprocessor_batch(
                     new_position_builder.append_null(); // encoder recalculates
                 },
                 BlobKind::Packed => {
-                    // Fallback: treat as Dedicated for sidecar copy
-                    let old_blob_id = blob_id_col.value(i);
-                    let new_id = blob_id_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    sidecar_copies.push(SidecarCopyEntry {
-                        old_data_file_key: _source_data_file_key.to_string(),
-                        old_blob_id,
-                        new_blob_id: new_id,
-                    });
+                    // Zero-copy: keep original blob_id, record source key in blob_uri
+                    let blob_id = blob_id_col.value(i);
+                    let blob_uri = blob_uri_col.value(i);
+                    let source_key = if !blob_uri.is_empty() {
+                        blob_uri.to_string() // Already compacted: pass through
+                                             // original key
+                    } else {
+                        source_data_file_key.to_string() // First compaction:
+                                                         // record current key
+                    };
+                    blob_source_keys.insert(source_key.clone());
 
                     kind_builder.append_value(BlobKind::Packed as u8);
                     data_builder.append_null();
-                    uri_builder.append_null();
-                    new_blob_id_builder.append_value(new_id);
+                    uri_builder.append_value(&source_key);
+                    new_blob_id_builder.append_value(blob_id);
                     blob_size_builder.append_value(size);
                     new_position_builder.append_value(position_col.value(i));
                 },
                 BlobKind::Dedicated => {
-                    let old_blob_id = blob_id_col.value(i);
-                    let new_id = blob_id_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    sidecar_copies.push(SidecarCopyEntry {
-                        old_data_file_key: _source_data_file_key.to_string(),
-                        old_blob_id,
-                        new_blob_id: new_id,
-                    });
+                    // Zero-copy: keep original blob_id, record source key in blob_uri
+                    let blob_id = blob_id_col.value(i);
+                    let blob_uri = blob_uri_col.value(i);
+                    let source_key = if !blob_uri.is_empty() {
+                        blob_uri.to_string() // Already compacted: pass through
+                                             // original key
+                    } else {
+                        source_data_file_key.to_string() // First compaction:
+                                                         // record current key
+                    };
+                    blob_source_keys.insert(source_key.clone());
 
                     kind_builder.append_value(BlobKind::Dedicated as u8);
                     data_builder.append_null();
-                    uri_builder.append_null();
-                    new_blob_id_builder.append_value(new_id);
+                    uri_builder.append_value(&source_key);
+                    new_blob_id_builder.append_value(blob_id);
                     blob_size_builder.append_value(size);
                     new_position_builder.append_null();
                 },
@@ -643,7 +657,7 @@ pub async fn descriptor_to_preprocessor_batch(
 
     let result = RecordBatch::try_new(new_schema, new_columns)
         .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
-    Ok((result, sidecar_copies))
+    Ok((result, blob_source_keys))
 }
 
 /// Build a Lance Schema for compaction writes: logical 2-field blob structs are
@@ -972,7 +986,8 @@ pub async fn take_blobs_by_addresses(
 
     // Use try_new_from_addresses to bypass row ID index lookup.
     // This is critical when enable_stable_row_ids=true because row addresses
-    // (fragment_id << 32 | row_offset) are different from row IDs (sequential integers).
+    // (fragment_id << 32 | row_offset) are different from row IDs (sequential
+    // integers).
     let description_and_addr =
         TakeBuilder::try_new_from_addresses(dataset.clone(), row_addrs.to_vec(), projection_plan)?
             .with_row_address(true)
@@ -1009,7 +1024,8 @@ fn blob_version_from_descriptions(descriptions: &StructArray) -> Result<BlobVers
     }
     Err(Error::InvalidInput {
         source: format!(
-            "Unrecognized blob descriptions schema: expected v1 (position,size) or v2 (kind,position,size,blob_id,blob_uri) but got {:?}",
+            "Unrecognized blob descriptions schema: expected v1 (position,size) or v2 \
+             (kind,position,size,blob_id,blob_uri) but got {:?}",
             fields.iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
         )
         .into(),
@@ -1058,7 +1074,8 @@ async fn collect_blob_files_v2(
     for (idx, row_addr) in row_addrs.values().iter().enumerate() {
         let kind = BlobKind::try_from(kinds.value(idx))?;
 
-        // Struct is non-nullable; null rows are encoded as inline with zero position/size and empty uri
+        // Struct is non-nullable; null rows are encoded as inline with zero
+        // position/size and empty uri
         if matches!(kind, BlobKind::Inline) && positions.value(idx) == 0 && sizes.value(idx) == 0 {
             continue;
         }
@@ -1078,22 +1095,30 @@ async fn collect_blob_files_v2(
             BlobKind::Dedicated => {
                 let blob_id = blob_ids.value(idx);
                 let size = sizes.value(idx);
-                let frag_id = RowAddress::from(*row_addr).fragment_id();
-                let frag =
-                    dataset
-                        .get_fragment(frag_id as usize)
-                        .ok_or_else(|| Error::Internal {
-                            message: "Fragment not found".to_string(),
-                            location: location!(),
-                        })?;
-                let data_file =
-                    frag.data_file_for_field(blob_field_id)
-                        .ok_or_else(|| Error::Internal {
-                            message: "Data file not found for blob field".to_string(),
-                            location: location!(),
-                        })?;
+                let blob_uri = blob_uris.value(idx);
 
-                let data_file_key = data_file_key_from_path(data_file.path.as_str());
+                // Zero-copy compaction: blob_uri stores the actual source data_file_key
+                let key_string;
+                let data_file_key = if !blob_uri.is_empty() {
+                    blob_uri
+                } else {
+                    let frag_id = RowAddress::from(*row_addr).fragment_id();
+                    let frag =
+                        dataset
+                            .get_fragment(frag_id as usize)
+                            .ok_or_else(|| Error::Internal {
+                                message: "Fragment not found".to_string(),
+                                location: location!(),
+                            })?;
+                    let data_file =
+                        frag.data_file_for_field(blob_field_id)
+                            .ok_or_else(|| Error::Internal {
+                                message: "Data file not found for blob field".to_string(),
+                                location: location!(),
+                            })?;
+                    key_string = data_file_key_from_path(data_file.path.as_str()).to_string();
+                    key_string.as_str()
+                };
                 let path = blob_path(&dataset.data_dir(), data_file_key, blob_id);
                 files.push(BlobFile::new_dedicated(dataset.clone(), path, size));
             },
@@ -1101,21 +1126,30 @@ async fn collect_blob_files_v2(
                 let blob_id = blob_ids.value(idx);
                 let size = sizes.value(idx);
                 let position = positions.value(idx);
-                let frag_id = RowAddress::from(*row_addr).fragment_id();
-                let frag =
-                    dataset
-                        .get_fragment(frag_id as usize)
-                        .ok_or_else(|| Error::Internal {
-                            message: "Fragment not found".to_string(),
-                            location: location!(),
-                        })?;
-                let data_file =
-                    frag.data_file_for_field(blob_field_id)
-                        .ok_or_else(|| Error::Internal {
-                            message: "Data file not found for blob field".to_string(),
-                            location: location!(),
-                        })?;
-                let data_file_key = data_file_key_from_path(data_file.path.as_str());
+                let blob_uri = blob_uris.value(idx);
+
+                // Zero-copy compaction: blob_uri stores the actual source data_file_key
+                let key_string;
+                let data_file_key = if !blob_uri.is_empty() {
+                    blob_uri
+                } else {
+                    let frag_id = RowAddress::from(*row_addr).fragment_id();
+                    let frag =
+                        dataset
+                            .get_fragment(frag_id as usize)
+                            .ok_or_else(|| Error::Internal {
+                                message: "Fragment not found".to_string(),
+                                location: location!(),
+                            })?;
+                    let data_file =
+                        frag.data_file_for_field(blob_field_id)
+                            .ok_or_else(|| Error::Internal {
+                                message: "Data file not found for blob field".to_string(),
+                                location: location!(),
+                            })?;
+                    key_string = data_file_key_from_path(data_file.path.as_str()).to_string();
+                    key_string.as_str()
+                };
                 let path = blob_path(&dataset.data_dir(), data_file_key, blob_id);
                 files.push(BlobFile::new_packed(dataset.clone(), path, position, size));
             },
@@ -1147,17 +1181,17 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::{array::AsArray, datatypes::UInt64Type};
-    use arrow_array::RecordBatch;
-    use arrow_array::{RecordBatchIterator, UInt32Array};
+    use arrow_array::{RecordBatch, RecordBatchIterator, UInt32Array};
     use arrow_schema::{DataType, Field, Schema};
     use futures::TryStreamExt;
     use lance_arrow::{DataTypeExt, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY};
-    use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
-    use lance_io::stream::RecordBatchStream;
-
     use lance_core::{utils::tempfile::TempStrDir, Error, Result};
     use lance_datagen::{array, BatchCount, RowCount};
     use lance_file::version::LanceFileVersion;
+    use lance_io::{
+        object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry},
+        stream::RecordBatchStream,
+    };
 
     use super::data_file_key_from_path;
     use crate::{
@@ -1191,7 +1225,11 @@ mod tests {
                     .await,
             );
 
-            Self { _test_dir: test_dir, dataset, data }
+            Self {
+                _test_dir: test_dir,
+                dataset,
+                data,
+            }
         }
     }
 
@@ -1335,18 +1373,21 @@ mod tests {
         }
     }
 
-    /// Test that take_blobs_by_indices works correctly with enable_stable_row_ids=true.
+    /// Test that take_blobs_by_indices works correctly with
+    /// enable_stable_row_ids=true.
     ///
-    /// This is a regression test for a bug where take_blobs_by_indices would fail
-    /// with "index out of bounds" for fragment 1+ when stable row IDs are enabled.
-    /// The bug was caused by passing row addresses (from row_offsets_to_row_addresses)
-    /// to blob::take_blobs which expected row IDs. When stable row IDs are enabled,
-    /// row addresses (fragment_id << 32 | offset) are different from row IDs
-    /// (sequential integers), causing the row ID index lookup to fail for fragment 1+.
+    /// This is a regression test for a bug where take_blobs_by_indices would
+    /// fail with "index out of bounds" for fragment 1+ when stable row IDs
+    /// are enabled. The bug was caused by passing row addresses (from
+    /// row_offsets_to_row_addresses) to blob::take_blobs which expected row
+    /// IDs. When stable row IDs are enabled, row addresses (fragment_id <<
+    /// 32 | offset) are different from row IDs (sequential integers),
+    /// causing the row ID index lookup to fail for fragment 1+.
     #[tokio::test]
     pub async fn test_take_blobs_by_indices_with_stable_row_ids() {
-        use crate::dataset::WriteParams;
         use arrow_array::RecordBatchIterator;
+
+        use crate::dataset::WriteParams;
 
         let test_dir = TempStrDir::default();
 

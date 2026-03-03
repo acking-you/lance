@@ -332,6 +332,11 @@ message DataFragment {
   // deletion tombstones. To compute the current number of rows, subtract
   // `deletion_file.num_deleted_rows` from this value.
   uint64 physical_rows = 4;
+
+  // Data file keys whose blob sidecar files are referenced by this fragment's
+  // descriptors (via blob_uri). Used by GC to protect cross-fragment blob references
+  // created during zero-copy compaction.
+  repeated string blob_source_keys = 11;
 }
 
 message DataFile {

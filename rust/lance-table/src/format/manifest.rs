@@ -1,29 +1,36 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::{
+    collections::{BTreeMap, HashMap},
+    ops::Range,
+    sync::Arc,
+};
+
 use async_trait::async_trait;
 use chrono::prelude::*;
 use deepsize::DeepSizeOf;
-use lance_file::datatypes::{populate_schema_dictionary, Fields, FieldsWithMeta};
-use lance_file::previous::reader::FileReader as PreviousFileReader;
-use lance_file::version::{LanceFileVersion, LEGACY_FORMAT_VERSION};
-use lance_io::traits::{ProtoStruct, Reader};
+use lance_core::{cache::LanceCache, datatypes::Schema, Error, Result};
+use lance_file::{
+    datatypes::{populate_schema_dictionary, Fields, FieldsWithMeta},
+    previous::reader::FileReader as PreviousFileReader,
+    version::{LanceFileVersion, LEGACY_FORMAT_VERSION},
+};
+use lance_io::{
+    object_store::{ObjectStore, ObjectStoreRegistry},
+    traits::{ProtoStruct, Reader},
+    utils::read_struct,
+};
 use object_store::path::Path;
 use prost::Message;
 use prost_types::Timestamp;
-use std::collections::{BTreeMap, HashMap};
-use std::ops::Range;
-use std::sync::Arc;
+use snafu::location;
 
 use super::Fragment;
-use crate::feature_flags::{has_deprecated_v2_feature_flag, FLAG_STABLE_ROW_IDS};
-use crate::format::pb;
-use lance_core::cache::LanceCache;
-use lance_core::datatypes::Schema;
-use lance_core::{Error, Result};
-use lance_io::object_store::{ObjectStore, ObjectStoreRegistry};
-use lance_io::utils::read_struct;
-use snafu::location;
+use crate::{
+    feature_flags::{has_deprecated_v2_feature_flag, FLAG_STABLE_ROW_IDS},
+    format::pb,
+};
 
 /// Manifest of a dataset
 ///
@@ -47,8 +54,8 @@ pub struct Manifest {
 
     /// Fragments, the pieces to build the dataset.
     ///
-    /// This list is stored in order, sorted by fragment id.  However, the fragment id
-    /// sequence may have gaps.
+    /// This list is stored in order, sorted by fragment id.  However, the
+    /// fragment id sequence may have gaps.
     pub fragments: Arc<Vec<Fragment>>,
 
     /// The file position of the version aux data.
@@ -99,7 +106,7 @@ pub struct Manifest {
     /// is used to tell libraries how to read, write, or manage the table.
     pub table_metadata: HashMap<String, String>,
 
-    /* external base paths */
+    // external base paths
     pub base_paths: HashMap<u32, BasePath>,
 }
 
@@ -137,26 +144,13 @@ pub struct ManifestSummary {
 impl From<ManifestSummary> for BTreeMap<String, String> {
     fn from(summary: ManifestSummary) -> Self {
         let mut stats_map = Self::new();
-        stats_map.insert(
-            "total_fragments".to_string(),
-            summary.total_fragments.to_string(),
-        );
-        stats_map.insert(
-            "total_data_files".to_string(),
-            summary.total_data_files.to_string(),
-        );
-        stats_map.insert(
-            "total_files_size".to_string(),
-            summary.total_files_size.to_string(),
-        );
-        stats_map.insert(
-            "total_deletion_files".to_string(),
-            summary.total_deletion_files.to_string(),
-        );
-        stats_map.insert(
-            "total_data_file_rows".to_string(),
-            summary.total_data_file_rows.to_string(),
-        );
+        stats_map.insert("total_fragments".to_string(), summary.total_fragments.to_string());
+        stats_map.insert("total_data_files".to_string(), summary.total_data_files.to_string());
+        stats_map.insert("total_files_size".to_string(), summary.total_files_size.to_string());
+        stats_map
+            .insert("total_deletion_files".to_string(), summary.total_deletion_files.to_string());
+        stats_map
+            .insert("total_data_file_rows".to_string(), summary.total_data_file_rows.to_string());
         stats_map.insert(
             "total_deletion_file_rows".to_string(),
             summary.total_deletion_file_rows.to_string(),
@@ -351,7 +345,8 @@ impl Manifest {
         self.schema.metadata = new_metadata;
     }
 
-    /// Replaces the metadata of the field with the given id with the given key-value pairs.
+    /// Replaces the metadata of the field with the given id with the given
+    /// key-value pairs.
     ///
     /// If the field does not exist in the schema, this is a no-op.
     #[deprecated(
@@ -367,10 +362,7 @@ impl Manifest {
             Ok(())
         } else {
             Err(Error::invalid_input(
-                format!(
-                    "Field with id {} does not exist for replace_field_metadata",
-                    field_id
-                ),
+                format!("Field with id {} does not exist for replace_field_metadata", field_id),
                 location!(),
             ))
         }
@@ -396,21 +388,22 @@ impl Manifest {
             None => {
                 // First time being set
                 self.max_fragment_id = Some(max_fragment_id);
-            }
+            },
             Some(current_max) => {
                 // Only update if the computed max is greater than current
                 // This preserves the high water mark even when fragments are deleted
                 if max_fragment_id > current_max {
                     self.max_fragment_id = Some(max_fragment_id);
                 }
-            }
+            },
         }
     }
 
     /// Return the max fragment id.
     /// Note this does not support recycling of fragment ids.
     ///
-    /// This will return None if there are no fragments and max_fragment_id was never set.
+    /// This will return None if there are no fragments and max_fragment_id was
+    /// never set.
     pub fn max_fragment_id(&self) -> Option<u64> {
         if let Some(max_id) = self.max_fragment_id {
             // Return the stored high water mark
@@ -458,7 +451,8 @@ impl Manifest {
             .collect())
     }
 
-    /// Find the fragments that contain the rows, identified by the offset range.
+    /// Find the fragments that contain the rows, identified by the offset
+    /// range.
     ///
     /// Note that the offsets are the logical offsets of rows, not row IDs.
     ///
@@ -472,7 +466,6 @@ impl Manifest {
     /// -------
     /// Vec<(usize, Fragment)>
     ///    A vector of `(starting_offset_of_fragment, fragment)` pairs.
-    ///
     pub fn fragments_by_offset_range(&self, range: Range<usize>) -> Vec<(usize, &Fragment)> {
         let start = range.start;
         let end = range.end;
@@ -500,8 +493,8 @@ impl Manifest {
         self.reader_feature_flags & FLAG_STABLE_ROW_IDS != 0
     }
 
-    /// Creates a serialized copy of the manifest, suitable for IPC or temp storage
-    /// and can be used to create a dataset
+    /// Creates a serialized copy of the manifest, suitable for IPC or temp
+    /// storage and can be used to create a dataset
     pub fn serialized(&self) -> Vec<u8> {
         let pb_manifest: pb::Manifest = self.into();
         pb_manifest.encode_to_vec()
@@ -513,13 +506,15 @@ impl Manifest {
 
     /// Get the summary information of a manifest.
     ///
-    /// This function calculates various statistics about the manifest, including:
+    /// This function calculates various statistics about the manifest,
+    /// including:
     /// - total_files_size: Total size of all data files in bytes
     /// - total_fragments: Total number of fragments in the dataset
     /// - total_data_files: Total number of data files across all fragments
     /// - total_deletion_files: Total number of deletion files
     /// - total_data_file_rows: Total number of rows in data files
-    /// - total_deletion_file_rows: Total number of deleted rows in deletion files
+    /// - total_deletion_file_rows: Total number of deleted rows in deletion
+    ///   files
     /// - total_rows: Total number of rows in the dataset
     pub fn summary(&self) -> ManifestSummary {
         // Calculate total fragments
@@ -575,7 +570,8 @@ impl BasePath {
     /// * `id` - Unique identifier for this base path
     /// * `path` - Full URI string (e.g., "s3://bucket/path", "/local/path")
     /// * `name` - Optional human-readable name for this base
-    /// * `is_dataset_root` - Whether this is the dataset root or a data-only base
+    /// * `is_dataset_root` - Whether this is the dataset root or a data-only
+    ///   base
     pub fn new(id: u32, path: String, name: Option<String>, is_dataset_root: bool) -> Self {
         Self {
             id,
@@ -587,7 +583,8 @@ impl BasePath {
 
     /// Extract the object store path from this BasePath's URI.
     ///
-    /// This is a synchronous operation that parses the URI without initializing an object store.
+    /// This is a synchronous operation that parses the URI without initializing
+    /// an object store.
     pub fn extract_path(&self, registry: Arc<ObjectStoreRegistry>) -> Result<Path> {
         ObjectStore::extract_path_from_uri(registry, &self.path)
     }
@@ -658,41 +655,36 @@ fn bump_version(version: &mut semver::Version, part: VersionPart) {
             version.major += 1;
             version.minor = 0;
             version.patch = 0;
-        }
+        },
         VersionPart::Minor => {
             version.minor += 1;
             version.patch = 0;
-        }
+        },
         VersionPart::Patch => {
             version.patch += 1;
-        }
+        },
     }
 }
 
 impl WriterVersion {
-    /// Split a version string into clean version (major.minor.patch), prerelease, and build metadata.
+    /// Split a version string into clean version (major.minor.patch),
+    /// prerelease, and build metadata.
     ///
     /// Returns None if the input is not a valid semver string.
     ///
     /// For example:
     /// - "2.0.0-rc.1" -> Some(("2.0.0", Some("rc.1"), None))
-    /// - "2.0.0-rc.1+build.123" -> Some(("2.0.0", Some("rc.1"), Some("build.123")))
+    /// - "2.0.0-rc.1+build.123" -> Some(("2.0.0", Some("rc.1"),
+    ///   Some("build.123")))
     /// - "2.0.0+build.123" -> Some(("2.0.0", None, Some("build.123")))
     /// - "not-a-version" -> None
     fn split_version(full_version: &str) -> Option<(String, Option<String>, Option<String>)> {
         let mut parsed = semver::Version::parse(full_version).ok()?;
 
-        let prerelease = if parsed.pre.is_empty() {
-            None
-        } else {
-            Some(parsed.pre.to_string())
-        };
+        let prerelease = if parsed.pre.is_empty() { None } else { Some(parsed.pre.to_string()) };
 
-        let build_metadata = if parsed.build.is_empty() {
-            None
-        } else {
-            Some(parsed.build.to_string())
-        };
+        let build_metadata =
+            if parsed.build.is_empty() { None } else { Some(parsed.build.to_string()) };
 
         // Remove prerelease and build metadata to get clean version
         parsed.pre = semver::Prerelease::EMPTY;
@@ -706,10 +698,7 @@ impl WriterVersion {
     pub fn semver(&self) -> Option<(u32, u32, u32, Option<&str>)> {
         // First split by '-' to separate the version from the pre-release tag
         let (version_part, tag) = if let Some(dash_idx) = self.version.find('-') {
-            (
-                &self.version[..dash_idx],
-                Some(&self.version[dash_idx + 1..]),
-            )
+            (&self.version[..dash_idx], Some(&self.version[dash_idx + 1..]))
         } else {
             (self.version.as_str(), None)
         };
@@ -723,12 +712,15 @@ impl WriterVersion {
     }
 
     /// If the library is "lance", parse the version as semver and return it.
-    /// Returns None if the library is not "lance" or the version cannot be parsed as semver.
+    /// Returns None if the library is not "lance" or the version cannot be
+    /// parsed as semver.
     ///
-    /// This method reconstructs the full semantic version by combining the version field
-    /// with the prerelease and build_metadata fields (if present). For example:
+    /// This method reconstructs the full semantic version by combining the
+    /// version field with the prerelease and build_metadata fields (if
+    /// present). For example:
     /// - version="2.0.0" + prerelease=Some("rc.1") -> "2.0.0-rc.1"
-    /// - version="2.0.0" + prerelease=Some("rc.1") + build_metadata=Some("build.123") -> "2.0.0-rc.1+build.123"
+    /// - version="2.0.0" + prerelease=Some("rc.1") +
+    ///   build_metadata=Some("build.123") -> "2.0.0-rc.1+build.123"
     pub fn lance_lib_version(&self) -> Option<semver::Version> {
         if self.library != "lance" {
             return None;
@@ -747,20 +739,21 @@ impl WriterVersion {
         Some(version)
     }
 
-    #[deprecated(
-        note = "Use `lance_lib_version()` instead, which safely checks the library field and returns Option"
-    )]
+    #[deprecated(note = "Use `lance_lib_version()` instead, which safely checks the library \
+                         field and returns Option")]
     #[allow(deprecated)]
     pub fn semver_or_panic(&self) -> (u32, u32, u32, Option<&str>) {
         self.semver()
             .unwrap_or_else(|| panic!("Invalid writer version: {}", self.version))
     }
 
-    /// Check if this is a Lance library version older than the given major/minor/patch.
+    /// Check if this is a Lance library version older than the given
+    /// major/minor/patch.
     ///
     /// # Panics
     ///
-    /// Panics if the library is not "lance" or the version cannot be parsed as semver.
+    /// Panics if the library is not "lance" or the version cannot be parsed as
+    /// semver.
     #[deprecated(note = "Use `lance_lib_version()` and its `older_than` method instead.")]
     pub fn older_than(&self, major: u32, minor: u32, patch: u32) -> bool {
         let version = self
@@ -904,7 +897,7 @@ impl TryFrom<pb::Manifest> for Manifest {
                         DataStorageFormat::new(LanceFileVersion::Legacy)
                     }
                 }
-            }
+            },
             Some(format) => DataStorageFormat::from(format),
         };
 
@@ -1071,13 +1064,13 @@ impl SelfDescribingFileReader for PreviousFileReader {
 
 #[cfg(test)]
 mod tests {
-    use crate::format::{DataFile, DeletionFile, DeletionFileType};
     use std::num::NonZero;
-
-    use super::*;
 
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Field;
+
+    use super::*;
+    use crate::format::{DataFile, DeletionFile, DeletionFileType};
 
     #[test]
     fn test_writer_version() {
@@ -1094,15 +1087,8 @@ mod tests {
 
         // Verify the version field contains only major.minor.patch
         let version_parts: Vec<&str> = wv.version.split('.').collect();
-        assert_eq!(
-            version_parts.len(),
-            3,
-            "Version should be major.minor.patch"
-        );
-        assert!(
-            !wv.version.contains('-'),
-            "Version field should not contain prerelease"
-        );
+        assert_eq!(version_parts.len(), 3, "Version should be major.minor.patch");
+        assert!(!wv.version.contains('-'), "Version field should not contain prerelease");
 
         // Verify the prerelease field matches the expected tag
         assert_eq!(wv.prerelease.as_deref(), expected_tag);
@@ -1111,14 +1097,8 @@ mod tests {
 
         // Verify lance_lib_version() reconstructs the full semver correctly
         let version = wv.lance_lib_version().unwrap();
-        assert_eq!(
-            version.major,
-            env!("CARGO_PKG_VERSION_MAJOR").parse::<u64>().unwrap()
-        );
-        assert_eq!(
-            version.minor,
-            env!("CARGO_PKG_VERSION_MINOR").parse::<u64>().unwrap()
-        );
+        assert_eq!(version.major, env!("CARGO_PKG_VERSION_MAJOR").parse::<u64>().unwrap());
+        assert_eq!(version.minor, env!("CARGO_PKG_VERSION_MINOR").parse::<u64>().unwrap());
         assert_eq!(
             version.patch,
             // Unit tests run against (major,minor,patch + 1)
@@ -1261,11 +1241,8 @@ mod tests {
 
     #[test]
     fn test_fragments_by_offset_range() {
-        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
-            "a",
-            arrow_schema::DataType::Int64,
-            false,
-        )]);
+        let arrow_schema =
+            ArrowSchema::new(vec![ArrowField::new("a", arrow_schema::DataType::Int64, false)]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
         let fragments = vec![
             Fragment::with_file_legacy(0, "path1", &schema, Some(10)),
@@ -1322,16 +1299,13 @@ mod tests {
         let fragments = vec![
             Fragment {
                 id: 0,
-                files: vec![DataFile::new_legacy_from_fields(
-                    "path1",
-                    vec![0, 1, 2],
-                    None,
-                )],
+                files: vec![DataFile::new_legacy_from_fields("path1", vec![0, 1, 2], None)],
                 deletion_file: None,
                 row_id_meta: None,
                 physical_rows: None,
                 created_at_version_meta: None,
                 last_updated_at_version_meta: None,
+                blob_source_keys: Vec::new(),
             },
             Fragment {
                 id: 1,
@@ -1344,6 +1318,7 @@ mod tests {
                 physical_rows: None,
                 created_at_version_meta: None,
                 last_updated_at_version_meta: None,
+                blob_source_keys: Vec::new(),
             },
         ];
 
@@ -1359,11 +1334,8 @@ mod tests {
 
     #[test]
     fn test_config() {
-        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
-            "a",
-            arrow_schema::DataType::Int64,
-            false,
-        )]);
+        let arrow_schema =
+            ArrowSchema::new(vec![ArrowField::new("a", arrow_schema::DataType::Int64, false)]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
         let fragments = vec![
             Fragment::with_file_legacy(0, "path1", &schema, Some(10)),
@@ -1494,7 +1466,7 @@ mod tests {
         assert_eq!(deletion_summary.total_data_file_rows, 50);
         assert_eq!(deletion_summary.total_deletion_files, 1);
 
-        //Just verify the transformation is OK
+        // Just verify the transformation is OK
         let stats_map: BTreeMap<String, String> = deletion_summary.into();
         assert_eq!(stats_map.len(), 7)
     }
