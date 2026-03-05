@@ -2,8 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_schema::{DataType, Field};
-use lance_arrow::json::JSON_EXT_NAME;
-use lance_arrow::ARROW_EXT_NAME_KEY;
+use lance_arrow::{json::JSON_EXT_NAME, ARROW_EXT_NAME_KEY};
 use serde_json::Value;
 use snafu::location;
 use tantivy::tokenizer::{BoxTokenStream, Token, TokenStream};
@@ -34,7 +33,7 @@ impl TryFrom<&Field> for DocType {
                 if matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) =>
             {
                 Ok(Self::Text)
-            }
+            },
             DataType::LargeBinary => match field.metadata().get(ARROW_EXT_NAME_KEY) {
                 Some(name) if name.as_str() == JSON_EXT_NAME => Ok(Self::Json),
                 _ => Err(lance_core::Error::InvalidInput {
@@ -63,7 +62,7 @@ impl DocType {
                     }
                 }
                 panic!("json token must be in format of <path>,<type>,<value>")
-            }
+            },
             Self::Text => 0,
         }
     }
@@ -71,10 +70,11 @@ impl DocType {
 
 /// Lance full text search tokenizer.
 ///
-/// `LanceTokenizer` defines 2 methods for tokenization, normally they are the same, but sometimes
-/// tokenizer needs different behavior for search and index. Take json document as an example:
-/// 1. Query text is a triplet <path,type,value>, something like `a.b,str,123`. We shouldn't use
-///    json in search, because it would be too complicated.
+/// `LanceTokenizer` defines 2 methods for tokenization, normally they are the
+/// same, but sometimes tokenizer needs different behavior for search and index.
+/// Take json document as an example:
+/// 1. Query text is a triplet <path,type,value>, something like `a.b,str,123`.
+///    We shouldn't use json in search, because it would be too complicated.
 /// 2. Document text is a json string.
 pub trait LanceTokenizer: Send + Sync {
     /// Tokenize query text for search.
@@ -100,7 +100,9 @@ pub struct TextTokenizer {
 
 impl TextTokenizer {
     pub fn new(tokenizer: tantivy::tokenizer::TextAnalyzer) -> Self {
-        Self { tokenizer }
+        Self {
+            tokenizer,
+        }
     }
 }
 
@@ -129,14 +131,19 @@ pub struct JsonTokenizer {
 
 impl JsonTokenizer {
     pub fn new(tokenizer: tantivy::tokenizer::TextAnalyzer) -> Self {
-        Self { tokenizer }
+        Self {
+            tokenizer,
+        }
     }
 }
 
 impl LanceTokenizer for JsonTokenizer {
     fn token_stream_for_search<'a>(&'a mut self, query_text: &'a str) -> BoxTokenStream<'a> {
         let tokens = flatten_triplet(query_text, &mut self.tokenizer).unwrap();
-        BoxTokenStream::new(TTStream { tokens, index: 0 })
+        BoxTokenStream::new(TTStream {
+            tokens,
+            index: 0,
+        })
     }
 
     fn token_stream_for_doc<'a>(&'a mut self, text: &'a str) -> BoxTokenStream<'a> {
@@ -144,12 +151,15 @@ impl LanceTokenizer for JsonTokenizer {
             Ok(v) => v,
             Err(e) => {
                 panic!("JSON parse error: {:?}", e);
-            }
+            },
         };
         let mut tokens = vec![];
         let mut position = 0;
         flatten_json(&value, "", &mut tokens, &mut position, &mut self.tokenizer);
-        BoxTokenStream::new(TTStream { tokens, index: 0 })
+        BoxTokenStream::new(TTStream {
+            tokens,
+            index: 0,
+        })
     }
 
     fn box_clone(&self) -> Box<dyn LanceTokenizer> {
@@ -191,7 +201,7 @@ fn flatten_triplet(
                 };
                 token_vec.push(token);
                 idx += 1;
-            }
+            },
             "str" => {
                 let mut tokens = tokenizer.token_stream(value);
                 while let Some(token) = tokens.next() {
@@ -204,13 +214,13 @@ fn flatten_triplet(
                     });
                     idx += 1;
                 }
-            }
+            },
             _ => {
                 return Err(lance_core::Error::InvalidInput {
                     source: format!("Invalid triple type: {}", v_type).into(),
                     location: location!(),
                 })
-            }
+            },
         }
     }
     Ok(token_vec)
@@ -226,19 +236,16 @@ fn flatten_json(
     match value {
         Value::Object(map) => {
             for (k, v) in map {
-                let next_prefix = if prefix.is_empty() {
-                    k.clone()
-                } else {
-                    format!("{}.{}", prefix, k)
-                };
+                let next_prefix =
+                    if prefix.is_empty() { k.clone() } else { format!("{}.{}", prefix, k) };
                 flatten_json(v, &next_prefix, out, position, tokenizer);
             }
-        }
+        },
         Value::Array(arr) => {
             for v in arr.iter() {
                 flatten_json(v, prefix, out, position, tokenizer);
             }
-        }
+        },
         Value::String(text) => {
             let mut tokens = tokenizer.token_stream(text);
             while let Some(token) = tokens.next() {
@@ -252,7 +259,7 @@ fn flatten_json(
                 *position += 1;
                 out.push(token);
             }
-        }
+        },
         _ => {
             let value_type = match value {
                 Value::Null => "null",
@@ -269,7 +276,7 @@ fn flatten_json(
             };
             *position += 1;
             out.push(token);
-        }
+        },
     }
 }
 
@@ -299,11 +306,12 @@ impl TokenStream for TTStream {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::Value;
+    use tantivy::tokenizer::{SimpleTokenizer, Token};
+
     use crate::scalar::inverted::tokenizer::lance_tokenizer::{
         flatten_json, flatten_triplet, JsonTokenizer, LanceTokenizer,
     };
-    use serde_json::Value;
-    use tantivy::tokenizer::{SimpleTokenizer, Token};
 
     #[test]
     fn test_json_tokenizer() {
@@ -379,14 +387,7 @@ mod tests {
     }
 
     fn assert_token(token: &Token, position: usize, text: &str) {
-        assert_eq!(
-            token.position, position,
-            "expected position {position} but {token:?}"
-        );
-        assert_eq!(
-            token.text.as_str(),
-            text,
-            "expected text {text} but {token:?}"
-        );
+        assert_eq!(token.position, position, "expected position {position} but {token:?}");
+        assert_eq!(token.text.as_str(), text, "expected text {text} but {token:?}");
     }
 }

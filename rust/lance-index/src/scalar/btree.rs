@@ -10,21 +10,6 @@ use std::{
     sync::Arc,
 };
 
-use super::{
-    AnyQuery, BuiltinIndexType, IndexReader, IndexStore, IndexWriter, MetricsCollector,
-    SargableQuery, ScalarIndex, ScalarIndexParams, SearchResult,
-};
-use crate::{
-    frag_reuse::FragReuseIndex,
-    scalar::{
-        expression::{SargableQueryParser, ScalarQueryParser},
-        registry::{ScalarIndexPlugin, TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME},
-        CreatedIndex, UpdateCriteria,
-    },
-};
-use crate::{metrics::NoOpMetricsCollector, scalar::registry::TrainingCriteria};
-use crate::{pbold, scalar::btree::flat::FlatIndex};
-use crate::{Index, IndexType};
 use arrow_arith::numeric::add;
 use arrow_array::{new_empty_array, Array, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SortOptions};
@@ -45,7 +30,7 @@ use lance_core::{
     cache::{CacheKey, LanceCache, WeakLanceCache},
     error::LanceOptionExt,
     utils::{
-        mask::NullableRowAddrSet,
+        mask::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps},
         tokio::get_num_compute_intensive_cpus,
         tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
     },
@@ -64,6 +49,26 @@ use serde::{Deserialize, Serialize, Serializer};
 use snafu::location;
 use tracing::{info, instrument};
 
+use super::{
+    AnyQuery, BuiltinIndexType, IndexReader, IndexStore, IndexWriter, MetricsCollector,
+    OldIndexDataFilter, SargableQuery, ScalarIndex, ScalarIndexParams, SearchResult,
+};
+use crate::{
+    frag_reuse::FragReuseIndex,
+    metrics::NoOpMetricsCollector,
+    pbold,
+    scalar::{
+        btree::flat::FlatIndex,
+        expression::{SargableQueryParser, ScalarQueryParser},
+        registry::{
+            ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
+            VALUE_COLUMN_NAME,
+        },
+        CreatedIndex, UpdateCriteria,
+    },
+    Index, IndexType,
+};
+
 mod flat;
 
 const BTREE_LOOKUP_NAME: &str = "page_lookup.lance";
@@ -77,7 +82,8 @@ const BTREE_INDEX_VERSION: u32 = 0;
 pub(crate) const BTREE_VALUES_COLUMN: &str = "values";
 pub(crate) const BTREE_IDS_COLUMN: &str = "ids";
 
-/// Wraps a ScalarValue and implements Ord (ScalarValue only implements PartialOrd)
+/// Wraps a ScalarValue and implements Ord (ScalarValue only implements
+/// PartialOrd)
 #[derive(Clone, Debug)]
 pub struct OrderableScalarValue(pub ScalarValue);
 
@@ -108,9 +114,9 @@ impl PartialOrd for OrderableScalarValue {
     }
 }
 
-// manual implementation of `Ord` that panics when asked to compare scalars of different type
-// and always puts nulls before non-nulls (this is consistent with Option<T>'s implementation
-// of Ord)
+// manual implementation of `Ord` that panics when asked to compare scalars of
+// different type and always puts nulls before non-nulls (this is consistent
+// with Option<T>'s implementation of Ord)
 //
 // TODO: Consider upstreaming this
 impl Ord for OrderableScalarValue {
@@ -124,65 +130,69 @@ impl Ord for OrderableScalarValue {
                 if p1.eq(p2) && s1.eq(s2) {
                     v1.cmp(v2)
                 } else {
-                    // Two decimal values can only be compared if they have the same precision and scale.
+                    // Two decimal values can only be compared if they have the same precision and
+                    // scale.
                     panic!("Attempt to compare decimals with unequal precision / scale")
                 }
-            }
+            },
             (Decimal32(v1, _, _), Null) => {
                 if v1.is_none() {
                     Ordering::Equal
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (Decimal32(_, _, _), _) => panic!("Attempt to compare decimal with non-decimal"),
             (Decimal64(v1, p1, s1), Decimal64(v2, p2, s2)) => {
                 if p1.eq(p2) && s1.eq(s2) {
                     v1.cmp(v2)
                 } else {
-                    // Two decimal values can only be compared if they have the same precision and scale.
+                    // Two decimal values can only be compared if they have the same precision and
+                    // scale.
                     panic!("Attempt to compare decimals with unequal precision / scale")
                 }
-            }
+            },
             (Decimal64(v1, _, _), Null) => {
                 if v1.is_none() {
                     Ordering::Equal
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (Decimal64(_, _, _), _) => panic!("Attempt to compare decimal with non-decimal"),
             (Decimal128(v1, p1, s1), Decimal128(v2, p2, s2)) => {
                 if p1.eq(p2) && s1.eq(s2) {
                     v1.cmp(v2)
                 } else {
-                    // Two decimal values can only be compared if they have the same precision and scale.
+                    // Two decimal values can only be compared if they have the same precision and
+                    // scale.
                     panic!("Attempt to compare decimals with unequal precision / scale")
                 }
-            }
+            },
             (Decimal128(v1, _, _), Null) => {
                 if v1.is_none() {
                     Ordering::Equal
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (Decimal128(_, _, _), _) => panic!("Attempt to compare decimal with non-decimal"),
             (Decimal256(v1, p1, s1), Decimal256(v2, p2, s2)) => {
                 if p1.eq(p2) && s1.eq(s2) {
                     v1.cmp(v2)
                 } else {
-                    // Two decimal values can only be compared if they have the same precision and scale.
+                    // Two decimal values can only be compared if they have the same precision and
+                    // scale.
                     panic!("Attempt to compare decimals with unequal precision / scale")
                 }
-            }
+            },
             (Decimal256(v1, _, _), Null) => {
                 if v1.is_none() {
                     Ordering::Equal
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (Decimal256(_, _, _), _) => panic!("Attempt to compare decimal with non-decimal"),
 
             (Boolean(v1), Boolean(v2)) => v1.cmp(v2),
@@ -192,7 +202,7 @@ impl Ord for OrderableScalarValue {
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (Boolean(_), _) => panic!("Attempt to compare boolean with non-boolean"),
             (Float32(v1), Float32(v2)) => match (v1, v2) {
                 (Some(f1), Some(f2)) => f1.total_cmp(f2),
@@ -206,7 +216,7 @@ impl Ord for OrderableScalarValue {
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (Float32(_), _) => panic!("Attempt to compare f32 with non-f32"),
             (Float64(v1), Float64(v2)) => match (v1, v2) {
                 (Some(f1), Some(f2)) => f1.total_cmp(f2),
@@ -220,7 +230,7 @@ impl Ord for OrderableScalarValue {
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (Float64(_), _) => panic!("Attempt to compare f64 with non-f64"),
             (Float16(v1), Float16(v2)) => match (v1, v2) {
                 (Some(f1), Some(f2)) => f1.total_cmp(f2),
@@ -234,7 +244,7 @@ impl Ord for OrderableScalarValue {
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (Float16(_), _) => panic!("Attempt to compare f16 with non-f16"),
             (Int8(v1), Int8(v2)) => v1.cmp(v2),
             (Int8(v1), Null) => {
@@ -243,7 +253,7 @@ impl Ord for OrderableScalarValue {
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (Int8(_), _) => panic!("Attempt to compare Int8 with non-Int8"),
             (Int16(v1), Int16(v2)) => v1.cmp(v2),
             (Int16(v1), Null) => {
@@ -252,7 +262,7 @@ impl Ord for OrderableScalarValue {
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (Int16(_), _) => panic!("Attempt to compare Int16 with non-Int16"),
             (Int32(v1), Int32(v2)) => v1.cmp(v2),
             (Int32(v1), Null) => {
@@ -261,7 +271,7 @@ impl Ord for OrderableScalarValue {
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (Int32(_), _) => panic!("Attempt to compare Int32 with non-Int32"),
             (Int64(v1), Int64(v2)) => v1.cmp(v2),
             (Int64(v1), Null) => {
@@ -270,7 +280,7 @@ impl Ord for OrderableScalarValue {
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (Int64(_), _) => panic!("Attempt to compare Int64 with non-Int64"),
             (UInt8(v1), UInt8(v2)) => v1.cmp(v2),
             (UInt8(v1), Null) => {
@@ -279,7 +289,7 @@ impl Ord for OrderableScalarValue {
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (UInt8(_), _) => panic!("Attempt to compare UInt8 with non-UInt8"),
             (UInt16(v1), UInt16(v2)) => v1.cmp(v2),
             (UInt16(v1), Null) => {
@@ -288,7 +298,7 @@ impl Ord for OrderableScalarValue {
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (UInt16(_), _) => panic!("Attempt to compare UInt16 with non-UInt16"),
             (UInt32(v1), UInt32(v2)) => v1.cmp(v2),
             (UInt32(v1), Null) => {
@@ -297,7 +307,7 @@ impl Ord for OrderableScalarValue {
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (UInt32(_), _) => panic!("Attempt to compare UInt32 with non-UInt32"),
             (UInt64(v1), UInt64(v2)) => v1.cmp(v2),
             (UInt64(v1), Null) => {
@@ -306,21 +316,21 @@ impl Ord for OrderableScalarValue {
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (UInt64(_), _) => panic!("Attempt to compare UInt64 with non-UInt64"),
             (Utf8(v1) | Utf8View(v1) | LargeUtf8(v1), Utf8(v2) | Utf8View(v2) | LargeUtf8(v2)) => {
                 v1.cmp(v2)
-            }
+            },
             (Utf8(v1) | Utf8View(v1) | LargeUtf8(v1), Null) => {
                 if v1.is_none() {
                     Ordering::Equal
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (Utf8(_) | Utf8View(_) | LargeUtf8(_), _) => {
                 panic!("Attempt to compare Utf8 with non-Utf8")
-            }
+            },
             (
                 Binary(v1) | LargeBinary(v1) | BinaryView(v1),
                 Binary(v2) | LargeBinary(v2) | BinaryView(v2),
@@ -331,10 +341,10 @@ impl Ord for OrderableScalarValue {
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (Binary(_) | LargeBinary(_) | BinaryView(_), _) => {
                 panic!("Attempt to compare Binary with non-Binary")
-            }
+            },
             (FixedSizeBinary(_, v1), FixedSizeBinary(_, v2)) => v1.cmp(v2),
             (FixedSizeBinary(_, v1), Null) => {
                 if v1.is_none() {
@@ -342,10 +352,10 @@ impl Ord for OrderableScalarValue {
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (FixedSizeBinary(_, _), _) => {
                 panic!("Attempt to compare FixedSizeBinary with non-FixedSizeBinary")
-            }
+            },
             (FixedSizeList(left), FixedSizeList(right)) => {
                 if left.eq(right) {
                     todo!()
@@ -354,17 +364,17 @@ impl Ord for OrderableScalarValue {
                         "Attempt to compare fixed size list elements with different widths/fields"
                     )
                 }
-            }
+            },
             (FixedSizeList(left), Null) => {
                 if left.is_null(0) {
                     Ordering::Equal
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (FixedSizeList(_), _) => {
                 panic!("Attempt to compare FixedSizeList with non-FixedSizeList")
-            }
+            },
             (List(_), List(_)) => todo!(),
             (List(left), Null) => {
                 if left.is_null(0) {
@@ -372,10 +382,10 @@ impl Ord for OrderableScalarValue {
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (List(_), _) => {
                 panic!("Attempt to compare List with non-List")
-            }
+            },
             (LargeList(_), _) => todo!(),
             (Map(_), Map(_)) => todo!(),
             (Map(left), Null) => {
@@ -384,10 +394,10 @@ impl Ord for OrderableScalarValue {
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (Map(_), _) => {
                 panic!("Attempt to compare Map with non-Map")
-            }
+            },
             (Date32(v1), Date32(v2)) => v1.cmp(v2),
             (Date32(v1), Null) => {
                 if v1.is_none() {
@@ -395,7 +405,7 @@ impl Ord for OrderableScalarValue {
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (Date32(_), _) => panic!("Attempt to compare Date32 with non-Date32"),
             (Date64(v1), Date64(v2)) => v1.cmp(v2),
             (Date64(v1), Null) => {
@@ -404,7 +414,7 @@ impl Ord for OrderableScalarValue {
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (Date64(_), _) => panic!("Attempt to compare Date64 with non-Date64"),
             (Time32Second(v1), Time32Second(v2)) => v1.cmp(v2),
             (Time32Second(v1), Null) => {
@@ -413,7 +423,7 @@ impl Ord for OrderableScalarValue {
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (Time32Second(_), _) => panic!("Attempt to compare Time32Second with non-Time32Second"),
             (Time32Millisecond(v1), Time32Millisecond(v2)) => v1.cmp(v2),
             (Time32Millisecond(v1), Null) => {
@@ -422,10 +432,10 @@ impl Ord for OrderableScalarValue {
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (Time32Millisecond(_), _) => {
                 panic!("Attempt to compare Time32Millisecond with non-Time32Millisecond")
-            }
+            },
             (Time64Microsecond(v1), Time64Microsecond(v2)) => v1.cmp(v2),
             (Time64Microsecond(v1), Null) => {
                 if v1.is_none() {
@@ -433,10 +443,10 @@ impl Ord for OrderableScalarValue {
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (Time64Microsecond(_), _) => {
                 panic!("Attempt to compare Time64Microsecond with non-Time64Microsecond")
-            }
+            },
             (Time64Nanosecond(v1), Time64Nanosecond(v2)) => v1.cmp(v2),
             (Time64Nanosecond(v1), Null) => {
                 if v1.is_none() {
@@ -444,10 +454,10 @@ impl Ord for OrderableScalarValue {
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (Time64Nanosecond(_), _) => {
                 panic!("Attempt to compare Time64Nanosecond with non-Time64Nanosecond")
-            }
+            },
             (TimestampSecond(v1, _), TimestampSecond(v2, _)) => v1.cmp(v2),
             (TimestampSecond(v1, _), Null) => {
                 if v1.is_none() {
@@ -455,10 +465,10 @@ impl Ord for OrderableScalarValue {
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (TimestampSecond(_, _), _) => {
                 panic!("Attempt to compare TimestampSecond with non-TimestampSecond")
-            }
+            },
             (TimestampMillisecond(v1, _), TimestampMillisecond(v2, _)) => v1.cmp(v2),
             (TimestampMillisecond(v1, _), Null) => {
                 if v1.is_none() {
@@ -466,10 +476,10 @@ impl Ord for OrderableScalarValue {
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (TimestampMillisecond(_, _), _) => {
                 panic!("Attempt to compare TimestampMillisecond with non-TimestampMillisecond")
-            }
+            },
             (TimestampMicrosecond(v1, _), TimestampMicrosecond(v2, _)) => v1.cmp(v2),
             (TimestampMicrosecond(v1, _), Null) => {
                 if v1.is_none() {
@@ -477,10 +487,10 @@ impl Ord for OrderableScalarValue {
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (TimestampMicrosecond(_, _), _) => {
                 panic!("Attempt to compare TimestampMicrosecond with non-TimestampMicrosecond")
-            }
+            },
             (TimestampNanosecond(v1, _), TimestampNanosecond(v2, _)) => v1.cmp(v2),
             (TimestampNanosecond(v1, _), Null) => {
                 if v1.is_none() {
@@ -488,10 +498,10 @@ impl Ord for OrderableScalarValue {
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (TimestampNanosecond(_, _), _) => {
                 panic!("Attempt to compare TimestampNanosecond with non-TimestampNanosecond")
-            }
+            },
             (IntervalYearMonth(v1), IntervalYearMonth(v2)) => v1.cmp(v2),
             (IntervalYearMonth(v1), Null) => {
                 if v1.is_none() {
@@ -499,10 +509,10 @@ impl Ord for OrderableScalarValue {
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (IntervalYearMonth(_), _) => {
                 panic!("Attempt to compare IntervalYearMonth with non-IntervalYearMonth")
-            }
+            },
             (IntervalDayTime(v1), IntervalDayTime(v2)) => v1.cmp(v2),
             (IntervalDayTime(v1), Null) => {
                 if v1.is_none() {
@@ -510,10 +520,10 @@ impl Ord for OrderableScalarValue {
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (IntervalDayTime(_), _) => {
                 panic!("Attempt to compare IntervalDayTime with non-IntervalDayTime")
-            }
+            },
             (IntervalMonthDayNano(v1), IntervalMonthDayNano(v2)) => v1.cmp(v2),
             (IntervalMonthDayNano(v1), Null) => {
                 if v1.is_none() {
@@ -521,10 +531,10 @@ impl Ord for OrderableScalarValue {
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (IntervalMonthDayNano(_), _) => {
                 panic!("Attempt to compare IntervalMonthDayNano with non-IntervalMonthDayNano")
-            }
+            },
             (DurationSecond(v1), DurationSecond(v2)) => v1.cmp(v2),
             (DurationSecond(v1), Null) => {
                 if v1.is_none() {
@@ -532,10 +542,10 @@ impl Ord for OrderableScalarValue {
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (DurationSecond(_), _) => {
                 panic!("Attempt to compare DurationSecond with non-DurationSecond")
-            }
+            },
             (DurationMillisecond(v1), DurationMillisecond(v2)) => v1.cmp(v2),
             (DurationMillisecond(v1), Null) => {
                 if v1.is_none() {
@@ -543,10 +553,10 @@ impl Ord for OrderableScalarValue {
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (DurationMillisecond(_), _) => {
                 panic!("Attempt to compare DurationMillisecond with non-DurationMillisecond")
-            }
+            },
             (DurationMicrosecond(v1), DurationMicrosecond(v2)) => v1.cmp(v2),
             (DurationMicrosecond(v1), Null) => {
                 if v1.is_none() {
@@ -554,10 +564,10 @@ impl Ord for OrderableScalarValue {
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (DurationMicrosecond(_), _) => {
                 panic!("Attempt to compare DurationMicrosecond with non-DurationMicrosecond")
-            }
+            },
             (DurationNanosecond(v1), DurationNanosecond(v2)) => v1.cmp(v2),
             (DurationNanosecond(v1), Null) => {
                 if v1.is_none() {
@@ -565,10 +575,10 @@ impl Ord for OrderableScalarValue {
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (DurationNanosecond(_), _) => {
                 panic!("Attempt to compare DurationNanosecond with non-DurationNanosecond")
-            }
+            },
             (Struct(_arr), Struct(_arr2)) => todo!(),
             (Struct(arr), Null) => {
                 if arr.is_empty() {
@@ -576,7 +586,7 @@ impl Ord for OrderableScalarValue {
                 } else {
                     Ordering::Greater
                 }
-            }
+            },
             (Struct(_arr), _) => panic!("Attempt to compare Struct with non-Struct"),
             (Dictionary(_k1, _v1), Dictionary(_k2, _v2)) => todo!(),
             (Dictionary(_, v1), Null) => Self(*v1.clone()).cmp(&Self(ScalarValue::Null)),
@@ -606,7 +616,8 @@ impl<K: Ord, V> BTreeMapExt<K, V> for BTreeMap<K, V> {
     }
 }
 
-/// An in-memory structure that can quickly satisfy scalar queries using a btree of ScalarValue
+/// An in-memory structure that can quickly satisfy scalar queries using a btree
+/// of ScalarValue
 #[derive(Debug, DeepSizeOf, PartialEq, Eq)]
 pub struct BTreeLookup {
     tree: BTreeMap<OrderableScalarValue, Vec<PageRecord>>,
@@ -665,8 +676,8 @@ impl BTreeLookup {
 
     // All pages that could have a value equal to one of the values
     fn pages_in(&self, values: impl IntoIterator<Item = OrderableScalarValue>) -> Vec<Matches> {
-        // TODO: Right now we convert all Matches::All into Matches::Some.  We could refine this.
-        // It would improve performance on low cardinality data.
+        // TODO: Right now we convert all Matches::All into Matches::Some.  We could
+        // refine this. It would improve performance on low cardinality data.
         let page_lists = values
             .into_iter()
             .map(|val| {
@@ -690,8 +701,8 @@ impl BTreeLookup {
         &self,
         range: (Bound<&OrderableScalarValue>, Bound<&OrderableScalarValue>),
     ) -> Vec<Matches> {
-        // We need to grab a little bit left of the given range because the query might be 7
-        // and the first page might be something like 5-10.
+        // We need to grab a little bit left of the given range because the query might
+        // be 7 and the first page might be something like 5-10.
         let lower_bound = match range.0 {
             Bound::Unbounded => Bound::Unbounded,
             // It doesn't matter if the bound is exclusive or inclusive.  We are going to grab
@@ -714,14 +725,15 @@ impl BTreeLookup {
         let upper_bound = match range.1 {
             Bound::Unbounded => Bound::Unbounded,
             Bound::Included(upper) => Bound::Included(upper),
-            // Even if the upper bound is excluded we need to include it on an [x, x) query.  This is because the
-            // query might be [x, x).  Our lower bound might find some [a-x] bucket and we still
-            // want to include any [x, z] bucket.
+            // Even if the upper bound is excluded we need to include it on an [x, x) query.  This
+            // is because the query might be [x, x).  Our lower bound might find some
+            // [a-x] bucket and we still want to include any [x, z] bucket.
             //
-            // We could be slightly more accurate here and only include the upper bound if the lower bound
-            // is defined, inclusive, and equal to the upper bound.  However, let's keep it simple for now.  This
-            // should only affect the probably rare case that our query is a true range query and the value
-            // matches an upper bound.  This will all be moot if/when we merge pages.
+            // We could be slightly more accurate here and only include the upper bound if the lower
+            // bound is defined, inclusive, and equal to the upper bound.  However,
+            // let's keep it simple for now.  This should only affect the probably rare
+            // case that our query is a true range query and the value matches an upper
+            // bound.  This will all be moot if/when we merge pages.
             Bound::Excluded(upper) => Bound::Included(upper),
         };
 
@@ -734,13 +746,13 @@ impl BTreeLookup {
                 if lower >= upper {
                     return vec![];
                 }
-            }
+            },
             (Bound::Included(lower), Bound::Included(upper)) => {
                 if lower > upper {
                     return vec![];
                 }
-            }
-            _ => {}
+            },
+            _ => {},
         }
 
         let mut matches = Vec::new();
@@ -748,17 +760,17 @@ impl BTreeLookup {
         for (min, page_records) in self.tree.range((lower_bound, upper_bound)) {
             for page_record in page_records {
                 match lower_bound {
-                    Bound::Unbounded => {}
+                    Bound::Unbounded => {},
                     Bound::Included(lower) => {
                         if page_record.max.cmp(lower) == Ordering::Less {
                             continue;
                         }
-                    }
+                    },
                     Bound::Excluded(lower) => {
                         if page_record.max.cmp(lower) != Ordering::Greater {
                             continue;
                         }
-                    }
+                    },
                 }
                 // At this point we know the page record matches at least some values.
                 // We should test to see if ALL values are a match.
@@ -777,7 +789,7 @@ impl BTreeLookup {
                             matches.push(Matches::Some(page_record.page_number));
                             continue;
                         }
-                    }
+                    },
                     // range.0 <= X therefore if the smallest value is not greater than or equal
                     // to the lower bound we only have partial match
                     Bound::Included(lower) => {
@@ -785,8 +797,8 @@ impl BTreeLookup {
                             matches.push(Matches::Some(page_record.page_number));
                             continue;
                         }
-                    }
-                    Bound::Unbounded => {}
+                    },
+                    Bound::Unbounded => {},
                 }
                 match range.1 {
                     // X < range.1 therefore if the largest value is not strictly less than
@@ -796,7 +808,7 @@ impl BTreeLookup {
                             matches.push(Matches::Some(page_record.page_number));
                             continue;
                         }
-                    }
+                    },
                     // X <= range.1 therefore if the largest value is not less than or equal to
                     // the upper bound we only have partial match
                     Bound::Included(upper) => {
@@ -804,11 +816,11 @@ impl BTreeLookup {
                             matches.push(Matches::Some(page_record.page_number));
                             continue;
                         }
-                    }
-                    Bound::Unbounded => {}
+                    },
+                    Bound::Unbounded => {},
                 }
-                // The min is greater than the lower bound and the max is less than the upper bound
-                // so we have a full match
+                // The min is greater than the lower bound and the max is less than the upper
+                // bound so we have a full match
                 matches.push(Matches::All(page_record.page_number));
             }
         }
@@ -825,8 +837,9 @@ impl BTreeLookup {
     }
 }
 
-// We only need to open a file reader for pages if we need to load a page.  If all
-// pages are cached we don't open it.  If we do open it we should only open it once.
+// We only need to open a file reader for pages if we need to load a page.  If
+// all pages are cached we don't open it.  If we do open it we should only open
+// it once.
 #[derive(Clone)]
 struct LazyIndexReader {
     index_reader: Arc<tokio::sync::Mutex<Option<Arc<dyn IndexReader>>>>,
@@ -850,10 +863,7 @@ impl LazyIndexReader {
         let mut reader = self.index_reader.lock().await;
         if reader.is_none() {
             let index_reader = if let Some(ranges_to_files) = &self.ranges_to_files {
-                Arc::new(LazyRangedIndexReader::new(
-                    self.store.clone(),
-                    ranges_to_files.clone(),
-                ))
+                Arc::new(LazyRangedIndexReader::new(self.store.clone(), ranges_to_files.clone()))
             } else {
                 self.store.open_index_file(BTREE_PAGES_NAME).await?
             };
@@ -959,12 +969,12 @@ impl IndexReader for LazyRangedIndexReader {
 /// to be searched by some other kind of index (currently a flat search).
 ///
 /// This strikes a balance between an expensive memory structure containing all
-/// of the values and an expensive disk structure that can't be efficiently searched.
+/// of the values and an expensive disk structure that can't be efficiently
+/// searched.
 ///
-/// For example, given 1Bi values we can store 256Ki leaves of size 4Ki.  We only
-/// need memory space for 256Ki leaves (depends on the data type but usually a few MiB
-/// at most) and can narrow our search to 4Ki values.
-///
+/// For example, given 1Bi values we can store 256Ki leaves of size 4Ki.  We
+/// only need memory space for 256Ki leaves (depends on the data type but
+/// usually a few MiB at most) and can narrow our search to 4Ki values.
 // Cache key implementation for type-safe cache access
 #[derive(Debug, Clone, DeepSizeOf)]
 pub struct CachedScalarIndex(Arc<dyn ScalarIndex>);
@@ -992,8 +1002,8 @@ impl CacheKey for BTreePageKey {
     }
 }
 
-/// Note: this is very similar to the IVF index except we store the IVF part in a btree
-/// for faster lookup
+/// Note: this is very similar to the IVF index except we store the IVF part in
+/// a btree for faster lookup
 #[derive(Clone, Debug)]
 pub struct BTreeIndex {
     page_lookup: Arc<BTreeLookup>,
@@ -1002,34 +1012,39 @@ pub struct BTreeIndex {
     data_type: DataType,
     batch_size: u64,
 
-    /// A map that translates a global_page_idx stored in the single lookup file into the
-    /// specific page file and local_page_idx.
+    /// A map that translates a global_page_idx stored in the single lookup file
+    /// into the specific page file and local_page_idx.
     ///
-    /// This is the key data structure used for efficiently reading data from a merged,
-    /// range-partitioned index. It stores mappings from a contiguous range of global page
-    /// indices to a tuple containing:
+    /// This is the key data structure used for efficiently reading data from a
+    /// merged, range-partitioned index. It stores mappings from a
+    /// contiguous range of global page indices to a tuple containing:
     ///
-    /// 1. The path to the corresponding page file (e.g., `part_i_page_file.lance`).
-    /// 2. The start offset that was used to calculate the local_page_idx for that partition.
+    /// 1. The path to the corresponding page file (e.g.,
+    ///    `part_i_page_file.lance`).
+    /// 2. The start offset that was used to calculate the local_page_idx for
+    ///    that partition.
     ///
-    /// When a query needs to access a specific page using its `global_page_idx`:
+    /// When a query needs to access a specific page using its
+    /// `global_page_idx`:
     ///
-    /// 1. The `global_page_idx` is used to look up its range in this `RangeInclusiveMap`,
-    ///    and the map returns the `(file_path, start_offset)` tuple for that range.
-    /// 3. The `local_page_idx` is calculated using the formula:
-    ///    `local_page_idx = global_page_idx - start_offset`.
-    /// 4. With the `file_path` and `local_page_idx`, the system can directly open the
-    ///    correct partition file and read the specific page.
+    /// 1. The `global_page_idx` is used to look up its range in this
+    ///    `RangeInclusiveMap`, and the map returns the `(file_path,
+    ///    start_offset)` tuple for that range.
+    /// 3. The `local_page_idx` is calculated using the formula: `local_page_idx
+    ///    = global_page_idx - start_offset`.
+    /// 4. With the `file_path` and `local_page_idx`, the system can directly
+    ///    open the correct partition file and read the specific page.
     ///
     /// # Example
     ///
-    /// If the map contains an entry `(100..=199) => ("part_2_page_file.lance", 100)`, and we
-    /// need to find `global_page_idx = 142`:
+    /// If the map contains an entry `(100..=199) => ("part_2_page_file.lance",
+    /// 100)`, and we need to find `global_page_idx = 142`:
     ///
-    /// - The map finds that 142 falls within the range `100..=199`, and it returns
-    ///   `("part_2_page_file.lance", 100)`.
+    /// - The map finds that 142 falls within the range `100..=199`, and it
+    ///   returns `("part_2_page_file.lance", 100)`.
     /// - The local page_idx is calculated: `142 - 100 = 42`.
-    /// - The system now knows to read page `42` from the file `part_2_page_file.lance`.
+    /// - The system now knows to read page `42` from the file
+    ///   `part_2_page_file.lance`.
     ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
 }
@@ -1071,9 +1086,12 @@ impl BTreeIndex {
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<FlatIndex>> {
         self.index_cache
-            .get_or_insert_with_key(BTreePageKey { page_number }, move || async move {
-                self.read_page(page_number, index_reader, metrics).await
-            })
+            .get_or_insert_with_key(
+                BTreePageKey {
+                    page_number,
+                },
+                move || async move { self.read_page(page_number, index_reader, metrics).await },
+            )
             .await
     }
 
@@ -1110,12 +1128,13 @@ impl BTreeIndex {
 
         match matches {
             Matches::Some(_) => {
-                // TODO: If this is an IN query we can perhaps simplify the subindex query by restricting it to the
-                // values that might be in the page.  E.g. if we are searching for X IN [5, 3, 7] and five is in pages
-                // 1 and 2 and three is in page 2 and seven is in pages 8 and 9, then when searching page 2 we only need
-                // to search for X IN [5, 3]
+                // TODO: If this is an IN query we can perhaps simplify the subindex query by
+                // restricting it to the values that might be in the page.  E.g.
+                // if we are searching for X IN [5, 3, 7] and five is in pages 1
+                // and 2 and three is in page 2 and seven is in pages 8 and 9, then when
+                // searching page 2 we only need to search for X IN [5, 3]
                 subindex.search(query, metrics)
-            }
+            },
             Matches::All(_) => Ok(match query {
                 // This means we hit an all-null page so just grab all row ids as true
                 SargableQuery::IsNull() => subindex.all_ignore_nulls(),
@@ -1178,9 +1197,10 @@ impl BTreeIndex {
                 // continue so we don't add it to the null_pages
                 continue;
             } else {
-                map.entry(min)
-                    .or_default()
-                    .push(PageRecord { max, page_number });
+                map.entry(min).or_default().push(PageRecord {
+                    max,
+                    page_number,
+                });
             }
 
             if null_count > 0 {
@@ -1233,9 +1253,12 @@ impl BTreeIndex {
         // from a global page range to its corresponding file and starting offset.
         let ranges_to_files = if range_partitioned {
             let part_sizes_str = file_schema
-            .metadata
-            .get(PAGE_NUM_PER_RANGE_PARTITION_META_KEY)
-            .expect("Range-partitioned Btree lookup file must have page-number-per-range-file metadata!");
+                .metadata
+                .get(PAGE_NUM_PER_RANGE_PARTITION_META_KEY)
+                .expect(
+                    "Range-partitioned Btree lookup file must have page-number-per-range-file \
+                     metadata!",
+                );
             let part_sizes_vec: Vec<(u64, u32)> = serde_json::from_str(part_sizes_str)?;
             let mut offset: u32 = 0;
 
@@ -1264,14 +1287,16 @@ impl BTreeIndex {
         )?))
     }
 
-    // For legacy reasons a btree index expects the training input to use value/_rowid
+    // For legacy reasons a btree index expects the training input to use
+    // value/_rowid
     fn train_schema(&self) -> Schema {
         let value_field = Field::new(VALUE_COLUMN_NAME, self.data_type.clone(), true);
         let row_id_field = Field::new(ROW_ID, DataType::UInt64, false);
         Schema::new(vec![value_field, row_id_field])
     }
 
-    /// Create a stream of all the data in the index, in the same format used to train the index
+    /// Create a stream of all the data in the index, in the same format used to
+    /// train the index
     async fn into_data_stream(self) -> Result<SendableRecordBatchStream> {
         let lazy_reader = LazyIndexReader::new(self.store.clone(), self.ranges_to_files.clone());
         let reader = lazy_reader.get().await?;
@@ -1282,31 +1307,33 @@ impl BTreeIndex {
             .map(|fut| fut.map_err(DataFusionError::from))
             .buffered(self.store.io_parallelism())
             .map_ok(move |batch| {
-                RecordBatch::try_new(
-                    new_schema.clone(),
-                    vec![batch.column(0).clone(), batch.column(1).clone()],
-                )
+                RecordBatch::try_new(new_schema.clone(), vec![
+                    batch.column(0).clone(),
+                    batch.column(1).clone(),
+                ])
                 .unwrap()
             })
             .boxed();
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            new_schema_clone,
-            batches,
-        )))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(new_schema_clone, batches)))
     }
 
     async fn combine_old_new(
         self,
         new_data: SendableRecordBatchStream,
         chunk_size: u64,
-        valid_old_fragments: Option<RoaringBitmap>,
+        old_data_filter: Option<OldIndexDataFilter>,
     ) -> Result<SendableRecordBatchStream> {
         let value_column_index = new_data.schema().index_of(VALUE_COLUMN_NAME)?;
 
         let new_input = Arc::new(OneShotExec::new(new_data));
         let old_stream = self.into_data_stream().await?;
-        let old_stream = match valid_old_fragments {
-            Some(valid_frags) => filter_row_ids_by_fragments(old_stream, valid_frags),
+        let old_stream = match old_data_filter {
+            Some(OldIndexDataFilter::Fragments(valid_frags)) => {
+                filter_row_ids_by_fragments(old_stream, valid_frags)
+            },
+            Some(OldIndexDataFilter::RowIds(valid_row_ids)) => {
+                filter_row_ids_by_exact_set(old_stream, valid_row_ids)
+            },
             None => old_stream,
         };
         let old_input = Arc::new(OneShotExec::new(old_stream));
@@ -1322,25 +1349,22 @@ impl BTreeIndex {
                 nulls_first: true,
             },
         };
-        // The UnionExec creates multiple partitions but the SortPreservingMergeExec merges
-        // them back into a single partition.
+        // The UnionExec creates multiple partitions but the SortPreservingMergeExec
+        // merges them back into a single partition.
         let all_data = UnionExec::try_new(vec![old_input, new_input])?;
         let ordered = Arc::new(SortPreservingMergeExec::new([sort_expr].into(), all_data));
 
-        let unchunked = execute_plan(
-            ordered,
-            LanceExecutionOptions {
-                use_spilling: true,
-                ..Default::default()
-            },
-        )?;
+        let unchunked = execute_plan(ordered, LanceExecutionOptions {
+            use_spilling: true,
+            ..Default::default()
+        })?;
         Ok(chunk_concat_stream(unchunked, chunk_size as usize))
     }
 }
 
 /// Filter a stream of record batches to only include rows whose row address
-/// belongs to a fragment in `valid_fragments`. Row addresses encode the fragment
-/// ID in the upper 32 bits.
+/// belongs to a fragment in `valid_fragments`. Row addresses encode the
+/// fragment ID in the upper 32 bits.
 fn filter_row_ids_by_fragments(
     stream: SendableRecordBatchStream,
     valid_fragments: RoaringBitmap,
@@ -1355,6 +1379,28 @@ fn filter_row_ids_by_fragments(
         let mask: arrow_array::BooleanArray = row_ids
             .iter()
             .map(|id| id.map(|id| valid_fragments.contains((id >> 32) as u32)))
+            .collect();
+        Ok(arrow_select::filter::filter_record_batch(&batch, &mask)?)
+    });
+    Box::pin(RecordBatchStreamAdapter::new(schema, filtered))
+}
+
+/// Filter a stream of record batches to only include rows whose row ID is in
+/// `valid_row_ids`.
+fn filter_row_ids_by_exact_set(
+    stream: SendableRecordBatchStream,
+    valid_row_ids: RowAddrTreeMap,
+) -> SendableRecordBatchStream {
+    let schema = stream.schema();
+    let filtered = stream.map(move |batch_result| {
+        let batch = batch_result?;
+        let row_ids = batch[ROW_ID]
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .expect("expected UInt64Array for row_id column");
+        let mask: arrow_array::BooleanArray = row_ids
+            .iter()
+            .map(|id| id.map(|id| valid_row_ids.contains(id)))
             .collect();
         Ok(arrow_select::filter::filter_record_batch(&batch, &mask)?)
     });
@@ -1502,10 +1548,13 @@ impl ScalarIndex for BTreeIndex {
             SargableQuery::IsIn(values) => self
                 .page_lookup
                 .pages_in(values.iter().map(|val| OrderableScalarValue(val.clone()))),
-            SargableQuery::FullTextSearch(_) => return Err(Error::invalid_input(
-                "full text search is not supported for BTree index, build a inverted index for it",
-                location!(),
-            )),
+            SargableQuery::FullTextSearch(_) => {
+                return Err(Error::invalid_input(
+                    "full text search is not supported for BTree index, build a inverted index \
+                     for it",
+                    location!(),
+                ))
+            },
             SargableQuery::IsNull() => self.page_lookup.pages_null(),
         };
 
@@ -1563,7 +1612,8 @@ impl ScalarIndex for BTreeIndex {
         let mapping = Arc::new(mapping.clone());
         let train_schema = Arc::new(self.train_schema());
 
-        // TODO: Could potentially parallelize this across parts, unclear it would be worth it
+        // TODO: Could potentially parallelize this across parts, unclear it would be
+        // worth it
         for (part_id, page_file) in part_page_files {
             // Retrain on the remapped pages
             let sub_index_reader = self.store.open_index_file(page_file).await?;
@@ -1577,7 +1627,8 @@ impl ScalarIndex for BTreeIndex {
                 .buffered(self.store.io_parallelism())
                 .map_err(DataFusionError::from)
                 .and_then(move |batch| {
-                    // Remap the batch and then convert from the serialized schema to the training input schema
+                    // Remap the batch and then convert from the serialized schema to the training
+                    // input schema
                     let remapped =
                         FlatIndex::remap_batch(batch, &mapping).map_err(DataFusionError::from);
                     let with_train_schema = remapped.and_then(|batch| {
@@ -1587,10 +1638,8 @@ impl ScalarIndex for BTreeIndex {
                     std::future::ready(with_train_schema)
                 });
 
-            let remapped_stream = Box::pin(RecordBatchStreamAdapter::new(
-                train_schema_clone,
-                remapped_stream,
-            ));
+            let remapped_stream =
+                Box::pin(RecordBatchStreamAdapter::new(train_schema_clone, remapped_stream));
 
             train_btree_index(remapped_stream, dest_store, self.batch_size, None, part_id).await?;
         }
@@ -1618,12 +1667,13 @@ impl ScalarIndex for BTreeIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        valid_old_fragments: Option<&RoaringBitmap>,
+        old_data_filter: Option<OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
-        // Merge the existing index data with the new data and then retrain the index on the merged stream
+        // Merge the existing index data with the new data and then retrain the index on
+        // the merged stream
         let merged_data_source = self
             .clone()
-            .combine_old_new(new_data, self.batch_size, valid_old_fragments.cloned())
+            .combine_old_new(new_data, self.batch_size, old_data_filter)
             .await?;
         train_btree_index(merged_data_source, dest_store, self.batch_size, None, None).await?;
 
@@ -1678,7 +1728,8 @@ fn analyze_batch(batch: &RecordBatch) -> Result<BatchStats> {
     })
 }
 
-/// A trait that must be implemented by anything that wishes to act as a btree subindex
+/// A trait that must be implemented by anything that wishes to act as a btree
+/// subindex
 #[async_trait]
 pub trait BTreeSubIndex: Debug + Send + Sync + DeepSizeOf {
     /// Trains the subindex on a single batch of data and serializes it to Arrow
@@ -1689,16 +1740,17 @@ pub trait BTreeSubIndex: Debug + Send + Sync + DeepSizeOf {
 
     /// Retrieve the data used to originally train this page
     ///
-    /// In order to perform an update we need to merge the old data in with the new data which
-    /// means we need to access the new data.  Right now this is convenient for flat indices but
-    /// we may need to take a different approach if we ever decide to use a sub-index other than
-    /// flat
+    /// In order to perform an update we need to merge the old data in with the
+    /// new data which means we need to access the new data.  Right now this
+    /// is convenient for flat indices but we may need to take a different
+    /// approach if we ever decide to use a sub-index other than flat
     async fn retrieve_data(&self, serialized: RecordBatch) -> Result<RecordBatch>;
 
     /// The schema of the subindex when serialized to Arrow
     fn schema(&self) -> &Arc<Schema>;
 
-    /// Given a serialized page, deserialize it, remap the row ids, and re-serialize it
+    /// Given a serialized page, deserialize it, remap the row ids, and
+    /// re-serialize it
     async fn remap_subindex(
         &self,
         serialized: RecordBatch,
@@ -1720,13 +1772,10 @@ async fn train_btree_page(
     let stats = analyze_batch(&batch)?;
 
     // Renames from value/_rowid to values/ids
-    let trained = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            batch.column_by_name(VALUE_COLUMN_NAME).expect_ok()?.clone(),
-            batch.column_by_name(ROW_ID).expect_ok()?.clone(),
-        ],
-    )?;
+    let trained = RecordBatch::try_new(schema.clone(), vec![
+        batch.column_by_name(VALUE_COLUMN_NAME).expect_ok()?.clone(),
+        batch.column_by_name(ROW_ID).expect_ok()?.clone(),
+    ])?;
 
     writer.write_record_batch(trained).await?;
     Ok(EncodedBatch {
@@ -1767,7 +1816,8 @@ fn btree_stats_as_batch(stats: Vec<EncodedBatch>, value_type: &DataType) -> Resu
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
-/// Train a btree index from a stream of sorted page-size batches of values and row ids
+/// Train a btree index from a stream of sorted page-size batches of values and
+/// row ids
 pub async fn train_btree_index(
     batches_source: SendableRecordBatchStream,
     index_store: &dyn IndexStore,
@@ -1778,7 +1828,8 @@ pub async fn train_btree_index(
     // Create `partition_id` for distributed index building.
     // This ID serves as a high-level mask (first 32 bits of a u64) to ensure
     // that index partitions generated by different workers do not conflict.
-    // Lance supports two strategies for distributed training: fragment-based and range-based.
+    // Lance supports two strategies for distributed training: fragment-based and
+    // range-based.
     let partition_id = fragment_ids
         .as_ref()
         // --- Fragment-based Partitioning ---
@@ -1792,11 +1843,7 @@ pub async fn train_btree_index(
         .or_else(|| range_id.map(|id| (id as u64) << 32));
 
     let flat_schema = Arc::new(Schema::new(vec![
-        Field::new(
-            BTREE_VALUES_COLUMN,
-            batches_source.schema().field(0).data_type().clone(),
-            true,
-        ),
+        Field::new(BTREE_VALUES_COLUMN, batches_source.schema().field(0).data_type().clone(), true),
         Field::new(BTREE_IDS_COLUMN, DataType::UInt64, false),
     ]));
 
@@ -1805,7 +1852,7 @@ pub async fn train_btree_index(
             index_store
                 .new_index_file(BTREE_PAGES_NAME, flat_schema.clone())
                 .await?
-        }
+        },
         Some(partition_id) => {
             index_store
                 .new_index_file(
@@ -1813,7 +1860,7 @@ pub async fn train_btree_index(
                     flat_schema.clone(),
                 )
                 .await?
-        }
+        },
     };
 
     let mut encoded_batches = Vec::new();
@@ -1829,13 +1876,8 @@ pub async fn train_btree_index(
 
     while let Some(batch) = batches_source.try_next().await? {
         encoded_batches.push(
-            train_btree_page(
-                batch,
-                batch_idx,
-                sub_index_file.as_mut(),
-                flat_schema.clone(),
-            )
-            .await?,
+            train_btree_page(batch, batch_idx, sub_index_file.as_mut(), flat_schema.clone())
+                .await?,
         );
         batch_idx += 1;
     }
@@ -1845,24 +1887,20 @@ pub async fn train_btree_index(
     file_schema
         .metadata
         .insert(BATCH_SIZE_META_KEY.to_string(), batch_size.to_string());
-    file_schema.metadata.insert(
-        RANGE_PARTITIONED_META_KEY.to_string(),
-        range_id.is_some().to_string(),
-    );
+    file_schema
+        .metadata
+        .insert(RANGE_PARTITIONED_META_KEY.to_string(), range_id.is_some().to_string());
     let mut btree_index_file = match partition_id {
         None => {
             index_store
                 .new_index_file(BTREE_LOOKUP_NAME, Arc::new(file_schema))
                 .await?
-        }
+        },
         Some(partition_id) => {
             index_store
-                .new_index_file(
-                    part_lookup_file_path(partition_id).as_str(),
-                    Arc::new(file_schema),
-                )
+                .new_index_file(part_lookup_file_path(partition_id).as_str(), Arc::new(file_schema))
                 .await?
-        }
+        },
     };
     btree_index_file.write_record_batch(record_batch).await?;
     btree_index_file.finish().await?;
@@ -1878,13 +1916,7 @@ pub async fn merge_index_files(
     // List all partition page / lookup files in the index directory
     let (part_page_files, part_lookup_files) =
         list_page_lookup_files(object_store, index_dir).await?;
-    merge_metadata_files(
-        store.as_ref(),
-        &part_page_files,
-        &part_lookup_files,
-        batch_readhead,
-    )
-    .await
+    merge_metadata_files(store.as_ref(), &part_page_files, &part_lookup_files, batch_readhead).await
 }
 
 /// List and filter files from the index directory
@@ -1910,7 +1942,7 @@ async fn list_page_lookup_files(
                 if file_name.starts_with("part_") && file_name.ends_with("_page_lookup.lance") {
                     part_lookup_files.push(file_name.to_string());
                 }
-            }
+            },
             Err(_) => continue,
         }
     }
@@ -1918,8 +1950,11 @@ async fn list_page_lookup_files(
     if part_page_files.is_empty() || part_lookup_files.is_empty() {
         return Err(Error::Internal {
             message: format!(
-                "No partition metadata files found in index directory: {} (page_files: {}, lookup_files: {})",
-                index_dir, part_page_files.len(), part_lookup_files.len()
+                "No partition metadata files found in index directory: {} (page_files: {}, \
+                 lookup_files: {})",
+                index_dir,
+                part_page_files.len(),
+                part_lookup_files.len()
             ),
             location: location!(),
         });
@@ -1930,10 +1965,13 @@ async fn list_page_lookup_files(
 
 /// Merge multiple partition page / lookup files into a complete metadata file
 ///
-/// In a distributed environment, each worker node writes partition page / lookup file for the partitions it processes,
-/// and this function merges these files into a final metadata file.
-/// - For fragment-based indices, it performs a full K-way sort-merge of page files to create new global page and lookup files.
-/// - For range-based indices, it concatenates lookup files, as data is already globally sorted.
+/// In a distributed environment, each worker node writes partition page /
+/// lookup file for the partitions it processes, and this function merges these
+/// files into a final metadata file.
+/// - For fragment-based indices, it performs a full K-way sort-merge of page
+///   files to create new global page and lookup files.
+/// - For range-based indices, it concatenates lookup files, as data is already
+///   globally sorted.
 async fn merge_metadata_files(
     store: &dyn IndexStore,
     part_page_files: &[String],
@@ -1951,7 +1989,8 @@ async fn merge_metadata_files(
     if part_lookup_files.len() != part_page_files.len() {
         return Err(Error::Internal {
             message: format!(
-                "Number of partition lookup files ({}) does not match number of partition page files ({})",
+                "Number of partition lookup files ({}) does not match number of partition page \
+                 files ({})",
                 part_lookup_files.len(),
                 part_page_files.len()
             ),
@@ -2036,35 +2075,41 @@ async fn merge_metadata_files(
     }
 }
 
-/// Merges multiple lookup files from a range-partitioned index into a single, unified lookup file.
+/// Merges multiple lookup files from a range-partitioned index into a single,
+/// unified lookup file.
 ///
-/// A range-partitioned B-Tree index creates a separate `page_lookup.lance` file for
-/// each partition. Each of these files has its own local `page_idx` column, where the indices
-/// start from 0.
+/// A range-partitioned B-Tree index creates a separate `page_lookup.lance` file
+/// for each partition. Each of these files has its own local `page_idx` column,
+/// where the indices start from 0.
 ///
-/// This function's primary goal is to combine these separate files into one large
-/// `page_lookup.lance` file. To do this, it remaps the local `page_idx` from each partition
-/// file into a contiguous, global `page_idx` space. It processes partition files sequentially,
-/// calculating an offset based on the number of pages in all previously processed partitions.
+/// This function's primary goal is to combine these separate files into one
+/// large `page_lookup.lance` file. To do this, it remaps the local `page_idx`
+/// from each partition file into a contiguous, global `page_idx` space. It
+/// processes partition files sequentially, calculating an offset based on the
+/// number of pages in all previously processed partitions.
 ///
-/// **The reverse operation occurs when the B-Tree index is loaded**: a global `page_idx` is translated
-/// back into a `(partition_id, local_page_idx)` tuple. This translation is made possible by the
-/// metadata stored under the `PAGE_NUM_PER_RANGE_PARTITION_META_KEY`, which this function
-/// is responsible for writing.
+/// **The reverse operation occurs when the B-Tree index is loaded**: a global
+/// `page_idx` is translated back into a `(partition_id, local_page_idx)` tuple.
+/// This translation is made possible by the metadata stored under the
+/// `PAGE_NUM_PER_RANGE_PARTITION_META_KEY`, which this function is responsible
+/// for writing.
 ///
 /// # Examples
 ///
 /// If we have two partition lookup files:
-/// - `part_0_page_lookup.lance`: Contains 3 pages. Its `page_idx` column is `[0, 1, 2]`.
-/// - `part_1_page_lookup.lance`: Contains 4 pages. Its `page_idx` column is `[0, 1, 2, 3]`.
+/// - `part_0_page_lookup.lance`: Contains 3 pages. Its `page_idx` column is
+///   `[0, 1, 2]`.
+/// - `part_1_page_lookup.lance`: Contains 4 pages. Its `page_idx` column is
+///   `[0, 1, 2, 3]`.
 ///
 /// The merge process works as follows:
-/// 1. Process `part_0`: The offset is 0. The indices `[0, 1, 2]` are written as is.
-/// 2. Process `part_1`: The offset is 3 and the local indices `[0, 1, 2, 3]` are remapped
-///    by adding the offset, resulting in `[3, 4, 5, 6]`.
+/// 1. Process `part_0`: The offset is 0. The indices `[0, 1, 2]` are written as
+///    is.
+/// 2. Process `part_1`: The offset is 3 and the local indices `[0, 1, 2, 3]`
+///    are remapped by adding the offset, resulting in `[3, 4, 5, 6]`.
 ///
-/// The final, merged `_page_lookup.lance` will have a single `page_idx` column containing
-/// `[0, 1, 2, 3, 4, 5, 6]`.
+/// The final, merged `_page_lookup.lance` will have a single `page_idx` column
+/// containing `[0, 1, 2, 3, 4, 5, 6]`.
 async fn merge_range_partitioned_lookups(
     store: &dyn IndexStore,
     part_lookup_files: &[String],
@@ -2111,8 +2156,9 @@ async fn merge_range_partitioned_lookups(
 /// Merges partition files using a K-way sort-merge algorithm.
 ///
 /// This function assumes its inputs have been pre-validated. It reads from all
-/// partitioned page files simultaneously, merges them into a single sorted stream,
-/// writes a new global page file, and generates a corresponding global lookup file.
+/// partitioned page files simultaneously, merges them into a single sorted
+/// stream, writes a new global page file, and generates a corresponding global
+/// lookup file.
 #[allow(clippy::too_many_arguments)]
 async fn merge_pages_and_lookups(
     store: &dyn IndexStore,
@@ -2147,21 +2193,18 @@ async fn merge_pages_and_lookups(
     .await?;
     page_file.finish().await?;
 
-    let lookup_batch = RecordBatch::try_new(
-        lookup_schema.clone(),
-        vec![
-            ScalarValue::iter_to_array(lookup_entries.iter().map(|(min, _, _, _)| min.clone()))?,
-            ScalarValue::iter_to_array(lookup_entries.iter().map(|(_, max, _, _)| max.clone()))?,
-            Arc::new(UInt32Array::from_iter_values(
-                lookup_entries
-                    .iter()
-                    .map(|(_, _, null_count, _)| *null_count),
-            )),
-            Arc::new(UInt32Array::from_iter_values(
-                lookup_entries.iter().map(|(_, _, _, page_idx)| *page_idx),
-            )),
-        ],
-    )?;
+    let lookup_batch = RecordBatch::try_new(lookup_schema.clone(), vec![
+        ScalarValue::iter_to_array(lookup_entries.iter().map(|(min, _, _, _)| min.clone()))?,
+        ScalarValue::iter_to_array(lookup_entries.iter().map(|(_, max, _, _)| max.clone()))?,
+        Arc::new(UInt32Array::from_iter_values(
+            lookup_entries
+                .iter()
+                .map(|(_, _, null_count, _)| *null_count),
+        )),
+        Arc::new(UInt32Array::from_iter_values(
+            lookup_entries.iter().map(|(_, _, _, page_idx)| *page_idx),
+        )),
+    ])?;
     let mut lookup_file = store
         .new_index_file(BTREE_LOOKUP_NAME, lookup_schema)
         .await?;
@@ -2169,13 +2212,15 @@ async fn merge_pages_and_lookups(
     lookup_file.finish_with_metadata(metadata).await?;
 
     // After successfully writing the merged files, delete all partition files
-    // Only perform deletion after files are successfully written, ensuring debug information is not lost in case of failure
+    // Only perform deletion after files are successfully written, ensuring debug
+    // information is not lost in case of failure
     cleanup_partition_files(store, part_lookup_files, part_page_files).await;
 
     Ok(())
 }
 
-// Adjust local_page_idx_ in each look-up file to create a contiguous global_page_idx
+// Adjust local_page_idx_ in each look-up file to create a contiguous
+// global_page_idx
 fn add_offset_to_page_idx(batch: &RecordBatch, offset: u32) -> Result<RecordBatch> {
     let (page_idx_pos, _) =
         batch
@@ -2215,10 +2260,7 @@ async fn merge_pages(
     let mut lookup_entries = Vec::new();
     let mut page_idx = 0u32;
 
-    debug!(
-        "Starting SortPreservingMerge with {} partitions",
-        part_lookup_files.len()
-    );
+    debug!("Starting SortPreservingMerge with {} partitions", part_lookup_files.len());
 
     let value_field = arrow_schema.field(0).clone().with_name(VALUE_COLUMN_NAME);
     let row_id_field = arrow_schema.field(1).clone().with_name(ROW_ID);
@@ -2264,28 +2306,22 @@ async fn merge_pages(
         },
     };
 
-    let merge_exec = Arc::new(SortPreservingMergeExec::new(
-        [sort_expr].into(),
-        union_inputs,
-    ));
+    let merge_exec = Arc::new(SortPreservingMergeExec::new([sort_expr].into(), union_inputs));
 
-    let unchunked = execute_plan(
-        merge_exec,
-        LanceExecutionOptions {
-            use_spilling: false,
-            ..Default::default()
-        },
-    )?;
+    let unchunked = execute_plan(merge_exec, LanceExecutionOptions {
+        use_spilling: false,
+        ..Default::default()
+    })?;
 
     // Use chunk_concat_stream to ensure fixed batch sizes
     let mut chunked_stream = chunk_concat_stream(unchunked, batch_size as usize);
 
     // Process chunked stream
     while let Some(batch) = chunked_stream.try_next().await? {
-        let writer_batch = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![batch.column(0).clone(), batch.column(1).clone()],
-        )?;
+        let writer_batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+            batch.column(0).clone(),
+            batch.column(1).clone(),
+        ])?;
 
         page_file.write_record_batch(writer_batch).await?;
 
@@ -2343,8 +2379,9 @@ fn extract_partition_id(filename: &str) -> Result<u64> {
 
 /// Clean up partition files after successful merge
 ///
-/// This function safely deletes partition lookup and page files after a successful merge operation.
-/// File deletion failures are logged but do not affect the overall success of the merge operation.
+/// This function safely deletes partition lookup and page files after a
+/// successful merge operation. File deletion failures are logged but do not
+/// affect the overall success of the merge operation.
 async fn cleanup_partition_files(
     store: &dyn IndexStore,
     part_lookup_files: &[String],
@@ -2352,26 +2389,13 @@ async fn cleanup_partition_files(
 ) {
     // Clean up partition lookup files
     for file_name in part_lookup_files {
-        cleanup_single_file(
-            store,
-            file_name,
-            "part_",
-            "_page_lookup.lance",
-            "partition lookup",
-        )
-        .await;
+        cleanup_single_file(store, file_name, "part_", "_page_lookup.lance", "partition lookup")
+            .await;
     }
 
     // Clean up partition page files
     for file_name in part_page_files {
-        cleanup_single_file(
-            store,
-            file_name,
-            "part_",
-            "_page_data.lance",
-            "partition page",
-        )
-        .await;
+        cleanup_single_file(store, file_name, "part_", "_page_data.lance", "partition page").await;
     }
 }
 
@@ -2389,21 +2413,21 @@ async fn cleanup_single_file(
         match store.delete_index_file(file_name).await {
             Ok(()) => {
                 debug!("Successfully deleted {} file: {}", file_type, file_name);
-            }
+            },
             Err(e) => {
                 warn!(
-                    "Failed to delete {} file '{}': {}. \
-                    This does not affect the merge operation, but may leave \
-                    partition files that should be cleaned up manually.",
+                    "Failed to delete {} file '{}': {}. This does not affect the merge operation, \
+                     but may leave partition files that should be cleaned up manually.",
                     file_type, file_name, e
                 );
-            }
+            },
         }
     } else {
-        // If the filename doesn't match the expected format, log a warning but don't attempt deletion
+        // If the filename doesn't match the expected format, log a warning but don't
+        // attempt deletion
         warn!(
-            "Skipping deletion of file '{}' as it does not match the expected \
-            {} file pattern ({}*{})",
+            "Skipping deletion of file '{}' as it does not match the expected {} file pattern \
+             ({}*{})",
             file_name, file_type, expected_prefix, expected_suffix
         );
     }
@@ -2470,29 +2494,32 @@ pub struct BTreeParameters {
     /// The number of rows to include in each zone
     pub zone_size: Option<u64>,
 
-    /// The ordinal ID of a data partition for building a large, distributed BTree index.
+    /// The ordinal ID of a data partition for building a large, distributed
+    /// BTree index.
     ///
-    /// When building an index from multiple, pre-partitioned data chunks (for example,
-    /// in a distributed environment), this ID specifies which partition this particular
-    /// build operation corresponds to.
+    /// When building an index from multiple, pre-partitioned data chunks (for
+    /// example, in a distributed environment), this ID specifies which
+    /// partition this particular build operation corresponds to.
     ///
     /// # Data Distribution Requirements
     ///
-    /// If this parameter is `Some(id)`, the caller **must** guarantee that the input data
-    /// is strictly global sorted. The input data, when considered as a whole across all
-    /// partitions ordered by `range_id`, must be sorted.
+    /// If this parameter is `Some(id)`, the caller **must** guarantee that the
+    /// input data is strictly global sorted. The input data, when
+    /// considered as a whole across all partitions ordered by `range_id`,
+    /// must be sorted.
     ///
     /// Concretely, this means:
     ///
-    /// All values in the data provided for `range_id: N` must be **less than or equal to**
-    /// all values in the data for `range_id: N+1`.
+    /// All values in the data provided for `range_id: N` must be **less than or
+    /// equal to** all values in the data for `range_id: N+1`.
     ///
-    /// Lance relies on this precondition to ensure the final, merged index is valid and
-    /// correctly ordered.
+    /// Lance relies on this precondition to ensure the final, merged index is
+    /// valid and correctly ordered.
     ///
     /// # `None` Case
     ///
-    /// If `range_id` is `None`, a single, monolithic index is built over the provided dataset.
+    /// If `range_id` is `None`, a single, monolithic index is built over the
+    /// provided dataset.
     pub range_id: Option<u32>,
 }
 
@@ -2605,8 +2632,10 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
-    use std::{collections::HashMap, sync::Arc};
+    use std::{
+        collections::HashMap,
+        sync::{atomic::Ordering, Arc},
+    };
 
     use arrow::datatypes::{Float32Type, Float64Type, Int32Type, UInt64Type};
     use arrow_array::{record_batch, FixedSizeListArray};
@@ -2617,29 +2646,30 @@ mod tests {
     use datafusion_common::{DataFusionError, ScalarValue};
     use datafusion_physical_expr::{expressions::col, PhysicalSortExpr};
     use deepsize::DeepSizeOf;
-    use futures::stream;
-    use futures::TryStreamExt;
-    use lance_core::utils::mask::RowSetOps;
-    use lance_core::utils::tempfile::TempObjDir;
-    use lance_core::{cache::LanceCache, utils::mask::RowAddrTreeMap};
+    use futures::{stream, TryStreamExt};
+    use lance_core::{
+        cache::LanceCache,
+        utils::{
+            mask::{RowAddrTreeMap, RowSetOps},
+            tempfile::TempObjDir,
+        },
+    };
     use lance_datafusion::{chunker::break_stream, datagen::DatafusionDatagenExt};
     use lance_datagen::{array, gen_batch, ArrayGeneratorExt, BatchCount, RowCount};
     use lance_io::object_store::ObjectStore;
     use object_store::path::Path;
 
-    use crate::metrics::LocalMetricsCollector;
-    use crate::{
-        metrics::NoOpMetricsCollector,
-        scalar::{
-            btree::{BTreeIndex, BTREE_PAGES_NAME},
-            lance_format::LanceIndexStore,
-            IndexStore, SargableQuery, ScalarIndex, SearchResult,
-        },
-    };
-
     use super::{
         part_lookup_file_path, part_page_data_file_path, train_btree_index, OrderableScalarValue,
         DEFAULT_BTREE_BATCH_SIZE,
+    };
+    use crate::{
+        metrics::{LocalMetricsCollector, NoOpMetricsCollector},
+        scalar::{
+            btree::{BTreeIndex, BTREE_PAGES_NAME},
+            lance_format::LanceIndexStore,
+            IndexStore, OldIndexDataFilter, SargableQuery, ScalarIndex, SearchResult,
+        },
     };
     #[test]
     fn test_scalar_value_size() {
@@ -2692,7 +2722,8 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        // Remap with a no-op mapping.  The remapped index should be identical to the original
+        // Remap with a no-op mapping.  The remapped index should be identical to the
+        // original
         index
             .remap(&HashMap::default(), remap_store.as_ref())
             .await
@@ -2730,15 +2761,7 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        let values = vec![
-            0.0,
-            1.0,
-            2.0,
-            3.0,
-            f64::NAN,
-            f64::NEG_INFINITY,
-            f64::INFINITY,
-        ];
+        let values = vec![0.0, 1.0, 2.0, 3.0, f64::NAN, f64::NEG_INFINITY, f64::INFINITY];
 
         // This is a bit overkill but we've had bugs in the past where DF's sort
         // didn't agree with Arrow's sort so we do an end-to-end test here
@@ -2831,16 +2854,15 @@ mod tests {
         ));
 
         // Method 1: Build complete index directly using the same data
-        // Create deterministic data for comparison - use 2 * DEFAULT_BTREE_BATCH_SIZE for testing
+        // Create deterministic data for comparison - use 2 * DEFAULT_BTREE_BATCH_SIZE
+        // for testing
         let total_count = 2 * DEFAULT_BTREE_BATCH_SIZE;
         let full_data_gen = gen_batch()
             .col("value", array::step::<Int32Type>())
             .col("_rowid", array::step::<UInt64Type>())
             .into_df_stream(RowCount::from(total_count / 2), BatchCount::from(2));
-        let full_data_source = Box::pin(RecordBatchStreamAdapter::new(
-            full_data_gen.schema(),
-            full_data_gen,
-        ));
+        let full_data_source =
+            Box::pin(RecordBatchStreamAdapter::new(full_data_gen.schema(), full_data_gen));
 
         train_btree_index(
             full_data_source,
@@ -2853,16 +2875,15 @@ mod tests {
         .unwrap();
 
         // Method 2: Build fragment-based index using the same data split into fragments
-        // Create fragment 1 index - first half of the data (0 to DEFAULT_BTREE_BATCH_SIZE-1)
+        // Create fragment 1 index - first half of the data (0 to
+        // DEFAULT_BTREE_BATCH_SIZE-1)
         let half_count = DEFAULT_BTREE_BATCH_SIZE;
         let fragment1_gen = gen_batch()
             .col("value", array::step::<Int32Type>())
             .col("_rowid", array::step::<UInt64Type>())
             .into_df_stream(RowCount::from(half_count), BatchCount::from(1));
-        let fragment1_data_source = Box::pin(RecordBatchStreamAdapter::new(
-            fragment1_gen.schema(),
-            fragment1_gen,
-        ));
+        let fragment1_data_source =
+            Box::pin(RecordBatchStreamAdapter::new(fragment1_gen.schema(), fragment1_gen));
 
         train_btree_index(
             fragment1_data_source,
@@ -2874,7 +2895,8 @@ mod tests {
         .await
         .unwrap();
 
-        // Create fragment 2 index - second half of the data (DEFAULT_BTREE_BATCH_SIZE to 2*DEFAULT_BTREE_BATCH_SIZE-1)
+        // Create fragment 2 index - second half of the data (DEFAULT_BTREE_BATCH_SIZE
+        // to 2*DEFAULT_BTREE_BATCH_SIZE-1)
         let start_val = DEFAULT_BTREE_BATCH_SIZE as i32;
         let end_val = (2 * DEFAULT_BTREE_BATCH_SIZE) as i32;
         let values_second_half: Vec<i32> = (start_val..end_val).collect();
@@ -2883,10 +2905,8 @@ mod tests {
             .col("value", array::cycle::<Int32Type>(values_second_half))
             .col("_rowid", array::cycle::<UInt64Type>(row_ids_second_half))
             .into_df_stream(RowCount::from(half_count), BatchCount::from(1));
-        let fragment2_data_source = Box::pin(RecordBatchStreamAdapter::new(
-            fragment2_gen.schema(),
-            fragment2_gen,
-        ));
+        let fragment2_data_source =
+            Box::pin(RecordBatchStreamAdapter::new(fragment2_gen.schema(), fragment2_gen));
 
         train_btree_index(
             fragment2_data_source,
@@ -2899,15 +2919,11 @@ mod tests {
         .unwrap();
 
         // Merge the fragment files
-        let part_page_files = vec![
-            part_page_data_file_path(1 << 32),
-            part_page_data_file_path(2 << 32),
-        ];
+        let part_page_files =
+            vec![part_page_data_file_path(1 << 32), part_page_data_file_path(2 << 32)];
 
-        let part_lookup_files = vec![
-            part_lookup_file_path(1 << 32),
-            part_lookup_file_path(2 << 32),
-        ];
+        let part_lookup_files =
+            vec![part_lookup_file_path(1 << 32), part_lookup_file_path(2 << 32)];
 
         super::merge_metadata_files(
             fragment_store.as_ref(),
@@ -3020,10 +3036,8 @@ mod tests {
             .col("value", array::step::<Int32Type>())
             .col("_rowid", array::step::<UInt64Type>())
             .into_df_stream(RowCount::from(total_count / 3), BatchCount::from(3));
-        let full_data_source = Box::pin(RecordBatchStreamAdapter::new(
-            full_data_gen.schema(),
-            full_data_gen,
-        ));
+        let full_data_source =
+            Box::pin(RecordBatchStreamAdapter::new(full_data_gen.schema(), full_data_gen));
 
         train_btree_index(
             full_data_source,
@@ -3042,10 +3056,8 @@ mod tests {
             .col("value", array::step::<Int32Type>())
             .col("_rowid", array::step::<UInt64Type>())
             .into_df_stream(RowCount::from(fragment_size), BatchCount::from(1));
-        let fragment1_data_source = Box::pin(RecordBatchStreamAdapter::new(
-            fragment1_gen.schema(),
-            fragment1_gen,
-        ));
+        let fragment1_data_source =
+            Box::pin(RecordBatchStreamAdapter::new(fragment1_gen.schema(), fragment1_gen));
 
         train_btree_index(
             fragment1_data_source,
@@ -3066,10 +3078,8 @@ mod tests {
             .col("value", array::cycle::<Int32Type>(values_fragment2))
             .col("_rowid", array::cycle::<UInt64Type>(row_ids_fragment2))
             .into_df_stream(RowCount::from(fragment_size), BatchCount::from(1));
-        let fragment2_data_source = Box::pin(RecordBatchStreamAdapter::new(
-            fragment2_gen.schema(),
-            fragment2_gen,
-        ));
+        let fragment2_data_source =
+            Box::pin(RecordBatchStreamAdapter::new(fragment2_gen.schema(), fragment2_gen));
 
         train_btree_index(
             fragment2_data_source,
@@ -3090,10 +3100,8 @@ mod tests {
             .col("value", array::cycle::<Int32Type>(values_fragment3))
             .col("_rowid", array::cycle::<UInt64Type>(row_ids_fragment3))
             .into_df_stream(RowCount::from(fragment_size), BatchCount::from(1));
-        let fragment3_data_source = Box::pin(RecordBatchStreamAdapter::new(
-            fragment3_gen.schema(),
-            fragment3_gen,
-        ));
+        let fragment3_data_source =
+            Box::pin(RecordBatchStreamAdapter::new(fragment3_gen.schema(), fragment3_gen));
 
         train_btree_index(
             fragment3_data_source,
@@ -3148,10 +3156,7 @@ mod tests {
             .search(&query_min, &NoOpMetricsCollector)
             .await
             .unwrap();
-        assert_eq!(
-            full_result_min, merged_result_min,
-            "Query for minimum value 0 failed"
-        );
+        assert_eq!(full_result_min, merged_result_min, "Query for minimum value 0 failed");
 
         // Test 2: Query maximum value (boundary: data end)
         let max_val = (3 * DEFAULT_BTREE_BATCH_SIZE - 1) as i32;
@@ -3339,7 +3344,8 @@ mod tests {
 
         // === Range Boundary Query Tests ===
 
-        // Test 12: Less than query (implemented using range query, from minimum to specified value)
+        // Test 12: Less than query (implemented using range query, from minimum to
+        // specified value)
         let lt_val = (DEFAULT_BTREE_BATCH_SIZE / 2) as i32;
         let query_lt = SargableQuery::Range(
             std::collections::Bound::Included(ScalarValue::Int32(Some(0))),
@@ -3353,13 +3359,10 @@ mod tests {
             .search(&query_lt, &NoOpMetricsCollector)
             .await
             .unwrap();
-        assert_eq!(
-            full_result_lt, merged_result_lt,
-            "Less than query (<{}) failed",
-            lt_val
-        );
+        assert_eq!(full_result_lt, merged_result_lt, "Less than query (<{}) failed", lt_val);
 
-        // Test 13: Greater than query (implemented using range query, from specified value to maximum)
+        // Test 13: Greater than query (implemented using range query, from specified
+        // value to maximum)
         let gt_val = (2 * DEFAULT_BTREE_BATCH_SIZE) as i32;
         let max_range_val = (3 * DEFAULT_BTREE_BATCH_SIZE) as i32;
         let query_gt = SargableQuery::Range(
@@ -3374,13 +3377,10 @@ mod tests {
             .search(&query_gt, &NoOpMetricsCollector)
             .await
             .unwrap();
-        assert_eq!(
-            full_result_gt, merged_result_gt,
-            "Greater than query (>{}) failed",
-            gt_val
-        );
+        assert_eq!(full_result_gt, merged_result_gt, "Greater than query (>{}) failed", gt_val);
 
-        // Test 14: Less than or equal query (implemented using range query, including boundary value)
+        // Test 14: Less than or equal query (implemented using range query, including
+        // boundary value)
         let lte_val = (DEFAULT_BTREE_BATCH_SIZE - 1) as i32;
         let query_lte = SargableQuery::Range(
             std::collections::Bound::Included(ScalarValue::Int32(Some(0))),
@@ -3400,7 +3400,8 @@ mod tests {
             lte_val
         );
 
-        // Test 15: Greater than or equal query (implemented using range query, including boundary value)
+        // Test 15: Greater than or equal query (implemented using range query,
+        // including boundary value)
         let gte_val = (2 * DEFAULT_BTREE_BATCH_SIZE) as i32;
         let query_gte = SargableQuery::Range(
             std::collections::Bound::Included(ScalarValue::Int32(Some(gte_val))),
@@ -3424,14 +3425,8 @@ mod tests {
     #[test]
     fn test_extract_partition_id() {
         // Test valid partition file names
-        assert_eq!(
-            super::extract_partition_id("part_123_page_data.lance").unwrap(),
-            123
-        );
-        assert_eq!(
-            super::extract_partition_id("part_456_page_lookup.lance").unwrap(),
-            456
-        );
+        assert_eq!(super::extract_partition_id("part_123_page_data.lance").unwrap(), 123);
+        assert_eq!(super::extract_partition_id("part_456_page_lookup.lance").unwrap(), 456);
         assert_eq!(
             super::extract_partition_id("part_4294967296_page_data.lance").unwrap(),
             4294967296
@@ -3467,8 +3462,9 @@ mod tests {
             "part_456_page_data.lance".to_string(),
         ];
 
-        // The cleanup function should handle both valid and invalid file patterns gracefully
-        // This test mainly verifies that the function doesn't panic and handles edge cases
+        // The cleanup function should handle both valid and invalid file patterns
+        // gracefully This test mainly verifies that the function doesn't panic
+        // and handles edge cases
         super::cleanup_partition_files(test_store.as_ref(), &lookup_files, &page_files).await;
     }
 
@@ -3520,7 +3516,7 @@ mod tests {
                 let null_rows: Vec<u64> =
                     null_row_ids.row_addrs().unwrap().map(u64::from).collect();
                 assert_eq!(null_rows, vec![0], "Should report row 0 as null");
-            }
+            },
             _ => panic!("Expected Exact search result"),
         }
 
@@ -3547,15 +3543,13 @@ mod tests {
                 let null_rows: Vec<u64> =
                     null_row_ids.row_addrs().unwrap().map(u64::from).collect();
                 assert_eq!(null_rows, vec![0], "Should report row 0 as null");
-            }
+            },
             _ => panic!("Expected Exact search result"),
         }
 
         // Test 3: IsIn query [0, 5] - should return allow=[1, 2], null=[0]
-        let query = SargableQuery::IsIn(vec![
-            ScalarValue::Int32(Some(0)),
-            ScalarValue::Int32(Some(5)),
-        ]);
+        let query =
+            SargableQuery::IsIn(vec![ScalarValue::Int32(Some(0)), ScalarValue::Int32(Some(5))]);
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         match result {
@@ -3579,7 +3573,7 @@ mod tests {
                 let null_rows: Vec<u64> =
                     null_row_ids.row_addrs().unwrap().map(u64::from).collect();
                 assert_eq!(null_rows, vec![0], "Should report row 0 as null");
-            }
+            },
             _ => panic!("Expected Exact search result"),
         }
     }
@@ -3602,16 +3596,15 @@ mod tests {
         ));
 
         // Method 1: Build complete index directly using the same data
-        // Create deterministic data for comparison - use 4 * DEFAULT_BTREE_BATCH_SIZE for testing
+        // Create deterministic data for comparison - use 4 * DEFAULT_BTREE_BATCH_SIZE
+        // for testing
         let total_count = 4 * DEFAULT_BTREE_BATCH_SIZE;
         let full_data_gen = gen_batch()
             .col("value", array::step::<Int32Type>())
             .col("_rowid", array::step::<UInt64Type>())
             .into_df_stream(RowCount::from(total_count / 4), BatchCount::from(4));
-        let full_data_source = Box::pin(RecordBatchStreamAdapter::new(
-            full_data_gen.schema(),
-            full_data_gen,
-        ));
+        let full_data_source =
+            Box::pin(RecordBatchStreamAdapter::new(full_data_gen.schema(), full_data_gen));
 
         train_btree_index(
             full_data_source,
@@ -3624,18 +3617,14 @@ mod tests {
         .unwrap();
 
         // Method 2: Build range-based index using the same data split into ranges
-        // Create range 1 index, intentionally make it not divisible by DEFAULT_BTREE_BATCH_SIZE
+        // Create range 1 index, intentionally make it not divisible by
+        // DEFAULT_BTREE_BATCH_SIZE
         let range1_gen = gen_batch()
             .col("value", array::step::<Int32Type>())
             .col("_rowid", array::step::<UInt64Type>())
-            .into_df_stream(
-                RowCount::from(DEFAULT_BTREE_BATCH_SIZE / 2),
-                BatchCount::from(5),
-            );
-        let range1_data_source = Box::pin(RecordBatchStreamAdapter::new(
-            range1_gen.schema(),
-            range1_gen,
-        ));
+            .into_df_stream(RowCount::from(DEFAULT_BTREE_BATCH_SIZE / 2), BatchCount::from(5));
+        let range1_data_source =
+            Box::pin(RecordBatchStreamAdapter::new(range1_gen.schema(), range1_gen));
 
         train_btree_index(
             range1_data_source,
@@ -3647,7 +3636,8 @@ mod tests {
         .await
         .unwrap();
 
-        // Create range 2 index, also intentionally make it not divisible by DEFAULT_BTREE_BATCH_SIZE
+        // Create range 2 index, also intentionally make it not divisible by
+        // DEFAULT_BTREE_BATCH_SIZE
         let start_val = (DEFAULT_BTREE_BATCH_SIZE * 2 + DEFAULT_BTREE_BATCH_SIZE / 2) as i32;
         let end_val = (4 * DEFAULT_BTREE_BATCH_SIZE) as i32;
         let values_second_half: Vec<i32> = (start_val..end_val).collect();
@@ -3655,14 +3645,9 @@ mod tests {
         let range2_gen = gen_batch()
             .col("value", array::cycle::<Int32Type>(values_second_half))
             .col("_rowid", array::cycle::<UInt64Type>(row_ids_second_half))
-            .into_df_stream(
-                RowCount::from(DEFAULT_BTREE_BATCH_SIZE / 2),
-                BatchCount::from(3),
-            );
-        let range2_data_source = Box::pin(RecordBatchStreamAdapter::new(
-            range2_gen.schema(),
-            range2_gen,
-        ));
+            .into_df_stream(RowCount::from(DEFAULT_BTREE_BATCH_SIZE / 2), BatchCount::from(3));
+        let range2_data_source =
+            Box::pin(RecordBatchStreamAdapter::new(range2_gen.schema(), range2_gen));
 
         train_btree_index(
             range2_data_source,
@@ -3675,15 +3660,11 @@ mod tests {
         .unwrap();
 
         // Merge the fragment files
-        let part_page_files = vec![
-            part_page_data_file_path(0 << 32),
-            part_page_data_file_path(1 << 32),
-        ];
+        let part_page_files =
+            vec![part_page_data_file_path(0 << 32), part_page_data_file_path(1 << 32)];
 
-        let part_lookup_files = vec![
-            part_lookup_file_path(0 << 32),
-            part_lookup_file_path(1 << 32),
-        ];
+        let part_lookup_files =
+            vec![part_lookup_file_path(0 << 32), part_lookup_file_path(1 << 32)];
 
         super::merge_metadata_files(
             range_store.as_ref(),
@@ -3733,7 +3714,8 @@ mod tests {
             mid_first_batch
         );
 
-        // Test 3: Query for value in the last batch (should be in the second range file)
+        // Test 3: Query for value in the last batch (should be in the second range
+        // file)
         let mid_last_batch = (DEFAULT_BTREE_BATCH_SIZE * 3 + (DEFAULT_BTREE_BATCH_SIZE / 2)) as i32;
         let query_mid_last = SargableQuery::Equals(ScalarValue::Int32(Some(mid_last_batch)));
         let full_result_mid_last = full_index
@@ -3818,7 +3800,8 @@ mod tests {
 
         // Range Tests
 
-        // Test 8: Cross-range query: One range including different values from adjacent range files.
+        // Test 8: Cross-range query: One range including different values from adjacent
+        // range files.
         let range_start =
             (DEFAULT_BTREE_BATCH_SIZE * 2 + DEFAULT_BTREE_BATCH_SIZE / 2 - 100) as i32;
         let range_end = range_start + 200;
@@ -3889,7 +3872,8 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        // Remap with a no-op mapping.  The remapped index should be identical to the original
+        // Remap with a no-op mapping.  The remapped index should be identical to the
+        // original
         ranged_index
             .remap(&HashMap::default(), remap_store.as_ref())
             .await
@@ -3941,18 +3925,14 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        // Create range 1 index, intentionally make it not divisible by DEFAULT_BTREE_BATCH_SIZE
+        // Create range 1 index, intentionally make it not divisible by
+        // DEFAULT_BTREE_BATCH_SIZE
         let range1_gen = gen_batch()
             .col("value", array::step::<Int32Type>())
             .col("_rowid", array::step::<UInt64Type>())
-            .into_df_stream(
-                RowCount::from(DEFAULT_BTREE_BATCH_SIZE / 2),
-                BatchCount::from(5),
-            );
-        let range1_data_source = Box::pin(RecordBatchStreamAdapter::new(
-            range1_gen.schema(),
-            range1_gen,
-        ));
+            .into_df_stream(RowCount::from(DEFAULT_BTREE_BATCH_SIZE / 2), BatchCount::from(5));
+        let range1_data_source =
+            Box::pin(RecordBatchStreamAdapter::new(range1_gen.schema(), range1_gen));
 
         train_btree_index(
             range1_data_source,
@@ -3964,7 +3944,8 @@ mod tests {
         .await
         .unwrap();
 
-        // Create range 2 index, also intentionally make it not divisible by DEFAULT_BTREE_BATCH_SIZE
+        // Create range 2 index, also intentionally make it not divisible by
+        // DEFAULT_BTREE_BATCH_SIZE
         let start_val = (DEFAULT_BTREE_BATCH_SIZE * 2 + DEFAULT_BTREE_BATCH_SIZE / 2) as i32;
         let end_val = (4 * DEFAULT_BTREE_BATCH_SIZE) as i32;
         let values_second_half: Vec<i32> = (start_val..end_val).collect();
@@ -3972,14 +3953,9 @@ mod tests {
         let range2_gen = gen_batch()
             .col("value", array::cycle::<Int32Type>(values_second_half))
             .col("_rowid", array::cycle::<UInt64Type>(row_ids_second_half))
-            .into_df_stream(
-                RowCount::from(DEFAULT_BTREE_BATCH_SIZE / 2),
-                BatchCount::from(3),
-            );
-        let range2_data_source = Box::pin(RecordBatchStreamAdapter::new(
-            range2_gen.schema(),
-            range2_gen,
-        ));
+            .into_df_stream(RowCount::from(DEFAULT_BTREE_BATCH_SIZE / 2), BatchCount::from(3));
+        let range2_data_source =
+            Box::pin(RecordBatchStreamAdapter::new(range2_gen.schema(), range2_gen));
 
         train_btree_index(
             range2_data_source,
@@ -3992,15 +3968,11 @@ mod tests {
         .unwrap();
 
         // Merge the fragment files
-        let part_page_files = vec![
-            part_page_data_file_path(1 << 32),
-            part_page_data_file_path(2 << 32),
-        ];
+        let part_page_files =
+            vec![part_page_data_file_path(1 << 32), part_page_data_file_path(2 << 32)];
 
-        let part_lookup_files = vec![
-            part_lookup_file_path(1 << 32),
-            part_lookup_file_path(2 << 32),
-        ];
+        let part_lookup_files =
+            vec![part_lookup_file_path(1 << 32), part_lookup_file_path(2 << 32)];
 
         super::merge_metadata_files(
             old_store.as_ref(),
@@ -4021,14 +3993,9 @@ mod tests {
         let update_data = gen_batch()
             .col("value", array::cycle::<Int32Type>(values))
             .col("_rowid", array::cycle::<UInt64Type>(row_ids))
-            .into_df_stream(
-                RowCount::from(DEFAULT_BTREE_BATCH_SIZE / 2),
-                BatchCount::from(2),
-            );
-        let update_data_source = Box::pin(RecordBatchStreamAdapter::new(
-            update_data.schema(),
-            update_data,
-        ));
+            .into_df_stream(RowCount::from(DEFAULT_BTREE_BATCH_SIZE / 2), BatchCount::from(2));
+        let update_data_source =
+            Box::pin(RecordBatchStreamAdapter::new(update_data.schema(), update_data));
 
         let ranged_index = BTreeIndex::load(old_store.clone(), None, &LanceCache::no_cache())
             .await
@@ -4066,17 +4033,97 @@ mod tests {
                     row_id_map.selected((updated_value + row_id_delta) as u64),
                     "Updated index should contain new rowids"
                 );
-            }
+            },
             _ => {
                 panic!("Btree search result should always be Exact.");
-            }
+            },
         }
+    }
+
+    #[tokio::test]
+    async fn test_update_with_exact_row_id_filter() {
+        let old_tmpdir = TempObjDir::default();
+        let old_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            old_tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let new_tmpdir = TempObjDir::default();
+        let new_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            new_tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let old_data = gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_stream(RowCount::from(512), BatchCount::from(2));
+        let old_data_source = Box::pin(RecordBatchStreamAdapter::new(old_data.schema(), old_data));
+        train_btree_index(
+            old_data_source,
+            old_store.as_ref(),
+            DEFAULT_BTREE_BATCH_SIZE,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let index = BTreeIndex::load(old_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let new_data = gen_batch()
+            .col("value", array::step_custom::<Int32Type>(2000, 1))
+            .col("_rowid", array::step_custom::<UInt64Type>(2000, 1))
+            .into_df_stream(RowCount::from(100), BatchCount::from(1));
+        let new_data_source = Box::pin(RecordBatchStreamAdapter::new(new_data.schema(), new_data));
+
+        let mut retained_old_rows = RowAddrTreeMap::new();
+        retained_old_rows.insert_range(0..64);
+        retained_old_rows.insert_range(300..364);
+
+        index
+            .update(
+                new_data_source,
+                new_store.as_ref(),
+                Some(OldIndexDataFilter::RowIds(retained_old_rows)),
+            )
+            .await
+            .unwrap();
+
+        let updated_index = BTreeIndex::load(new_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let present = |value: i32| {
+            let updated_index = updated_index.clone();
+            async move {
+                let query = SargableQuery::Equals(ScalarValue::Int32(Some(value)));
+                match updated_index
+                    .search(&query, &NoOpMetricsCollector)
+                    .await
+                    .unwrap()
+                {
+                    SearchResult::Exact(row_id_map) => row_id_map.selected(value as u64),
+                    _ => unreachable!("Btree search result should always be Exact"),
+                }
+            }
+        };
+
+        assert!(present(12).await);
+        assert!(present(320).await);
+        assert!(!present(120).await);
+        assert!(!present(420).await);
+        assert!(present(2005).await);
     }
 
     /// Rust equivalent of Python test `test_btree_remap_big_deletions`
     ///
-    /// This test verifies that btree index remapping works correctly when a large
-    /// portion of the data is deleted. The Python test:
+    /// This test verifies that btree index remapping works correctly when a
+    /// large portion of the data is deleted. The Python test:
     /// 1. Writes 15K rows in 3 fragments (values 0-14999)
     /// 2. Creates a btree index (will have multiple pages)
     /// 3. Deletes rows where a > 1000 AND a < 10000 (deletes values 1001-9999)
@@ -4109,8 +4156,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Create a mapping that simulates deleting rows where value > 1000 AND value < 10000
-        // Since values match row_ids in our test data:
+        // Create a mapping that simulates deleting rows where value > 1000 AND value <
+        // 10000 Since values match row_ids in our test data:
         // - Rows 0-1000 (values 0-1000) are kept with same row_ids
         // - Rows 1001-9999 (values 1001-9999) are deleted (mapped to None)
         // - Rows 10000-14999 (values 10000-14999) are remapped to new row_ids 1001-5999
@@ -4161,10 +4208,10 @@ mod tests {
                         "Value {} should exist in remapped index but was not found",
                         value
                     );
-                }
+                },
                 _ => {
                     panic!("Btree search result should always be Exact.");
-                }
+                },
             }
         }
 
@@ -4183,10 +4230,10 @@ mod tests {
                         "Value {} should NOT exist in remapped index but was found",
                         value
                     );
-                }
+                },
                 _ => {
                     panic!("Btree search result should always be Exact.");
-                }
+                },
             }
         }
     }

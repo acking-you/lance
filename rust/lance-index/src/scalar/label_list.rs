@@ -7,31 +7,40 @@ use arrow::array::AsArray;
 use arrow_array::{Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use async_trait::async_trait;
-use datafusion::execution::RecordBatchStream;
-use datafusion::physical_plan::{stream::RecordBatchStreamAdapter, SendableRecordBatchStream};
+use datafusion::{
+    execution::RecordBatchStream,
+    physical_plan::{stream::RecordBatchStreamAdapter, SendableRecordBatchStream},
+};
 use datafusion_common::ScalarValue;
 use deepsize::DeepSizeOf;
 use futures::{stream::BoxStream, StreamExt, TryStream, TryStreamExt};
-use lance_core::cache::LanceCache;
-use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap};
-use lance_core::{Error, Result};
+use lance_core::{
+    cache::LanceCache,
+    utils::mask::{NullableRowAddrSet, RowAddrTreeMap},
+    Error, Result,
+};
 use roaring::RoaringBitmap;
 use snafu::location;
 use tracing::instrument;
 
-use super::{bitmap::BitmapIndex, AnyQuery, IndexStore, LabelListQuery, ScalarIndex};
-use super::{BuiltinIndexType, SargableQuery, ScalarIndexParams};
-use super::{MetricsCollector, SearchResult};
-use crate::frag_reuse::FragReuseIndex;
-use crate::pbold;
-use crate::scalar::bitmap::BitmapIndexPlugin;
-use crate::scalar::expression::{LabelListQueryParser, ScalarQueryParser};
-use crate::scalar::registry::{
-    DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
-    VALUE_COLUMN_NAME,
+use super::{
+    bitmap::BitmapIndex, AnyQuery, BuiltinIndexType, IndexStore, LabelListQuery, MetricsCollector,
+    SargableQuery, ScalarIndex, ScalarIndexParams, SearchResult,
 };
-use crate::scalar::{CreatedIndex, UpdateCriteria};
-use crate::{Index, IndexType};
+use crate::{
+    frag_reuse::FragReuseIndex,
+    pbold,
+    scalar::{
+        bitmap::BitmapIndexPlugin,
+        expression::{LabelListQueryParser, ScalarQueryParser},
+        registry::{
+            DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
+            TrainingRequest, VALUE_COLUMN_NAME,
+        },
+        CreatedIndex, UpdateCriteria,
+    },
+    Index, IndexType,
+};
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
 const LABEL_LIST_INDEX_VERSION: u32 = 0;
@@ -50,7 +59,7 @@ trait LabelListSubIndex: ScalarIndex + DeepSizeOf {
                 // results should remain for array_has_any/array_has_all when the list itself
                 // is non-NULL. Clear nulls to avoid propagating element-level NULLs.
                 Ok(row_ids.with_nulls(RowAddrTreeMap::new()))
-            }
+            },
             _ => Err(Error::Internal {
                 message: "Label list sub-index should return exact results".to_string(),
                 location: location!(),
@@ -71,7 +80,9 @@ pub struct LabelListIndex {
 
 impl LabelListIndex {
     fn new(values_index: Arc<dyn LabelListSubIndex>) -> Self {
-        Self { values_index }
+        Self {
+            values_index,
+        }
     }
 
     async fn load(
@@ -179,11 +190,11 @@ impl ScalarIndex for LabelListIndex {
                 let values_results = self.search_values(labels, metrics);
                 self.set_intersection(values_results, labels.len() == 1)
                     .await
-            }
+            },
             LabelListQuery::HasAnyLabel(labels) => {
                 let values_results = self.search_values(labels, metrics);
                 self.set_union(values_results, labels.len() == 1).await
-            }
+            },
         }?;
         Ok(SearchResult::Exact(row_ids))
     }
@@ -192,7 +203,8 @@ impl ScalarIndex for LabelListIndex {
         true
     }
 
-    /// Remap the row ids, creating a new remapped version of this index in `dest_store`
+    /// Remap the row ids, creating a new remapped version of this index in
+    /// `dest_store`
     async fn remap(
         &self,
         mapping: &HashMap<u64, Option<u64>>,
@@ -207,15 +219,16 @@ impl ScalarIndex for LabelListIndex {
         })
     }
 
-    /// Add the new data into the index, creating an updated version of the index in `dest_store`
+    /// Add the new data into the index, creating an updated version of the
+    /// index in `dest_store`
     async fn update(
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        valid_old_fragments: Option<&RoaringBitmap>,
+        old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
         self.values_index
-            .update(unnest_chunks(new_data)?, dest_store, valid_old_fragments)
+            .update(unnest_chunks(new_data)?, dest_store, old_data_filter)
             .await?;
 
         Ok(CreatedIndex {
@@ -272,11 +285,11 @@ fn unnest_schema(schema: &Schema) -> SchemaRef {
         ),
         other_type => {
             unreachable!(
-                "The first field in the schema must be a List or LargeList type. \
-                Found: {}. This should have been verified earlier in the code.",
+                "The first field in the schema must be a List or LargeList type. Found: {}. This \
+                 should have been verified earlier in the code.",
                 other_type
             )
-        }
+        },
     };
 
     let all_fields = vec![Arc::new(new_key_field)]
@@ -350,10 +363,7 @@ fn unnest_chunks(
         std::future::ready(Some(unnest_batch(batch, unnest_schema.clone())).transpose())
     });
 
-    Ok(Box::pin(RecordBatchStreamAdapter::new(
-        unnest_schema_copy,
-        source,
-    )))
+    Ok(Box::pin(RecordBatchStreamAdapter::new(unnest_schema_copy, source)))
 }
 
 #[derive(Debug, Default)]
@@ -370,13 +380,11 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
         _params: &str,
         field: &Field,
     ) -> Result<Box<dyn TrainingRequest>> {
-        if !matches!(
-            field.data_type(),
-            DataType::List(_) | DataType::LargeList(_)
-        ) {
+        if !matches!(field.data_type(), DataType::List(_) | DataType::LargeList(_)) {
             return Err(Error::InvalidInput {
                 source: format!(
-                    "LabelList index can only be created on List or LargeList type columns. Column has type {:?}",
+                    "LabelList index can only be created on List or LargeList type columns. \
+                     Column has type {:?}",
                     field.data_type()
                 )
                 .into(),
@@ -407,8 +415,8 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
 
     /// Train a new index
     ///
-    /// The provided data must fulfill all the criteria returned by `training_criteria`
-    /// and the plugin can rely on this fact.
+    /// The provided data must fulfill all the criteria returned by
+    /// `training_criteria` and the plugin can rely on this fact.
     async fn train_index(
         &self,
         data: SendableRecordBatchStream,
@@ -435,13 +443,11 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
             })?
             .1;
 
-        if !matches!(
-            field.data_type(),
-            DataType::List(_) | DataType::LargeList(_)
-        ) {
+        if !matches!(field.data_type(), DataType::List(_) | DataType::LargeList(_)) {
             return Err(Error::InvalidInput {
                 source: format!(
-                    "LabelList index can only be created on List or LargeList type columns. Column has type {:?}",
+                    "LabelList index can only be created on List or LargeList type columns. \
+                     Column has type {:?}",
                     field.data_type()
                 )
                 .into(),
@@ -469,9 +475,7 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        Ok(
-            LabelListIndex::load(index_store, frag_reuse_index, cache).await?
-                as Arc<dyn ScalarIndex>,
-        )
+        Ok(LabelListIndex::load(index_store, frag_reuse_index, cache).await?
+            as Arc<dyn ScalarIndex>)
     }
 }

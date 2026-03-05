@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::scalar::inverted::lance_tokenizer::DocType;
-use crate::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
-use lance_core::{Error, Result};
-use serde::ser::SerializeMap;
-use serde::{Deserialize, Serialize};
-use snafu::location;
 use std::collections::HashSet;
+
+use lance_core::{Error, Result};
+use serde::{ser::SerializeMap, Deserialize, Serialize};
+use snafu::location;
+
+use crate::scalar::inverted::{
+    lance_tokenizer::DocType, tokenizer::lance_tokenizer::LanceTokenizer,
+};
 
 #[derive(Debug, Clone)]
 pub struct FtsSearchParams {
@@ -84,10 +86,7 @@ impl TryFrom<&str> for Operator {
         match value.to_ascii_uppercase().as_str() {
             "AND" => Ok(Self::And),
             "OR" => Ok(Self::Or),
-            _ => Err(Error::invalid_input(
-                format!("Invalid operator: {}", value),
-                location!(),
-            )),
+            _ => Err(Error::invalid_input(format!("Invalid operator: {}", value), location!())),
         }
     }
 }
@@ -130,12 +129,8 @@ impl std::fmt::Display for FtsQuery {
             ),
             Self::MultiMatch(query) => write!(f, "MultiMatch({:?})", query),
             Self::Boolean(query) => {
-                write!(
-                    f,
-                    "Boolean(must={:?}, should={:?})",
-                    query.must, query.should
-                )
-            }
+                write!(f, "Boolean(must={:?}, should={:?})", query.must, query.should)
+            },
         }
     }
 }
@@ -149,14 +144,14 @@ impl FtsQueryNode for FtsQuery {
                 let mut columns = query.positive.columns();
                 columns.extend(query.negative.columns());
                 columns
-            }
+            },
             Self::MultiMatch(query) => {
                 let mut columns = HashSet::new();
                 for match_query in &query.match_queries {
                     columns.extend(match_query.columns());
                 }
                 columns
-            }
+            },
             Self::Boolean(query) => {
                 let mut columns = HashSet::new();
                 for query in &query.must {
@@ -166,7 +161,7 @@ impl FtsQueryNode for FtsQuery {
                     columns.extend(query.columns());
                 }
                 columns
-            }
+            },
         }
     }
 }
@@ -179,9 +174,10 @@ impl FtsQuery {
             Self::Boost(query) => query.positive.query(),
             Self::MultiMatch(query) => query.match_queries[0].terms.clone(),
             Self::Boolean(_) => {
-                // Bool queries don't have a single query string, they are composed of multiple queries
+                // Bool queries don't have a single query string, they are composed of multiple
+                // queries
                 String::new()
-            }
+            },
         }
     }
 
@@ -191,12 +187,12 @@ impl FtsQuery {
             Self::Phrase(query) => query.column.is_none(),
             Self::Boost(query) => {
                 query.positive.is_missing_column() || query.negative.is_missing_column()
-            }
+            },
             Self::MultiMatch(query) => query.match_queries.iter().any(|q| q.column.is_none()),
             Self::Boolean(query) => {
                 query.must.iter().any(|q| q.is_missing_column())
                     || query.should.iter().any(|q| q.is_missing_column())
-            }
+            },
         }
     }
 
@@ -212,15 +208,17 @@ impl FtsQuery {
                     negative: Box::new(negative),
                     negative_boost: query.negative_boost,
                 })
-            }
+            },
             Self::MultiMatch(query) => {
                 let match_queries = query
                     .match_queries
                     .into_iter()
                     .map(|q| q.with_column(Some(column.clone())))
                     .collect();
-                Self::MultiMatch(MultiMatchQuery { match_queries })
-            }
+                Self::MultiMatch(MultiMatchQuery {
+                    match_queries,
+                })
+            },
             Self::Boolean(query) => {
                 let must = query
                     .must
@@ -242,7 +240,7 @@ impl FtsQuery {
                     should,
                     must_not,
                 })
-            }
+            },
         }
     }
 }
@@ -522,7 +520,9 @@ impl MultiMatchQuery {
             .into_iter()
             .map(|column| MatchQuery::new(query.clone()).with_column(Some(column)))
             .collect();
-        Ok(Self { match_queries })
+        Ok(Self {
+            match_queries,
+        })
     }
 
     pub fn try_with_boosts(mut self, boosts: Vec<f32>) -> Result<Self> {
@@ -570,10 +570,7 @@ impl TryFrom<&str> for Occur {
             "SHOULD" => Ok(Self::Should),
             "MUST" => Ok(Self::Must),
             "MUST_NOT" => Ok(Self::MustNot),
-            _ => Err(Error::invalid_input(
-                format!("Invalid occur value: {}", value),
-                location!(),
-            )),
+            _ => Err(Error::invalid_input(format!("Invalid occur value: {}", value), location!())),
         }
     }
 }
@@ -653,7 +650,7 @@ impl BooleanMatchPlan {
                     must: Vec::new(),
                     must_not: Vec::new(),
                 })
-            }
+            },
             FtsQuery::Boolean(bool_query) => {
                 let mut column = None;
                 let should = Self::collect_matches(&bool_query.should, &mut column)?;
@@ -669,7 +666,7 @@ impl BooleanMatchPlan {
                     must,
                     must_not,
                 })
-            }
+            },
             _ => None,
         }
     }
@@ -829,47 +826,43 @@ pub fn fill_fts_query_column(
     match query {
         FtsQuery::Match(match_query) => {
             match columns.len() {
-                0 => {
-                    Err(Error::invalid_input(
-                        "Cannot perform full text search unless an INVERTED index has been created on at least one column".to_string(),
-                        location!(),
-                    ))
-                }
+                0 => Err(Error::invalid_input(
+                    "Cannot perform full text search unless an INVERTED index has been created on \
+                     at least one column"
+                        .to_string(),
+                    location!(),
+                )),
                 1 => {
                     let column = columns[0].clone();
                     let query = match_query.clone().with_column(Some(column));
                     Ok(FtsQuery::Match(query))
-                }
+                },
                 _ => {
                     // if there are multiple columns, we need to create a MultiMatch query
                     let multi_match_query =
                         MultiMatchQuery::try_new(match_query.terms.clone(), columns.to_vec())?;
                     Ok(FtsQuery::MultiMatch(multi_match_query))
-                }
+                },
             }
-        }
-        FtsQuery::Phrase(phrase_query) => {
-            match columns.len() {
-                0 => {
-                    Err(Error::invalid_input(
-                        "Cannot perform full text search unless an INVERTED index has been created on at least one column".to_string(),
-                        location!(),
-                    ))
-                }
-                1 => {
-                    let column = columns[0].clone();
-                    let query = phrase_query.clone().with_column(Some(column));
-                    Ok(FtsQuery::Phrase(query))
-                }
-                _ => {
-                    Err(Error::invalid_input(
-                        "the column must be specified in the query".to_string(),
-                        location!(),
-                    ))
-                }
-            }
-        }
-       FtsQuery::Boost(boost_query) => {
+        },
+        FtsQuery::Phrase(phrase_query) => match columns.len() {
+            0 => Err(Error::invalid_input(
+                "Cannot perform full text search unless an INVERTED index has been created on at \
+                 least one column"
+                    .to_string(),
+                location!(),
+            )),
+            1 => {
+                let column = columns[0].clone();
+                let query = phrase_query.clone().with_column(Some(column));
+                Ok(FtsQuery::Phrase(query))
+            },
+            _ => Err(Error::invalid_input(
+                "the column must be specified in the query".to_string(),
+                location!(),
+            )),
+        },
+        FtsQuery::Boost(boost_query) => {
             let positive = fill_fts_query_column(&boost_query.positive, columns, replace)?;
             let negative = fill_fts_query_column(&boost_query.negative, columns, replace)?;
             Ok(FtsQuery::Boost(BoostQuery {
@@ -877,12 +870,14 @@ pub fn fill_fts_query_column(
                 negative: Box::new(negative),
                 negative_boost: boost_query.negative_boost,
             }))
-        }
+        },
         FtsQuery::MultiMatch(multi_match_query) => {
             let match_queries = multi_match_query
                 .match_queries
                 .iter()
-                .map(|query| fill_fts_query_column(&FtsQuery::Match(query.clone()), columns, replace))
+                .map(|query| {
+                    fill_fts_query_column(&FtsQuery::Match(query.clone()), columns, replace)
+                })
                 .map(|result| {
                     result.map(|query| {
                         if let FtsQuery::Match(match_query) = query {
@@ -893,8 +888,10 @@ pub fn fill_fts_query_column(
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            Ok(FtsQuery::MultiMatch(MultiMatchQuery { match_queries }))
-       }
+            Ok(FtsQuery::MultiMatch(MultiMatchQuery {
+                match_queries,
+            }))
+        },
         FtsQuery::Boolean(bool_query) => {
             let must = bool_query
                 .must
@@ -911,8 +908,12 @@ pub fn fill_fts_query_column(
                 .iter()
                 .map(|query| fill_fts_query_column(query, columns, replace))
                 .collect::<Result<Vec<_>>>()?;
-            Ok(FtsQuery::Boolean(BooleanQuery { must, should, must_not }))
-        }
+            Ok(FtsQuery::Boolean(BooleanQuery {
+                must,
+                should,
+                must_not,
+            }))
+        },
     }
 }
 
@@ -920,8 +921,9 @@ pub fn fill_fts_query_column(
 mod tests {
     #[test]
     fn test_match_query_serde() {
-        use super::*;
         use serde_json::json;
+
+        use super::*;
 
         let query = MatchQuery::new("hello world".to_string())
             .with_column(Some("text".to_string()))
@@ -959,8 +961,9 @@ mod tests {
 
     #[test]
     fn test_phrase_query_serde() {
-        use super::*;
         use serde_json::json;
+
+        use super::*;
 
         let query = json!({
             "terms": "hello world",
@@ -1018,10 +1021,8 @@ mod tests {
 
         let should = MatchQuery::new("a".to_string()).with_column(Some("text".to_string()));
         let must = MatchQuery::new("b".to_string()).with_column(Some("title".to_string()));
-        let query = BooleanQuery::new(vec![
-            (Occur::Should, should.into()),
-            (Occur::Must, must.into()),
-        ]);
+        let query =
+            BooleanQuery::new(vec![(Occur::Should, should.into()), (Occur::Must, must.into())]);
         assert!(BooleanMatchPlan::try_build(&FtsQuery::Boolean(query)).is_none());
     }
 

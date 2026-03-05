@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::{env, path::PathBuf};
+
 use lance_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use snafu::location;
-use std::{env, path::PathBuf};
 
 #[cfg(feature = "tokenizer-jieba")]
 mod jieba;
@@ -15,19 +16,19 @@ mod lindera;
 
 #[cfg(feature = "tokenizer-jieba")]
 use jieba::JiebaTokenizerBuilder;
-
 #[cfg(feature = "tokenizer-lindera")]
 use lindera::LinderaTokenizerBuilder;
 
-use crate::pbold;
-use crate::scalar::inverted::tokenizer::lance_tokenizer::{
-    JsonTokenizer, LanceTokenizer, TextTokenizer,
+use crate::{
+    pbold,
+    scalar::inverted::tokenizer::lance_tokenizer::{JsonTokenizer, LanceTokenizer, TextTokenizer},
 };
 
 /// Tokenizer configs
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InvertedIndexParams {
-    /// lance tokenizer takes care of different data types, such as text, json, etc.
+    /// lance tokenizer takes care of different data types, such as text, json,
+    /// etc.
     /// - 'text': parsing input documents into tokens
     /// - 'json': parsing input json string into tokens
     /// - none: auto type inference
@@ -92,7 +93,8 @@ pub struct InvertedIndexParams {
     pub(crate) prefix_only: bool,
 
     /// If true, skip the partition merge stage after indexing.
-    /// This can be useful for distributed indexing where merge is handled separately.
+    /// This can be useful for distributed indexing where merge is handled
+    /// separately.
     #[serde(default)]
     pub(crate) skip_merge: bool,
 }
@@ -164,7 +166,8 @@ impl Default for InvertedIndexParams {
 }
 
 impl InvertedIndexParams {
-    /// Create a new `InvertedIndexParams` with the given base tokenizer and language.
+    /// Create a new `InvertedIndexParams` with the given base tokenizer and
+    /// language.
     ///
     /// The `base_tokenizer` can be one of the following:
     /// - `simple`: splits tokens on whitespace and punctuation, default
@@ -258,24 +261,24 @@ impl InvertedIndexParams {
         self
     }
 
-    /// Set the minimum N-Gram length, only works when `base_tokenizer` is `ngram`.
-    /// Must be greater than 0 and not greater than `max_ngram_length`.
-    /// Default to 3.
+    /// Set the minimum N-Gram length, only works when `base_tokenizer` is
+    /// `ngram`. Must be greater than 0 and not greater than
+    /// `max_ngram_length`. Default to 3.
     pub fn ngram_min_length(mut self, min_length: u32) -> Self {
         self.min_ngram_length = min_length;
         self
     }
 
-    /// Set the maximum N-Gram length, only works when `base_tokenizer` is `ngram`.
-    /// Must be greater than 0 and not less than `min_ngram_length`.
-    /// Default to 3.
+    /// Set the maximum N-Gram length, only works when `base_tokenizer` is
+    /// `ngram`. Must be greater than 0 and not less than
+    /// `min_ngram_length`. Default to 3.
     pub fn ngram_max_length(mut self, max_length: u32) -> Self {
         self.max_ngram_length = max_length;
         self
     }
 
-    /// Set whether only prefix N-Gram is generated, only works when `base_tokenizer` is `ngram`.
-    /// Default to `false`.
+    /// Set whether only prefix N-Gram is generated, only works when
+    /// `base_tokenizer` is `ngram`. Default to `false`.
     pub fn ngram_prefix_only(mut self, prefix_only: bool) -> Self {
         self.prefix_only = prefix_only;
         self
@@ -290,9 +293,8 @@ impl InvertedIndexParams {
     pub fn build(&self) -> Result<Box<dyn LanceTokenizer>> {
         let mut builder = self.build_base_tokenizer()?;
         if let Some(max_token_length) = self.max_token_length {
-            builder = builder.filter_dynamic(tantivy::tokenizer::RemoveLongFilter::limit(
-                max_token_length,
-            ));
+            builder = builder
+                .filter_dynamic(tantivy::tokenizer::RemoveLongFilter::limit(max_token_length));
         }
         if self.lower_case {
             builder = builder.filter_dynamic(tantivy::tokenizer::LowerCaser);
@@ -313,7 +315,7 @@ impl InvertedIndexParams {
                             location!(),
                         )
                     })?
-                }
+                },
             };
             builder = builder.filter_dynamic(stop_word_filter);
         }
@@ -327,10 +329,7 @@ impl InvertedIndexParams {
             Some(ref t) if t == "json" => Ok(Box::new(JsonTokenizer::new(tokenizer))),
             None => Ok(Box::new(TextTokenizer::new(tokenizer))),
             _ => Err(Error::invalid_input(
-                format!(
-                    "unknown lance tokenizer {}",
-                    self.lance_tokenizer.as_ref().unwrap()
-                ),
+                format!("unknown lance tokenizer {}", self.lance_tokenizer.as_ref().unwrap()),
                 location!(),
             )),
         }
@@ -368,7 +367,7 @@ impl InvertedIndexParams {
                     ));
                 };
                 lindera::LinderaBuilder::load(&home.join(s))?.build()
-            }
+            },
             #[cfg(feature = "tokenizer-jieba")]
             s if s.starts_with("jieba/") || s == "jieba" => {
                 let s = if s == "jieba" { "jieba/default" } else { s };
@@ -379,7 +378,7 @@ impl InvertedIndexParams {
                     ));
                 };
                 jieba::JiebaBuilder::load(&home.join(s))?.build()
-            }
+            },
             _ => Err(Error::invalid_input(
                 format!("unknown base tokenizer {}", self.base_tokenizer),
                 location!(),

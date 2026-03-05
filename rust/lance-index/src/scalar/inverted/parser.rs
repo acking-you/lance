@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use super::query::{
-    BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Occur, Operator, PhraseQuery,
-};
 use lance_core::{Error, Result};
 use serde_json::Value;
 use snafu::location;
+
+use super::query::{
+    BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Occur, Operator, PhraseQuery,
+};
 
 pub trait JsonParser {
     fn from_json(value: &Value) -> Result<Self>
@@ -145,10 +146,7 @@ fn from_json_value(value: &Value) -> Result<FtsQuery> {
         .as_object()
         .ok_or_else(|| Error::invalid_input("value must be a JSON object", location!()))?;
     if value.len() != 1 {
-        return Err(Error::invalid_input(
-            "value must be a single JSON object",
-            location!(),
-        ));
+        return Err(Error::invalid_input("value must be a single JSON object", location!()));
     }
 
     let (query_type, query_val) = value.into_iter().next().unwrap();
@@ -285,7 +283,9 @@ mod tests {
                 .with_column(Some("body".to_string()))
                 .with_fuzziness(None),
         ];
-        let expected_query = FtsQuery::MultiMatch(MultiMatchQuery { match_queries });
+        let expected_query = FtsQuery::MultiMatch(MultiMatchQuery {
+            match_queries,
+        });
         assert_eq!(fts_query, expected_query);
     }
 

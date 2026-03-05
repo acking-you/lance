@@ -3,44 +3,46 @@
 
 //! Bloom Filter Index
 //!
-//! Bloom Filter is a probabilistic data structure that allows for fast membership testing.
-//! It is a space-efficient data structure that can be used to test whether an element is a member of a set.
-//! It's an inexact filter - they may include false positives that require rechecking.
+//! Bloom Filter is a probabilistic data structure that allows for fast
+//! membership testing. It is a space-efficient data structure that can be used
+//! to test whether an element is a member of a set. It's an inexact filter -
+//! they may include false positives that require rechecking.
 
-use crate::scalar::bloomfilter::sbbf::{Sbbf, SbbfBuilder};
-use crate::scalar::expression::{BloomFilterQueryParser, ScalarQueryParser};
-use crate::scalar::registry::{
-    ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
-};
-use crate::scalar::{
-    BloomFilterQuery, BuiltinIndexType, CreatedIndex, ScalarIndexParams, UpdateCriteria,
-};
-use crate::{pb, Any};
 use arrow_array::{Array, UInt64Array};
+
+use crate::{
+    pb,
+    scalar::{
+        bloomfilter::sbbf::{Sbbf, SbbfBuilder},
+        expression::{BloomFilterQueryParser, ScalarQueryParser},
+        registry::{ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest},
+        BloomFilterQuery, BuiltinIndexType, CreatedIndex, ScalarIndexParams, UpdateCriteria,
+    },
+    Any,
+};
 mod as_bytes;
 pub mod sbbf;
-use arrow_schema::{DataType, Field};
-use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock},
+};
 
-use std::sync::LazyLock;
-
-use datafusion::execution::SendableRecordBatchStream;
-use std::{collections::HashMap, sync::Arc};
-
-use crate::scalar::FragReuseIndex;
-use crate::scalar::{AnyQuery, IndexStore, MetricsCollector, ScalarIndex, SearchResult};
-use crate::vector::VectorIndex;
-use crate::{Index, IndexType};
 use arrow_array::{ArrayRef, RecordBatch};
+use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
+use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
-use lance_core::cache::LanceCache;
-use lance_core::Error;
-use lance_core::Result;
+use lance_core::{cache::LanceCache, Error, Result};
 use roaring::RoaringBitmap;
+use serde::{Deserialize, Serialize};
 use snafu::location;
 
 use super::zoned::{rebuild_zones, search_zones, ZoneBound, ZoneProcessor, ZoneTrainer};
+use crate::{
+    scalar::{AnyQuery, FragReuseIndex, IndexStore, MetricsCollector, ScalarIndex, SearchResult},
+    vector::VectorIndex,
+    Index, IndexType,
+};
 
 const BLOOMFILTER_FILENAME: &str = "bloomfilter.lance";
 const BLOOMFILTER_ITEM_META_KEY: &str = "bloomfilter_item";
@@ -61,8 +63,9 @@ struct BloomFilterStatistics {
 impl DeepSizeOf for BloomFilterStatistics {
     fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
         // Estimate the size of the bloom filter
-        // We could try to get the actual size from the Sbbf if it has a method for that,
-        // but for now we'll estimate based on the number of bytes it serializes to
+        // We could try to get the actual size from the Sbbf if it has a method for
+        // that, but for now we'll estimate based on the number of bytes it
+        // serializes to
         self.bloom_filter.to_bytes().len()
     }
 }
@@ -112,11 +115,7 @@ impl BloomFilterIndex {
             .and_then(|bs| bs.parse().ok())
             .unwrap_or(*DEFAULT_PROBABILITY);
 
-        Ok(Arc::new(Self::try_from_serialized(
-            bloom_data,
-            number_of_items,
-            probability,
-        )?))
+        Ok(Arc::new(Self::try_from_serialized(bloom_data, number_of_items, probability)?))
     }
 
     fn try_from_serialized(
@@ -136,10 +135,7 @@ impl BloomFilterIndex {
         let fragment_id_col = data
             .column_by_name("fragment_id")
             .ok_or_else(|| {
-                Error::invalid_input(
-                    "BloomFilterIndex: missing 'fragment_id' column",
-                    location!(),
-                )
+                Error::invalid_input("BloomFilterIndex: missing 'fragment_id' column", location!())
             })?
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
@@ -167,10 +163,7 @@ impl BloomFilterIndex {
         let zone_length_col = data
             .column_by_name("zone_length")
             .ok_or_else(|| {
-                Error::invalid_input(
-                    "BloomFilterIndex: missing 'zone_length' column",
-                    location!(),
-                )
+                Error::invalid_input("BloomFilterIndex: missing 'zone_length' column", location!())
             })?
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
@@ -259,7 +252,7 @@ impl BloomFilterIndex {
             BloomFilterQuery::IsNull() => {
                 // Use the has_null information to determine if this block contains nulls
                 Ok(block.has_null)
-            }
+            },
             BloomFilterQuery::Equals(target) => {
                 if target.is_null() {
                     // Handle null values using has_null information
@@ -285,39 +278,39 @@ impl BloomFilterIndex {
                     datafusion_common::ScalarValue::Utf8(Some(val)) => Ok(sbbf.check(val.as_str())),
                     datafusion_common::ScalarValue::LargeUtf8(Some(val)) => {
                         Ok(sbbf.check(val.as_str()))
-                    }
+                    },
                     // Binary types
                     datafusion_common::ScalarValue::Binary(Some(val)) => {
                         Ok(sbbf.check(val.as_slice()))
-                    }
+                    },
                     datafusion_common::ScalarValue::LargeBinary(Some(val)) => {
                         Ok(sbbf.check(val.as_slice()))
-                    }
+                    },
                     // Date and time types
                     datafusion_common::ScalarValue::Date32(Some(val)) => Ok(sbbf.check(val)),
                     datafusion_common::ScalarValue::Date64(Some(val)) => Ok(sbbf.check(val)),
                     datafusion_common::ScalarValue::Time32Second(Some(val)) => Ok(sbbf.check(val)),
                     datafusion_common::ScalarValue::Time32Millisecond(Some(val)) => {
                         Ok(sbbf.check(val))
-                    }
+                    },
                     datafusion_common::ScalarValue::Time64Microsecond(Some(val)) => {
                         Ok(sbbf.check(val))
-                    }
+                    },
                     datafusion_common::ScalarValue::Time64Nanosecond(Some(val)) => {
                         Ok(sbbf.check(val))
-                    }
+                    },
                     datafusion_common::ScalarValue::TimestampSecond(Some(val), _) => {
                         Ok(sbbf.check(val))
-                    }
+                    },
                     datafusion_common::ScalarValue::TimestampMillisecond(Some(val), _) => {
                         Ok(sbbf.check(val))
-                    }
+                    },
                     datafusion_common::ScalarValue::TimestampMicrosecond(Some(val), _) => {
                         Ok(sbbf.check(val))
-                    }
+                    },
                     datafusion_common::ScalarValue::TimestampNanosecond(Some(val), _) => {
                         Ok(sbbf.check(val))
-                    }
+                    },
                     _ => Err(Error::InvalidInput {
                         source: format!(
                             "Unsupported data type in bloom filter query: {:?}",
@@ -327,7 +320,7 @@ impl BloomFilterIndex {
                         location: location!(),
                     }),
                 }
-            }
+            },
             BloomFilterQuery::IsIn(values) => {
                 // Check if any value in the set is in the bloom filter
                 for value in values {
@@ -357,39 +350,39 @@ impl BloomFilterIndex {
                         datafusion_common::ScalarValue::Utf8(Some(val)) => sbbf.check(val.as_str()),
                         datafusion_common::ScalarValue::LargeUtf8(Some(val)) => {
                             sbbf.check(val.as_str())
-                        }
+                        },
                         // Binary types
                         datafusion_common::ScalarValue::Binary(Some(val)) => {
                             sbbf.check(val.as_slice())
-                        }
+                        },
                         datafusion_common::ScalarValue::LargeBinary(Some(val)) => {
                             sbbf.check(val.as_slice())
-                        }
+                        },
                         // Date and time types
                         datafusion_common::ScalarValue::Date32(Some(val)) => sbbf.check(val),
                         datafusion_common::ScalarValue::Date64(Some(val)) => sbbf.check(val),
                         datafusion_common::ScalarValue::Time32Second(Some(val)) => sbbf.check(val),
                         datafusion_common::ScalarValue::Time32Millisecond(Some(val)) => {
                             sbbf.check(val)
-                        }
+                        },
                         datafusion_common::ScalarValue::Time64Microsecond(Some(val)) => {
                             sbbf.check(val)
-                        }
+                        },
                         datafusion_common::ScalarValue::Time64Nanosecond(Some(val)) => {
                             sbbf.check(val)
-                        }
+                        },
                         datafusion_common::ScalarValue::TimestampSecond(Some(val), _) => {
                             sbbf.check(val)
-                        }
+                        },
                         datafusion_common::ScalarValue::TimestampMillisecond(Some(val), _) => {
                             sbbf.check(val)
-                        }
+                        },
                         datafusion_common::ScalarValue::TimestampMicrosecond(Some(val), _) => {
                             sbbf.check(val)
-                        }
+                        },
                         datafusion_common::ScalarValue::TimestampNanosecond(Some(val), _) => {
                             sbbf.check(val)
-                        }
+                        },
                         _ => {
                             return Err(Error::InvalidInput {
                                 source: format!(
@@ -399,7 +392,7 @@ impl BloomFilterIndex {
                                 .into(),
                                 location: location!(),
                             });
-                        }
+                        },
                     };
 
                     if found {
@@ -407,7 +400,7 @@ impl BloomFilterIndex {
                     }
                 }
                 Ok(false) // None of the values were found
-            }
+            },
         }
     }
 }
@@ -466,9 +459,7 @@ impl ScalarIndex for BloomFilterIndex {
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<BloomFilterQuery>().unwrap();
-        search_zones(&self.zones, metrics, |block| {
-            self.evaluate_block_against_query(block, query)
-        })
+        search_zones(&self.zones, metrics, |block| self.evaluate_block_against_query(block, query))
     }
 
     fn can_remap(&self) -> bool {
@@ -490,7 +481,7 @@ impl ScalarIndex for BloomFilterIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        _valid_old_fragments: Option<&RoaringBitmap>,
+        _old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
         // Re-train bloom filters for the appended data using the shared trainer
         let params = BloomFilterIndexBuilderParams {
@@ -537,8 +528,8 @@ fn default_probability() -> f64 {
     *DEFAULT_PROBABILITY
 }
 
-// NumberOfItems: 8192 + Probability: 0.00057(1 in 1754) -> NumberOfBytes: 16384(16KiB) + 8 SALT values
-// reference: https://hur.st/bloomfilter/?n=8192&p=&m=16KiB&k=8
+// NumberOfItems: 8192 + Probability: 0.00057(1 in 1754) -> NumberOfBytes:
+// 16384(16KiB) + 8 SALT values reference: https://hur.st/bloomfilter/?n=8192&p=&m=16KiB&k=8
 static DEFAULT_NUMBER_OF_ITEMS: LazyLock<u64> = LazyLock::new(|| {
     std::env::var("LANCE_BLOOMFILTER_DEFAULT_NUMBER_OF_ITEMS")
         .unwrap_or_else(|_| "8192".to_string())
@@ -603,9 +594,9 @@ impl BloomFilterIndexBuilder {
         })
     }
 
-    /// Train the builder using the shared ZoneTrainer. The input stream is expected to
-    /// contain the value column followed by `_rowaddr`, matching the order emitted by
-    /// the scalar index training pipeline.
+    /// Train the builder using the shared ZoneTrainer. The input stream is
+    /// expected to contain the value column followed by `_rowaddr`,
+    /// matching the order emitted by the scalar index training pipeline.
     pub async fn train(&mut self, batches_source: SendableRecordBatchStream) -> Result<()> {
         let processor = BloomFilterProcessor::new(self.params.clone())?;
         let trainer = ZoneTrainer::new(processor, self.params.number_of_items)?;
@@ -670,10 +661,9 @@ impl BloomFilterIndexBuilder {
         let record_batch = self.bloomfilter_stats_as_batch()?;
 
         let mut file_schema = record_batch.schema().as_ref().clone();
-        file_schema.metadata.insert(
-            BLOOMFILTER_ITEM_META_KEY.to_string(),
-            self.params.number_of_items.to_string(),
-        );
+        file_schema
+            .metadata
+            .insert(BLOOMFILTER_ITEM_META_KEY.to_string(), self.params.number_of_items.to_string());
 
         file_schema.metadata.insert(
             BLOOMFILTER_PROBABILITY_META_KEY.to_string(),
@@ -689,7 +679,8 @@ impl BloomFilterIndexBuilder {
     }
 }
 
-/// Index-specific processor that inserts values into the split block Bloom filter.
+/// Index-specific processor that inserts values into the split block Bloom
+/// filter.
 struct BloomFilterProcessor {
     params: BloomFilterIndexBuilderParams,
     sbbf: Option<Sbbf>,
@@ -802,28 +793,28 @@ impl ZoneProcessor for BloomFilterProcessor {
                     .downcast_ref::<arrow_array::Int8Array>()
                     .unwrap();
                 Self::process_primitive_array(sbbf, typed_array)
-            }
+            },
             DataType::Int16 => {
                 let typed_array = array
                     .as_any()
                     .downcast_ref::<arrow_array::Int16Array>()
                     .unwrap();
                 Self::process_primitive_array(sbbf, typed_array)
-            }
+            },
             DataType::Int32 => {
                 let typed_array = array
                     .as_any()
                     .downcast_ref::<arrow_array::Int32Array>()
                     .unwrap();
                 Self::process_primitive_array(sbbf, typed_array)
-            }
+            },
             DataType::Int64 => {
                 let typed_array = array
                     .as_any()
                     .downcast_ref::<arrow_array::Int64Array>()
                     .unwrap();
                 Self::process_primitive_array(sbbf, typed_array)
-            }
+            },
             // Unsigned integers
             DataType::UInt8 => {
                 let typed_array = array
@@ -831,28 +822,28 @@ impl ZoneProcessor for BloomFilterProcessor {
                     .downcast_ref::<arrow_array::UInt8Array>()
                     .unwrap();
                 Self::process_primitive_array(sbbf, typed_array)
-            }
+            },
             DataType::UInt16 => {
                 let typed_array = array
                     .as_any()
                     .downcast_ref::<arrow_array::UInt16Array>()
                     .unwrap();
                 Self::process_primitive_array(sbbf, typed_array)
-            }
+            },
             DataType::UInt32 => {
                 let typed_array = array
                     .as_any()
                     .downcast_ref::<arrow_array::UInt32Array>()
                     .unwrap();
                 Self::process_primitive_array(sbbf, typed_array)
-            }
+            },
             DataType::UInt64 => {
                 let typed_array = array
                     .as_any()
                     .downcast_ref::<arrow_array::UInt64Array>()
                     .unwrap();
                 Self::process_primitive_array(sbbf, typed_array)
-            }
+            },
             // Floating point numbers
             DataType::Float32 => {
                 let typed_array = array
@@ -860,14 +851,14 @@ impl ZoneProcessor for BloomFilterProcessor {
                     .downcast_ref::<arrow_array::Float32Array>()
                     .unwrap();
                 Self::process_primitive_array(sbbf, typed_array)
-            }
+            },
             DataType::Float64 => {
                 let typed_array = array
                     .as_any()
                     .downcast_ref::<arrow_array::Float64Array>()
                     .unwrap();
                 Self::process_primitive_array(sbbf, typed_array)
-            }
+            },
             // Date and time types (stored as i32 internally)
             DataType::Date32 => {
                 let typed_array = array
@@ -875,7 +866,7 @@ impl ZoneProcessor for BloomFilterProcessor {
                     .downcast_ref::<arrow_array::Date32Array>()
                     .unwrap();
                 Self::process_primitive_array(sbbf, typed_array)
-            }
+            },
             DataType::Time32(time_unit) => match time_unit {
                 arrow_schema::TimeUnit::Second => {
                     let typed_array = array
@@ -883,20 +874,20 @@ impl ZoneProcessor for BloomFilterProcessor {
                         .downcast_ref::<arrow_array::Time32SecondArray>()
                         .unwrap();
                     Self::process_primitive_array(sbbf, typed_array)
-                }
+                },
                 arrow_schema::TimeUnit::Millisecond => {
                     let typed_array = array
                         .as_any()
                         .downcast_ref::<arrow_array::Time32MillisecondArray>()
                         .unwrap();
                     Self::process_primitive_array(sbbf, typed_array)
-                }
+                },
                 _ => {
                     return Err(Error::InvalidInput {
                         source: format!("Unsupported Time32 unit: {:?}", time_unit).into(),
                         location: location!(),
                     });
-                }
+                },
             },
             // Date and time types (stored as i64 internally)
             DataType::Date64 => {
@@ -905,7 +896,7 @@ impl ZoneProcessor for BloomFilterProcessor {
                     .downcast_ref::<arrow_array::Date64Array>()
                     .unwrap();
                 Self::process_primitive_array(sbbf, typed_array)
-            }
+            },
             DataType::Time64(time_unit) => match time_unit {
                 arrow_schema::TimeUnit::Microsecond => {
                     let typed_array = array
@@ -913,20 +904,20 @@ impl ZoneProcessor for BloomFilterProcessor {
                         .downcast_ref::<arrow_array::Time64MicrosecondArray>()
                         .unwrap();
                     Self::process_primitive_array(sbbf, typed_array)
-                }
+                },
                 arrow_schema::TimeUnit::Nanosecond => {
                     let typed_array = array
                         .as_any()
                         .downcast_ref::<arrow_array::Time64NanosecondArray>()
                         .unwrap();
                     Self::process_primitive_array(sbbf, typed_array)
-                }
+                },
                 _ => {
                     return Err(Error::InvalidInput {
                         source: format!("Unsupported Time64 unit: {:?}", time_unit).into(),
                         location: location!(),
                     });
-                }
+                },
             },
             DataType::Timestamp(time_unit, _) => match time_unit {
                 arrow_schema::TimeUnit::Second => {
@@ -935,28 +926,28 @@ impl ZoneProcessor for BloomFilterProcessor {
                         .downcast_ref::<arrow_array::TimestampSecondArray>()
                         .unwrap();
                     Self::process_primitive_array(sbbf, typed_array)
-                }
+                },
                 arrow_schema::TimeUnit::Millisecond => {
                     let typed_array = array
                         .as_any()
                         .downcast_ref::<arrow_array::TimestampMillisecondArray>()
                         .unwrap();
                     Self::process_primitive_array(sbbf, typed_array)
-                }
+                },
                 arrow_schema::TimeUnit::Microsecond => {
                     let typed_array = array
                         .as_any()
                         .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
                         .unwrap();
                     Self::process_primitive_array(sbbf, typed_array)
-                }
+                },
                 arrow_schema::TimeUnit::Nanosecond => {
                     let typed_array = array
                         .as_any()
                         .downcast_ref::<arrow_array::TimestampNanosecondArray>()
                         .unwrap();
                     Self::process_primitive_array(sbbf, typed_array)
-                }
+                },
             },
             DataType::Utf8 => {
                 let typed_array = array
@@ -964,28 +955,28 @@ impl ZoneProcessor for BloomFilterProcessor {
                     .downcast_ref::<arrow_array::StringArray>()
                     .unwrap();
                 Self::process_string_array(sbbf, typed_array)
-            }
+            },
             DataType::LargeUtf8 => {
                 let typed_array = array
                     .as_any()
                     .downcast_ref::<arrow_array::LargeStringArray>()
                     .unwrap();
                 Self::process_large_string_array(sbbf, typed_array)
-            }
+            },
             DataType::Binary => {
                 let typed_array = array
                     .as_any()
                     .downcast_ref::<arrow_array::BinaryArray>()
                     .unwrap();
                 Self::process_binary_array(sbbf, typed_array)
-            }
+            },
             DataType::LargeBinary => {
                 let typed_array = array
                     .as_any()
                     .downcast_ref::<arrow_array::LargeBinaryArray>()
                     .unwrap();
                 Self::process_large_binary_array(sbbf, typed_array)
-            }
+            },
             _ => {
                 return Err(Error::InvalidInput {
                     source: format!(
@@ -995,7 +986,7 @@ impl ZoneProcessor for BloomFilterProcessor {
                     .into(),
                     location: location!(),
                 });
-            }
+            },
         };
 
         // Update the current zone's null tracking
@@ -1157,10 +1148,8 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        Ok(
-            BloomFilterIndex::load(index_store, frag_reuse_index, cache).await?
-                as Arc<dyn ScalarIndex>,
-        )
+        Ok(BloomFilterIndex::load(index_store, frag_reuse_index, cache).await?
+            as Arc<dyn ScalarIndex>)
     }
 
     async fn load_statistics(
@@ -1199,14 +1188,13 @@ impl TrainingRequest for BloomFilterIndexTrainingRequest {
 
 #[cfg(test)]
 mod tests {
-    use crate::scalar::registry::VALUE_COLUMN_NAME;
     use std::sync::Arc;
 
-    use crate::scalar::bloomfilter::BloomFilterIndexPlugin;
     use arrow_array::{record_batch, RecordBatch, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
-    use datafusion::execution::SendableRecordBatchStream;
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion::{
+        execution::SendableRecordBatchStream, physical_plan::stream::RecordBatchStreamAdapter,
+    };
     use datafusion_common::ScalarValue;
     use futures::{stream, StreamExt};
     use lance_core::{
@@ -1215,16 +1203,20 @@ mod tests {
         ROW_ADDR,
     };
     use lance_io::object_store::ObjectStore;
+    use roaring::RoaringBitmap;
 
-    use crate::scalar::{
-        bloomfilter::{BloomFilterIndex, BloomFilterIndexBuilderParams},
-        lance_format::LanceIndexStore,
-        BloomFilterQuery, ScalarIndex, SearchResult,
-    };
-
-    use crate::metrics::NoOpMetricsCollector;
     use crate::Index; // Import Index trait to access calculate_included_frags
-    use roaring::RoaringBitmap; // Import RoaringBitmap for the test
+    use crate::{
+        metrics::NoOpMetricsCollector,
+        scalar::{
+            bloomfilter::{
+                BloomFilterIndex, BloomFilterIndexBuilderParams, BloomFilterIndexPlugin,
+            },
+            lance_format::LanceIndexStore,
+            registry::VALUE_COLUMN_NAME,
+            BloomFilterQuery, ScalarIndex, SearchResult,
+        },
+    }; // Import RoaringBitmap for the test
 
     // Adds a _rowaddr column emulating each batch as a new fragment
     fn add_row_addr(stream: SendableRecordBatchStream) -> SendableRecordBatchStream {
@@ -1239,10 +1231,10 @@ mod tests {
             let row_addr = Arc::new(UInt64Array::from_iter_values(
                 (0..batch.num_rows() as u64).map(|off| off + ((frag_id as u64) << 32)),
             ));
-            Ok(RecordBatch::try_new(
-                schema_with_row_addr.clone(),
-                vec![batch.column(0).clone(), row_addr],
-            )?)
+            Ok(RecordBatch::try_new(schema_with_row_addr.clone(), vec![
+                batch.column(0).clone(),
+                row_addr,
+            ])?)
         });
         Box::pin(RecordBatchStreamAdapter::new(schema, stream))
     }
@@ -1257,11 +1249,8 @@ mod tests {
         ));
 
         let data = arrow_array::Int32Array::from(Vec::<i32>::new());
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            VALUE_COLUMN_NAME,
-            DataType::Int32,
-            false,
-        )]));
+        let schema =
+            Arc::new(Schema::new(vec![Field::new(VALUE_COLUMN_NAME, DataType::Int32, false)]));
         let data = RecordBatch::try_new(schema.clone(), vec![Arc::new(data)]).unwrap();
 
         let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
@@ -1284,7 +1273,8 @@ mod tests {
         assert_eq!(index.number_of_items, 8192);
         assert_eq!(index.probability, 0.00057); // Default probability
 
-        // Equals query: null (should match nothing, as there are no nulls in empty index)
+        // Equals query: null (should match nothing, as there are no nulls in empty
+        // index)
         let query = BloomFilterQuery::Equals(ScalarValue::Int32(None));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
@@ -1300,11 +1290,8 @@ mod tests {
         ));
 
         let data = arrow_array::Int32Array::from_iter_values(0..100);
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            VALUE_COLUMN_NAME,
-            DataType::Int32,
-            false,
-        )]));
+        let schema =
+            Arc::new(Schema::new(vec![Field::new(VALUE_COLUMN_NAME, DataType::Int32, false)]));
         let data = RecordBatch::try_new(schema.clone(), vec![Arc::new(data)]).unwrap();
         let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
             schema,
@@ -1331,7 +1318,8 @@ mod tests {
         assert_eq!(index.number_of_items, 100);
         assert_eq!(index.probability, 0.01);
 
-        // Check that we have one zone (since 100 items fit exactly in one zone of size 100)
+        // Check that we have one zone (since 100 items fit exactly in one zone of size
+        // 100)
         assert_eq!(index.zones[0].bound.fragment_id, 0u64);
         assert_eq!(index.zones[0].bound.start, 0u64);
         assert_eq!(index.zones[0].bound.length, 100);
@@ -1350,14 +1338,12 @@ mod tests {
         let query = BloomFilterQuery::Equals(ScalarValue::Int32(Some(500))); // Value not in [0, 100)
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
-        // Should return empty result since bloom filter correctly filters out this value
+        // Should return empty result since bloom filter correctly filters out this
+        // value
         assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
 
         // Test calculate_included_frags
-        assert_eq!(
-            index.calculate_included_frags().await.unwrap(),
-            RoaringBitmap::from_iter(0..1)
-        );
+        assert_eq!(index.calculate_included_frags().await.unwrap(), RoaringBitmap::from_iter(0..1));
     }
 
     #[tokio::test]
@@ -1369,11 +1355,8 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            VALUE_COLUMN_NAME,
-            DataType::Int64,
-            false,
-        )]));
+        let schema =
+            Arc::new(Schema::new(vec![Field::new(VALUE_COLUMN_NAME, DataType::Int64, false)]));
 
         // Create multiple fragments with data
         // Fragment 0: values 0-99
@@ -1389,10 +1372,7 @@ mod tests {
         // Create a stream with multiple batches (fragments)
         let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
             schema.clone(),
-            stream::iter(vec![
-                Ok(fragment0_batch.clone()),
-                Ok(fragment1_batch.clone()),
-            ]),
+            stream::iter(vec![Ok(fragment0_batch.clone()), Ok(fragment1_batch.clone())]),
         ));
         let data_stream = add_row_addr(data_stream);
 
@@ -1435,16 +1415,14 @@ mod tests {
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should only match fragment 1 blocks since bloom filter correctly filters
-        // Value 150 is only in fragment 1 (values 100-199), not in fragment 0 (values 0-99)
+        // Value 150 is only in fragment 1 (values 100-199), not in fragment 0 (values
+        // 0-99)
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range((1u64 << 32) + 50..((1u64 << 32) + 100)); // Only the block containing 150
         assert_eq!(result, SearchResult::at_most(expected));
 
         // Test calculate_included_frags
-        assert_eq!(
-            index.calculate_included_frags().await.unwrap(),
-            RoaringBitmap::from_iter(0..2)
-        );
+        assert_eq!(index.calculate_included_frags().await.unwrap(), RoaringBitmap::from_iter(0..2));
     }
 
     #[tokio::test]
@@ -1468,11 +1446,8 @@ mod tests {
         }
 
         let float_data = arrow_array::Float32Array::from(values);
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            VALUE_COLUMN_NAME,
-            DataType::Float32,
-            true,
-        )]));
+        let schema =
+            Arc::new(Schema::new(vec![Field::new(VALUE_COLUMN_NAME, DataType::Float32, true)]));
         let data =
             RecordBatch::try_new(schema.clone(), vec![Arc::new(float_data.clone())]).unwrap();
         let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
@@ -1557,11 +1532,8 @@ mod tests {
         // Create data that will produce multiple blocks
         let data_size = 10000;
         let data = arrow_array::Int64Array::from_iter_values(0..data_size as i64);
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            VALUE_COLUMN_NAME,
-            DataType::Int64,
-            false,
-        )]));
+        let schema =
+            Arc::new(Schema::new(vec![Field::new(VALUE_COLUMN_NAME, DataType::Int64, false)]));
         let data = RecordBatch::try_new(schema.clone(), vec![Arc::new(data)]).unwrap();
         let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
             schema,
@@ -1629,10 +1601,7 @@ mod tests {
         assert_eq!(result, SearchResult::at_most(expected));
 
         // Test calculate_included_frags
-        assert_eq!(
-            index.calculate_included_frags().await.unwrap(),
-            RoaringBitmap::from_iter(0..1)
-        );
+        assert_eq!(index.calculate_included_frags().await.unwrap(), RoaringBitmap::from_iter(0..1));
     }
 
     #[tokio::test]
@@ -1647,11 +1616,8 @@ mod tests {
         // Create string data
         let string_values: Vec<String> = (0..200).map(|i| format!("value_{:03}", i)).collect();
         let string_data = arrow_array::StringArray::from_iter_values(string_values.iter());
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            VALUE_COLUMN_NAME,
-            DataType::Utf8,
-            false,
-        )]));
+        let schema =
+            Arc::new(Schema::new(vec![Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false)]));
         let data = RecordBatch::try_new(schema.clone(), vec![Arc::new(string_data)]).unwrap();
         let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
             schema,
@@ -1729,11 +1695,8 @@ mod tests {
             .map(|i| vec![i as u8, (i + 1) as u8, (i + 2) as u8])
             .collect();
         let binary_data = arrow_array::BinaryArray::from_iter_values(binary_values.iter());
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            VALUE_COLUMN_NAME,
-            DataType::Binary,
-            false,
-        )]));
+        let schema =
+            Arc::new(Schema::new(vec![Field::new(VALUE_COLUMN_NAME, DataType::Binary, false)]));
         let data = RecordBatch::try_new(schema.clone(), vec![Arc::new(binary_data)]).unwrap();
         let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
             schema,
@@ -1797,11 +1760,8 @@ mod tests {
             (0..100).map(|i| format!("large_value_{:05}", i)).collect();
         let large_string_data =
             arrow_array::LargeStringArray::from_iter_values(large_string_values.iter());
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            VALUE_COLUMN_NAME,
-            DataType::LargeUtf8,
-            false,
-        )]));
+        let schema =
+            Arc::new(Schema::new(vec![Field::new(VALUE_COLUMN_NAME, DataType::LargeUtf8, false)]));
         let data = RecordBatch::try_new(schema.clone(), vec![Arc::new(large_string_data)]).unwrap();
         let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
             schema,
@@ -1825,9 +1785,8 @@ mod tests {
         assert_eq!(index.zones.len(), 2);
 
         // Test search functionality
-        let query = BloomFilterQuery::Equals(ScalarValue::LargeUtf8(Some(
-            "large_value_00025".to_string(),
-        )));
+        let query =
+            BloomFilterQuery::Equals(ScalarValue::LargeUtf8(Some("large_value_00025".to_string())));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should match the first zone
@@ -1857,11 +1816,8 @@ mod tests {
         // Test Date32 (days since Unix epoch)
         let date32_values: Vec<i32> = (0..100).collect(); // Days since Unix epoch
         let date32_data = arrow_array::Date32Array::from(date32_values.clone());
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            VALUE_COLUMN_NAME,
-            DataType::Date32,
-            false,
-        )]));
+        let schema =
+            Arc::new(Schema::new(vec![Field::new(VALUE_COLUMN_NAME, DataType::Date32, false)]));
         let data = RecordBatch::try_new(schema.clone(), vec![Arc::new(date32_data)]).unwrap();
         let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
             schema,
@@ -1946,10 +1902,8 @@ mod tests {
 
         // Test search for Timestamp value in first zone
         let first_timestamp = timestamp_values[25];
-        let query = BloomFilterQuery::Equals(ScalarValue::TimestampNanosecond(
-            Some(first_timestamp),
-            None,
-        ));
+        let query =
+            BloomFilterQuery::Equals(ScalarValue::TimestampNanosecond(Some(first_timestamp), None));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..50);
@@ -2050,11 +2004,8 @@ mod tests {
         ));
 
         let data = arrow_array::Int32Array::from_iter_values(0..1000);
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            VALUE_COLUMN_NAME,
-            DataType::Int32,
-            false,
-        )]));
+        let schema =
+            Arc::new(Schema::new(vec![Field::new(VALUE_COLUMN_NAME, DataType::Int32, false)]));
         let data = RecordBatch::try_new(schema.clone(), vec![Arc::new(data)]).unwrap();
         let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
             schema,
@@ -2153,15 +2104,13 @@ mod tests {
                 );
 
                 // For AtMost results, nulls are included in the superset
-            }
+            },
             _ => panic!("Expected AtMost search result from bloomfilter"),
         }
 
         // Test 2: IsIn query - should also return all rows
-        let query = BloomFilterQuery::IsIn(vec![
-            ScalarValue::Int64(Some(0)),
-            ScalarValue::Int64(Some(10)),
-        ]);
+        let query =
+            BloomFilterQuery::IsIn(vec![ScalarValue::Int64(Some(0)), ScalarValue::Int64(Some(10))]);
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         match result {
@@ -2177,7 +2126,7 @@ mod tests {
                     vec![0, 1, 2],
                     "Should return all rows in zone as possible matches"
                 );
-            }
+            },
             _ => panic!("Expected AtMost search result from bloomfilter"),
         }
     }

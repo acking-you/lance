@@ -3,26 +3,28 @@
 
 //! Shared Zone Training Utilities
 //!
-//! This module provides common infrastructure for building zone-based scalar indexes.
-//! It handles chunking data streams into fixed-size zones while respecting fragment
-//! boundaries and computing zone bounds that remain valid after row deletions.
+//! This module provides common infrastructure for building zone-based scalar
+//! indexes. It handles chunking data streams into fixed-size zones while
+//! respecting fragment boundaries and computing zone bounds that remain valid
+//! after row deletions.
 
 use arrow_array::{ArrayRef, UInt64Array};
 use datafusion::execution::SendableRecordBatchStream;
 use futures::TryStreamExt;
-use lance_core::error::Error;
-use lance_core::utils::address::RowAddress;
-use lance_core::utils::mask::RowAddrTreeMap;
-use lance_core::{Result, ROW_ADDR};
+use lance_core::{
+    error::Error,
+    utils::{address::RowAddress, mask::RowAddrTreeMap},
+    Result, ROW_ADDR,
+};
 use lance_datafusion::chunker::chunk_concat_stream;
 use snafu::location;
 
-//
 // Example: Suppose we have two fragments, each with 4 rows.
 // Fragment 0: start = 0, length = 4  // covers rows 0, 1, 2, 3 in fragment 0
 // The row addresses for fragment 0 are: 0, 1, 2, 3
 // Fragment 1: start = 0, length = 4  // covers rows 0, 1, 2, 3 in fragment 1
-// The row addresses for fragment 1 are: (1<<32), (1<<32)+1, (1<<32)+2, (1<<32)+3
+// The row addresses for fragment 1 are: (1<<32), (1<<32)+1, (1<<32)+2,
+// (1<<32)+3
 //
 // Deletion is 0 index based. We delete the 0th and 1st row in fragment 0,
 // and the 1st and 2nd row in fragment 1,
@@ -83,8 +85,8 @@ where
         })
     }
 
-    /// Consume the `_rowaddr`-annotated stream, split it into zones, and let the
-    /// processor compute zone statistics.
+    /// Consume the `_rowaddr`-annotated stream, split it into zones, and let
+    /// the processor compute zone statistics.
     ///
     /// The caller must provide record batches where the first column is the
     /// value array that the zone processor understands, and the schema includes
@@ -143,11 +145,11 @@ where
                             )?;
                         }
                         current_fragment_id = Some(fragment_id);
-                    }
+                    },
                     None => {
                         current_fragment_id = Some(fragment_id);
-                    }
-                    _ => {}
+                    },
+                    _ => {},
                 }
 
                 // Count consecutive rows in the same fragment
@@ -221,10 +223,7 @@ where
         let inferred_end =
             zone_end_offset.unwrap_or_else(|| start + (*current_zone_len as u64).saturating_sub(1));
         if inferred_end < start {
-            return Err(Error::invalid_input(
-                "zone row offsets are out of order",
-                location!(),
-            ));
+            return Err(Error::invalid_input("zone row offsets are out of order", location!()));
         }
         let bound = ZoneBound {
             fragment_id,
@@ -293,14 +292,16 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{metrics::LocalMetricsCollector, scalar::SearchResult};
+    use std::sync::Arc;
+
     use arrow_array::{ArrayRef, Int32Array, RecordBatch, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
     use lance_core::ROW_ADDR;
-    use std::sync::Arc;
+
+    use super::*;
+    use crate::{metrics::LocalMetricsCollector, scalar::SearchResult};
 
     #[derive(Debug, Clone, PartialEq)]
     struct MockStats {
@@ -315,7 +316,9 @@ mod tests {
 
     impl MockProcessor {
         fn new() -> Self {
-            Self { current_sum: 0 }
+            Self {
+                current_sum: 0,
+            }
         }
     }
 
@@ -380,10 +383,7 @@ mod tests {
         assert_eq!(stats[1].bound.length, 4);
         assert_eq!(stats[2].bound.start, 8);
         assert_eq!(stats[2].bound.length, 2); // Last zone has only 2 rows
-        assert_eq!(
-            stats.iter().map(|s| s.sum).collect::<Vec<_>>(),
-            vec![4, 4, 2]
-        );
+        assert_eq!(stats.iter().map(|s| s.sum).collect::<Vec<_>>(), vec![4, 4, 2]);
     }
 
     #[tokio::test]
@@ -408,7 +408,8 @@ mod tests {
         assert_eq!(stats[0].bound.fragment_id, 0);
         assert_eq!(stats[0].bound.length, 3); // Fragment 0: offsets 0,1,2 → length = 2-0+1 = 3
         assert_eq!(stats[1].bound.fragment_id, 1);
-        assert_eq!(stats[1].bound.length, 3); // Fragment 1: offsets 0,1,2 → length = 2-0+1 = 3
+        assert_eq!(stats[1].bound.length, 3); // Fragment 1: offsets 0,1,2 →
+                                              // length = 2-0+1 = 3
     }
 
     #[tokio::test]
@@ -435,7 +436,8 @@ mod tests {
 
     #[tokio::test]
     async fn handles_empty_batches() {
-        // Empty batches in the stream should be properly skipped without affecting zones.
+        // Empty batches in the stream should be properly skipped without affecting
+        // zones.
         let schema = Arc::new(Schema::new(vec![
             Field::new("value", DataType::Int32, false),
             Field::new(ROW_ADDR, DataType::UInt64, false),
@@ -446,11 +448,7 @@ mod tests {
 
         let stream = Box::pin(RecordBatchStreamAdapter::new(
             schema,
-            stream::iter(vec![
-                Ok(empty_batch.clone()),
-                Ok(valid_batch),
-                Ok(empty_batch),
-            ]),
+            stream::iter(vec![Ok(empty_batch.clone()), Ok(valid_batch), Ok(empty_batch)]),
         ));
 
         let processor = MockProcessor::new();
@@ -524,7 +522,8 @@ mod tests {
 
     #[tokio::test]
     async fn handles_multiple_batches_same_fragment() {
-        // Multiple batches from the same fragment should be properly accumulated into zones.
+        // Multiple batches from the same fragment should be properly accumulated into
+        // zones.
         let b1 = batch(vec![1, 1], vec![0, 0], vec![0, 1]);
         let b2 = batch(vec![1, 1], vec![0, 0], vec![2, 3]);
         let b3 = batch(vec![1, 1], vec![0, 0], vec![4, 5]);
@@ -645,7 +644,8 @@ mod tests {
         let trainer = ZoneTrainer::new(processor, 10).unwrap();
         let stats = trainer.train(stream).await.unwrap();
 
-        // One zone with 3 rows, but offset span [0..=200] so length=201 due to large gaps
+        // One zone with 3 rows, but offset span [0..=200] so length=201 due to large
+        // gaps
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].sum, 3);
         assert_eq!(stats[0].bound.start, 0);
@@ -654,9 +654,9 @@ mod tests {
 
     #[tokio::test]
     async fn handles_non_contiguous_fragment_ids() {
-        // CRITICAL: Test fragment IDs that are not consecutive (e.g., after fragment deletion).
-        // Original code assumed fragment_id + 1, which would fail here.
-        // Fragment IDs: 0, 5, 10 (non-consecutive!)
+        // CRITICAL: Test fragment IDs that are not consecutive (e.g., after fragment
+        // deletion). Original code assumed fragment_id + 1, which would fail
+        // here. Fragment IDs: 0, 5, 10 (non-consecutive!)
         let values = vec![1, 1, 2, 2, 3, 3];
         let fragments = vec![0, 0, 5, 5, 10, 10]; // Gaps in fragment IDs
         let offsets = vec![0, 1, 0, 1, 0, 1];

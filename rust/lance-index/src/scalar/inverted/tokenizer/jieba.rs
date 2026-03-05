@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{fs::File, io::BufReader, path::Path, path::PathBuf};
+use std::{
+    fs::File,
+    io::BufReader,
+    path::{Path, PathBuf},
+};
 
 use lance_core::{Error, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -77,11 +81,7 @@ impl JiebaTokenizerBuilder for JiebaBuilder {
         let mut f = std::io::BufReader::new(file);
         let mut jieba = jieba_rs::Jieba::with_dict(&mut f).map_err(|e| {
             Error::invalid_input(
-                format!(
-                    "Failed to load Jieba dictionary from {}: {}",
-                    main_dict_path.display(),
-                    e
-                ),
+                format!("Failed to load Jieba dictionary from {}: {}", main_dict_path.display(), e),
                 snafu::location!(),
             )
         })?;
@@ -99,7 +99,9 @@ impl JiebaTokenizerBuilder for JiebaBuilder {
                 )
             })?
         }
-        let tokenizer = JiebaTokenizer { jieba };
+        let tokenizer = JiebaTokenizer {
+            jieba,
+        };
         Ok(tantivy::tokenizer::TextAnalyzer::builder(tokenizer).dynamic())
     }
 }
@@ -153,6 +155,9 @@ impl tantivy::tokenizer::Tokenizer for JiebaTokenizer {
                 position_length: token.end - token.start,
             });
         }
-        JiebaTokenStream { tokens, index: 0 }
+        JiebaTokenStream {
+            tokens,
+            index: 0,
+        }
     }
 }

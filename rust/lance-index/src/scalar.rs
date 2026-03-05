@@ -3,32 +3,38 @@
 
 //! Scalar indices for metadata search & filtering
 
+use std::{
+    any::Any,
+    collections::{HashMap, HashSet},
+    fmt::Debug,
+    ops::Bound,
+    sync::Arc,
+};
+
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_array::{ListArray, RecordBatch};
 use arrow_schema::{Field, Schema};
 use async_trait::async_trait;
-use datafusion::functions::string::contains::ContainsFunc;
-use datafusion::functions_nested::array_has;
-use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::{
+    functions::string::contains::ContainsFunc, functions_nested::array_has,
+    physical_plan::SendableRecordBatchStream,
+};
 use datafusion_common::{scalar::ScalarValue, Column};
-use std::collections::{HashMap, HashSet};
-use std::fmt::Debug;
-use std::{any::Any, ops::Bound, sync::Arc};
-
-use datafusion_expr::expr::ScalarFunction;
-use datafusion_expr::Expr;
+use datafusion_expr::{expr::ScalarFunction, Expr};
 use deepsize::DeepSizeOf;
 use futures::{future::BoxFuture, FutureExt, Stream};
 use inverted::query::{fill_fts_query_column, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery};
-use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap};
-use lance_core::{Error, Result};
+use lance_core::{
+    utils::mask::{NullableRowAddrSet, RowAddrTreeMap},
+    Error, Result,
+};
 use roaring::RoaringBitmap;
 use serde::Serialize;
 use snafu::location;
 
-use crate::metrics::MetricsCollector;
-use crate::scalar::registry::TrainingCriteria;
-use crate::{Index, IndexParams, IndexType};
+use crate::{
+    metrics::MetricsCollector, scalar::registry::TrainingCriteria, Index, IndexParams, IndexType,
+};
 
 pub mod bitmap;
 pub mod bloomfilter;
@@ -45,9 +51,10 @@ pub mod rtree;
 pub mod zoned;
 pub mod zonemap;
 
-use crate::frag_reuse::FragReuseIndex;
 pub use inverted::tokenizer::InvertedIndexParams;
 use lance_datafusion::udf::CONTAINS_TOKENS_UDF;
+
+use crate::frag_reuse::FragReuseIndex;
 
 pub const LANCE_SCALAR_INDEX: &str = "__lance_scalar_index";
 
@@ -108,12 +115,14 @@ impl TryFrom<IndexType> for BuiltinIndexType {
 pub struct ScalarIndexParams {
     /// The type of index to create
     ///
-    /// Plugins may add additional index types.  Index type lookup is case-insensitive.
+    /// Plugins may add additional index types.  Index type lookup is
+    /// case-insensitive.
     pub index_type: String,
     /// The parameters to train the index
     ///
-    /// This should be a JSON string.  The contents of the JSON string will be specific to the
-    /// index type.  If not set, then default parameters will be used for the index type.
+    /// This should be a JSON string.  The contents of the JSON string will be
+    /// specific to the index type.  If not set, then default parameters
+    /// will be used for the index type.
     pub params: Option<String>,
 }
 
@@ -173,7 +182,8 @@ impl IndexParams for InvertedIndexParams {
 /// Trait for storing an index (or parts of an index) into storage
 #[async_trait]
 pub trait IndexWriter: Send {
-    /// Writes a record batch into the file, returning the 0-based index of the batch in the file
+    /// Writes a record batch into the file, returning the 0-based index of the
+    /// batch in the file
     ///
     /// E.g. if this is the third time this is called this method will return 2
     async fn write_record_batch(&mut self, batch: RecordBatch) -> Result<u64>;
@@ -257,9 +267,10 @@ impl Stream for IndexReaderStream {
 
 /// Trait abstracting I/O away from index logic
 ///
-/// Scalar indices are currently serialized as indexable arrow record batches stored in
-/// named "files".  The index store is responsible for serializing and deserializing
-/// these batches into file data (e.g. as .lance files or .parquet files, etc.)
+/// Scalar indices are currently serialized as indexable arrow record batches
+/// stored in named "files".  The index store is responsible for serializing and
+/// deserializing these batches into file data (e.g. as .lance files or .parquet
+/// files, etc.)
 #[async_trait]
 pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
     fn as_any(&self) -> &dyn Any;
@@ -291,11 +302,12 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
 /// For example, a btree index can support a wide range of queries (e.g. x > 7)
 /// while an index based on FTS only supports queries like "x LIKE 'foo'"
 ///
-/// This trait is used when we need an object that can represent any kind of query
+/// This trait is used when we need an object that can represent any kind of
+/// query
 ///
-/// Note: if you are implementing this trait for a query type then you probably also
-/// need to implement the [crate::scalar::expression::ScalarQueryParser] trait to
-/// create instances of your query at parse time.
+/// Note: if you are implementing this trait for a query type then you probably
+/// also need to implement the [crate::scalar::expression::ScalarQueryParser]
+/// trait to create instances of your query at parse time.
 pub trait AnyQuery: std::fmt::Debug + Any + Send + Sync {
     /// Cast the query as Any to allow for downcasting
     fn as_any(&self) -> &dyn Any;
@@ -323,7 +335,8 @@ pub struct FullTextSearchQuery {
     /// The wand factor to use for ranking
     /// if None, use the default value of 1.0
     /// Increasing this value will reduce the recall and improve the performance
-    /// 1.0 is the value that would give the best performance without recall loss
+    /// 1.0 is the value that would give the best performance without recall
+    /// loss
     pub wand_factor: Option<f32>,
 }
 
@@ -400,9 +413,9 @@ impl FullTextSearchQuery {
 /// "sargable" operators
 ///
 /// Note that negation is not included.  Negation should be applied later.  For
-/// example, to invert an equality query (e.g. all rows where the value is not 7)
-/// you can grab all rows where the value = 7 and then do an inverted take (or use
-/// a block list instead of an allow list for prefiltering)
+/// example, to invert an equality query (e.g. all rows where the value is not
+/// 7) you can grab all rows where the value = 7 and then do an inverted take
+/// (or use a block list instead of an allow list for prefiltering)
 #[derive(Debug, Clone, PartialEq)]
 pub enum SargableQuery {
     /// Retrieve all row ids where the value is in the given [min, max) range
@@ -411,7 +424,8 @@ pub enum SargableQuery {
     IsIn(Vec<ScalarValue>),
     /// Retrieve all row ids where the value is exactly the given value
     Equals(ScalarValue),
-    /// Retrieve all row ids where the value matches the given full text search query
+    /// Retrieve all row ids where the value matches the given full text search
+    /// query
     FullTextSearch(FullTextSearchQuery),
     /// Retrieve all row ids where the value is null
     IsNull(),
@@ -431,17 +445,17 @@ impl AnyQuery for SargableQuery {
                 (Bound::Included(lhs), Bound::Unbounded) => format!("{} >= {}", col, lhs),
                 (Bound::Included(lhs), Bound::Included(rhs)) => {
                     format!("{} >= {} && {} <= {}", col, lhs, col, rhs)
-                }
+                },
                 (Bound::Included(lhs), Bound::Excluded(rhs)) => {
                     format!("{} >= {} && {} < {}", col, lhs, col, rhs)
-                }
+                },
                 (Bound::Excluded(lhs), Bound::Unbounded) => format!("{} > {}", col, lhs),
                 (Bound::Excluded(lhs), Bound::Included(rhs)) => {
                     format!("{} > {} && {} <= {}", col, lhs, col, rhs)
-                }
+                },
                 (Bound::Excluded(lhs), Bound::Excluded(rhs)) => {
                     format!("{} > {} && {} < {}", col, lhs, col, rhs)
-                }
+                },
             },
             Self::IsIn(values) => {
                 format!(
@@ -453,16 +467,16 @@ impl AnyQuery for SargableQuery {
                         .collect::<Vec<_>>()
                         .join(",")
                 )
-            }
+            },
             Self::FullTextSearch(query) => {
                 format!("fts({})", query.query)
-            }
+            },
             Self::IsNull() => {
                 format!("{} IS NULL", col)
-            }
+            },
             Self::Equals(val) => {
                 format!("{} = {}", col, val)
-            }
+            },
         }
     }
 
@@ -472,27 +486,25 @@ impl AnyQuery for SargableQuery {
             Self::Range(lower, upper) => match (lower, upper) {
                 (Bound::Unbounded, Bound::Unbounded) => {
                     Expr::Literal(ScalarValue::Boolean(Some(true)), None)
-                }
+                },
                 (Bound::Unbounded, Bound::Included(rhs)) => {
                     col_expr.lt_eq(Expr::Literal(rhs.clone(), None))
-                }
+                },
                 (Bound::Unbounded, Bound::Excluded(rhs)) => {
                     col_expr.lt(Expr::Literal(rhs.clone(), None))
-                }
+                },
                 (Bound::Included(lhs), Bound::Unbounded) => {
                     col_expr.gt_eq(Expr::Literal(lhs.clone(), None))
-                }
-                (Bound::Included(lhs), Bound::Included(rhs)) => col_expr.between(
-                    Expr::Literal(lhs.clone(), None),
-                    Expr::Literal(rhs.clone(), None),
-                ),
+                },
+                (Bound::Included(lhs), Bound::Included(rhs)) => col_expr
+                    .between(Expr::Literal(lhs.clone(), None), Expr::Literal(rhs.clone(), None)),
                 (Bound::Included(lhs), Bound::Excluded(rhs)) => col_expr
                     .clone()
                     .gt_eq(Expr::Literal(lhs.clone(), None))
                     .and(col_expr.lt(Expr::Literal(rhs.clone(), None))),
                 (Bound::Excluded(lhs), Bound::Unbounded) => {
                     col_expr.gt(Expr::Literal(lhs.clone(), None))
-                }
+                },
                 (Bound::Excluded(lhs), Bound::Included(rhs)) => col_expr
                     .clone()
                     .gt(Expr::Literal(lhs.clone(), None))
@@ -509,10 +521,9 @@ impl AnyQuery for SargableQuery {
                     .collect::<Vec<_>>(),
                 false,
             ),
-            Self::FullTextSearch(query) => col_expr.like(Expr::Literal(
-                ScalarValue::Utf8(Some(query.query.to_string())),
-                None,
-            )),
+            Self::FullTextSearch(query) => {
+                col_expr.like(Expr::Literal(ScalarValue::Utf8(Some(query.query.to_string())), None))
+            },
             Self::IsNull() => col_expr.is_null(),
             Self::Equals(value) => col_expr.eq(Expr::Literal(value.clone(), None)),
         }
@@ -529,9 +540,11 @@ impl AnyQuery for SargableQuery {
 /// A query that a LabelListIndex can satisfy
 #[derive(Debug, Clone, PartialEq)]
 pub enum LabelListQuery {
-    /// Retrieve all row ids where every label is in the list of values for the row
+    /// Retrieve all row ids where every label is in the list of values for the
+    /// row
     HasAllLabels(Vec<ScalarValue>),
-    /// Retrieve all row ids where at least one of the given labels is in the list of values for the row
+    /// Retrieve all row ids where at least one of the given labels is in the
+    /// list of values for the row
     HasAnyLabel(Vec<ScalarValue>),
 }
 
@@ -565,7 +578,7 @@ impl AnyQuery for LabelListQuery {
                         Expr::Literal(ScalarValue::List(labels_arr), None),
                     ],
                 })
-            }
+            },
             Self::HasAnyLabel(labels) => {
                 let labels_arr = ScalarValue::iter_to_array(labels.iter().cloned()).unwrap();
                 let offsets_buffer =
@@ -585,7 +598,7 @@ impl AnyQuery for LabelListQuery {
                         Expr::Literal(ScalarValue::List(labels_arr), None),
                     ],
                 })
-            }
+            },
         }
     }
 
@@ -639,15 +652,16 @@ impl AnyQuery for TextQuery {
 /// A query that a InvertedIndex can satisfy
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenQuery {
-    /// Retrieve all row ids where the text contains all tokens parsed from given string. The tokens
-    /// are separated by punctuations and white spaces.
+    /// Retrieve all row ids where the text contains all tokens parsed from
+    /// given string. The tokens are separated by punctuations and white
+    /// spaces.
     TokensContains(String),
 }
 
 /// A query that a BloomFilter index can satisfy
 ///
-/// This is a subset of SargableQuery that only includes operations that bloom filters
-/// can efficiently handle: equals, is_null, and is_in queries.
+/// This is a subset of SargableQuery that only includes operations that bloom
+/// filters can efficiently handle: equals, is_null, and is_in queries.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BloomFilterQuery {
     /// Retrieve all row ids where the value is exactly the given value
@@ -667,10 +681,10 @@ impl AnyQuery for BloomFilterQuery {
         match self {
             Self::Equals(val) => {
                 format!("{} = {}", col, val)
-            }
+            },
             Self::IsNull() => {
                 format!("{} IS NULL", col)
-            }
+            },
             Self::IsIn(values) => {
                 format!(
                     "{} IN [{}]",
@@ -681,7 +695,7 @@ impl AnyQuery for BloomFilterQuery {
                         .collect::<Vec<_>>()
                         .join(",")
                 )
-            }
+            },
         }
     }
 
@@ -762,10 +776,10 @@ impl AnyQuery for GeoQuery {
         match self {
             Self::IntersectQuery(query) => {
                 format!("Intersect({} {})", col, query.value)
-            }
+            },
             Self::IsNull => {
                 format!("{} IS NULL", col)
-            }
+            },
         }
     }
 
@@ -854,6 +868,20 @@ pub struct UpdateCriteria {
     pub data_criteria: TrainingCriteria,
 }
 
+/// Filter used when merging existing scalar-index rows during update.
+#[derive(Debug, Clone)]
+pub enum OldIndexDataFilter {
+    /// Keep old rows whose row-address fragment is in this bitmap.
+    ///
+    /// This is valid for address-style row IDs.
+    Fragments(RoaringBitmap),
+    /// Keep old rows whose row IDs are in this exact allow-list.
+    ///
+    /// This is required for stable row IDs, where row IDs are opaque and
+    /// should not be interpreted as encoded row addresses.
+    RowIds(RowAddrTreeMap),
+}
+
 impl UpdateCriteria {
     pub fn requires_old_data(data_criteria: TrainingCriteria) -> Self {
         Self {
@@ -870,12 +898,14 @@ impl UpdateCriteria {
     }
 }
 
-/// A trait for a scalar index, a structure that can determine row ids that satisfy scalar queries
+/// A trait for a scalar index, a structure that can determine row ids that
+/// satisfy scalar queries
 #[async_trait]
 pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     /// Search the scalar index
     ///
-    /// Returns all row ids that satisfy the query, these row ids are not necessarily ordered
+    /// Returns all row ids that satisfy the query, these row ids are not
+    /// necessarily ordered
     async fn search(
         &self,
         query: &dyn AnyQuery,
@@ -885,22 +915,24 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     /// Returns true if the remap operation is supported
     fn can_remap(&self) -> bool;
 
-    /// Remap the row ids, creating a new remapped version of this index in `dest_store`
+    /// Remap the row ids, creating a new remapped version of this index in
+    /// `dest_store`
     async fn remap(
         &self,
         mapping: &HashMap<u64, Option<u64>>,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex>;
 
-    /// Add the new data into the index, creating an updated version of the index in `dest_store`
+    /// Add the new data into the index, creating an updated version of the
+    /// index in `dest_store`
     ///
-    /// If `valid_old_fragments` is provided, old index data for fragments not in the bitmap
-    /// will be filtered out during the merge.
+    /// If `old_data_filter` is provided, old index data will be filtered before
+    /// merge according to the chosen filter mode.
     async fn update(
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        valid_old_fragments: Option<&RoaringBitmap>,
+        old_data_filter: Option<OldIndexDataFilter>,
     ) -> Result<CreatedIndex>;
 
     /// Returns the criteria that will be used to update the index

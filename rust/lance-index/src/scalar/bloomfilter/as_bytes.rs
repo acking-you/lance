@@ -114,10 +114,7 @@ mod tests {
         let bytes = val.as_bytes();
         assert_eq!(bytes.as_ref().len(), 8);
         // Check that we get the expected bytes in little-endian format
-        assert_eq!(
-            bytes.as_ref(),
-            &[0xF0, 0xDE, 0xBC, 0x9A, 0x78, 0x56, 0x34, 0x12]
-        );
+        assert_eq!(bytes.as_ref(), &[0xF0, 0xDE, 0xBC, 0x9A, 0x78, 0x56, 0x34, 0x12]);
     }
 
     #[test]
@@ -134,11 +131,9 @@ mod tests {
         let val = 1.0f64;
         let bytes = val.as_bytes();
         assert_eq!(bytes.as_ref().len(), 8);
-        // f64 representation of 1.0 is [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x3F] in little-endian
-        assert_eq!(
-            bytes.as_ref(),
-            &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x3F]
-        );
+        // f64 representation of 1.0 is [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x3F]
+        // in little-endian
+        assert_eq!(bytes.as_ref(), &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x3F]);
     }
 
     #[test]

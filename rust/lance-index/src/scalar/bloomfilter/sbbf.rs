@@ -24,16 +24,16 @@
 //! for use in Lance indexing. This implementation follows the Parquet spec
 //! <https://github.com/apache/arrow-rs/blob/main/parquet/src/bloom_filter/mod.rs>
 //! for SBBF as described in <https://github.com/apache/parquet-format/blob/master/BloomFilter.md>
-//! FIXME: Make the upstream SBBF implementation public so that this file could be
-//! removed from Lance.
+//! FIXME: Make the upstream SBBF implementation public so that this file could
+//! be removed from Lance.
 //! <https://github.com/apache/arrow-rs/issues/8277>
 
-use crate::scalar::bloomfilter::as_bytes::AsBytes;
+use std::{error::Error, fmt, io::Write};
+
 use libm::lgamma;
-use std::error::Error;
-use std::fmt;
-use std::io::Write;
 use twox_hash::XxHash64;
+
+use crate::scalar::bloomfilter::as_bytes::AsBytes;
 
 #[derive(Debug)]
 pub enum SbbfError {
@@ -45,19 +45,21 @@ pub enum SbbfError {
 impl fmt::Display for SbbfError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidFpp { fpp } => {
-                write!(
-                    f,
-                    "False positive probability must be between 0.0 and 1.0, got {}",
-                    fpp
-                )
-            }
-            Self::WriteError { source } => {
+            Self::InvalidFpp {
+                fpp,
+            } => {
+                write!(f, "False positive probability must be between 0.0 and 1.0, got {}", fpp)
+            },
+            Self::WriteError {
+                source,
+            } => {
                 write!(f, "Failed to write bloom filter: {}", source)
-            }
-            Self::InvalidData { message } => {
+            },
+            Self::InvalidData {
+                message,
+            } => {
                 write!(f, "Invalid bloom filter data: {}", message)
-            }
+            },
         }
     }
 }
@@ -65,7 +67,9 @@ impl fmt::Display for SbbfError {
 impl Error for SbbfError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::WriteError { source } => Some(source),
+            Self::WriteError {
+                source,
+            } => Some(source),
             _ => None,
         }
     }
@@ -85,16 +89,17 @@ const SALT: [u32; 8] = [
     0x5c6bfb31_u32,
 ];
 
-/// Each block is 256 bits, broken up into eight contiguous "words", each consisting of 32 bits.
-/// Each word is thought of as an array of bits; each bit is either "set" or "not set".
+/// Each block is 256 bits, broken up into eight contiguous "words", each
+/// consisting of 32 bits. Each word is thought of as an array of bits; each bit
+/// is either "set" or "not set".
 #[derive(Debug, Copy, Clone)]
 struct Block([u32; 8]);
 
 impl Block {
     const ZERO: Self = Self([0; 8]);
 
-    /// Takes as its argument a single unsigned 32-bit integer and returns a block in which each
-    /// word has exactly one bit set.
+    /// Takes as its argument a single unsigned 32-bit integer and returns a
+    /// block in which each word has exactly one bit set.
     fn mask(x: u32) -> Self {
         let mut result = [0_u32; 8];
         for i in 0..8 {
@@ -120,7 +125,8 @@ impl Block {
 
     #[inline]
     fn to_ne_bytes(self) -> [u8; 32] {
-        // SAFETY: [u32; 8] and [u8; 32] have the same size and neither has invalid bit patterns.
+        // SAFETY: [u32; 8] and [u8; 32] have the same size and neither has invalid bit
+        // patterns.
         unsafe { std::mem::transmute(self.0) }
     }
 
@@ -139,7 +145,8 @@ impl Block {
         }
     }
 
-    /// Returns true when every bit that is set in the result of mask is also set in the block.
+    /// Returns true when every bit that is set in the result of mask is also
+    /// set in the block.
     fn check(&self, hash: u32) -> bool {
         let mask = Self::mask(hash);
         for i in 0..8 {
@@ -167,8 +174,8 @@ impl std::ops::IndexMut<usize> for Block {
     }
 }
 
-// This implements the false positive probability in Putze et al.'s "Cache-, hash-and
-// space-efficient bloom filters", equation 3.
+// This implements the false positive probability in Putze et al.'s "Cache-,
+// hash-and space-efficient bloom filters", equation 3.
 #[inline]
 fn false_positive_probability(ndv: u64, log_space_bytes: u8) -> f64 {
     const WORD_BITS: f64 = 32.0;
@@ -183,27 +190,28 @@ fn false_positive_probability(ndv: u64, log_space_bytes: u8) -> f64 {
         return 1.0;
     }
     let mut result: f64 = 0.0;
-    // lam is the usual parameter to the Poisson's PMF. Following the notation in the paper,
-    // lam is B/c, where B is the number of bits in a bucket and c is the number of bits per
-    // distinct value
+    // lam is the usual parameter to the Poisson's PMF. Following the notation in
+    // the paper, lam is B/c, where B is the number of bits in a bucket and c is
+    // the number of bits per distinct value
     let lam = BUCKET_WORDS * WORD_BITS / ((bytes * u8::BITS as f64) / ndv);
-    // Some of the calculations are done in log-space to increase numerical stability
+    // Some of the calculations are done in log-space to increase numerical
+    // stability
     let loglam = lam.ln();
 
-    // 750 iterations are sufficient to cause the sum to converge in all of the tests. In
-    // other words, setting the iterations higher than 750 will give the same result as
-    // leaving it at 750.
+    // 750 iterations are sufficient to cause the sum to converge in all of the
+    // tests. In other words, setting the iterations higher than 750 will give
+    // the same result as leaving it at 750.
     const ITERS: i32 = 750;
-    // We start with the highest value of i, since the values we're adding to result are
-    // mostly smaller at high i, and this increases accuracy to sum from the smallest
-    // values up.
+    // We start with the highest value of i, since the values we're adding to result
+    // are mostly smaller at high i, and this increases accuracy to sum from the
+    // smallest values up.
     for i in (0..ITERS).rev() {
-        // The PMF of the Poisson distribution is lam^i * exp(-lam) / i!. In logspace, using
-        // lgamma for the log of the factorial function:
+        // The PMF of the Poisson distribution is lam^i * exp(-lam) / i!. In logspace,
+        // using lgamma for the log of the factorial function:
         let logp = i as f64 * loglam - lam - lgamma((i + 1).into());
         // The f_inner part of the equation in the paper is the probability of a single
-        // collision in the bucket. Since there are kBucketWords non-overlapping lanes in each
-        // bucket, the log of this probability is:
+        // collision in the bucket. Since there are kBucketWords non-overlapping lanes
+        // in each bucket, the log of this probability is:
         let logfinner = BUCKET_WORDS * (1.0 - (1.0 - 1.0 / WORD_BITS).powi(i)).ln();
         // Here we are forced out of log-space calculations
         result += (logp + logfinner).exp();
@@ -245,10 +253,7 @@ impl Sbbf {
     pub fn new(bitset: &[u8]) -> Result<Self> {
         if !bitset.len().is_multiple_of(32) {
             return Err(SbbfError::InvalidData {
-                message: format!(
-                    "Bitset length must be a multiple of 32, got {}",
-                    bitset.len()
-                ),
+                message: format!("Bitset length must be a multiple of 32, got {}", bitset.len()),
             });
         }
 
@@ -263,7 +268,9 @@ impl Sbbf {
             })
             .collect::<Vec<Block>>();
 
-        Ok(Self { blocks: data })
+        Ok(Self {
+            blocks: data,
+        })
     }
 
     /// Create a new empty SBBF with the given number of bytes
@@ -276,10 +283,13 @@ impl Sbbf {
         Self::new(&bitset).unwrap()
     }
 
-    /// Create a new SBBF with given number of distinct values and false positive probability
+    /// Create a new SBBF with given number of distinct values and false
+    /// positive probability
     pub fn with_ndv_fpp(ndv: u64, fpp: f64) -> Result<Self> {
         if !(0.0..1.0).contains(&fpp) {
-            return Err(SbbfError::InvalidFpp { fpp });
+            return Err(SbbfError::InvalidFpp {
+                fpp,
+            });
         }
         let log2_num_bytes = min_log2_bytes(ndv, fpp);
         Ok(Self::with_log2_num_bytes(log2_num_bytes))
@@ -302,7 +312,8 @@ impl Sbbf {
         self.blocks[block_index].insert(hash as u32)
     }
 
-    /// Check if an AsBytes value is probably present or definitely absent in the filter
+    /// Check if an AsBytes value is probably present or definitely absent in
+    /// the filter
     pub fn check<T: AsBytes + ?Sized>(&self, value: &T) -> bool {
         self.check_hash(hash_as_bytes(value))
     }
@@ -321,7 +332,9 @@ impl Sbbf {
         for block in &self.blocks {
             writer
                 .write_all(block.to_le_bytes().as_slice())
-                .map_err(|source| SbbfError::WriteError { source })?;
+                .map_err(|source| SbbfError::WriteError {
+                    source,
+                })?;
         }
         Ok(())
     }
@@ -354,11 +367,12 @@ impl Sbbf {
     }
 
     /// Check if this filter might intersect with another filter.
-    /// Returns true if there's at least one bit position where both filters have a 1.
-    /// This is a fast check that may return false positives but never false negatives.
+    /// Returns true if there's at least one bit position where both filters
+    /// have a 1. This is a fast check that may return false positives but
+    /// never false negatives.
     ///
-    /// Returns an error if the filters have different sizes, as bloom filters with
-    /// different configurations cannot be reliably compared.
+    /// Returns an error if the filters have different sizes, as bloom filters
+    /// with different configurations cannot be reliably compared.
     pub fn might_intersect(&self, other: &Self) -> Result<bool> {
         if self.blocks.len() != other.blocks.len() {
             return Err(SbbfError::InvalidData {
@@ -383,21 +397,22 @@ impl Sbbf {
     /// Check if this filter might intersect with a raw bitmap.
     /// The bitmap should be in the same format as produced by to_bytes().
     ///
-    /// Returns an error if the bitmaps have different sizes, as bloom filters with
-    /// different configurations cannot be reliably compared.
+    /// Returns an error if the bitmaps have different sizes, as bloom filters
+    /// with different configurations cannot be reliably compared.
     pub fn might_intersect_bytes(&self, other_bytes: &[u8]) -> Result<bool> {
         Self::bytes_might_intersect(&self.to_bytes(), other_bytes)
     }
 
     /// Check if two raw bloom filter bitmaps might intersect.
-    /// Returns true if there's at least one bit position where both filters have a 1.
+    /// Returns true if there's at least one bit position where both filters
+    /// have a 1.
     ///
-    /// This is a fast probabilistic check: if it returns false, the filters definitely
-    /// have no common elements. If it returns true, they might have common elements
-    /// (with possible false positives).
+    /// This is a fast probabilistic check: if it returns false, the filters
+    /// definitely have no common elements. If it returns true, they might
+    /// have common elements (with possible false positives).
     ///
-    /// Returns an error if the bitmaps have different sizes, as bloom filters with
-    /// different configurations cannot be reliably compared.
+    /// Returns an error if the bitmaps have different sizes, as bloom filters
+    /// with different configurations cannot be reliably compared.
     pub fn bytes_might_intersect(a: &[u8], b: &[u8]) -> Result<bool> {
         if a.len() != b.len() {
             return Err(SbbfError::InvalidData {

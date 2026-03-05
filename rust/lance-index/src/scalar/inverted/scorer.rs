@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
+
 use super::InvertedPartition;
 use crate::scalar::inverted::query::Tokens;
-use std::collections::HashMap;
 
 // the Scorer trait is used to calculate the score of a token in a document
 // in general, the score is calculated as:

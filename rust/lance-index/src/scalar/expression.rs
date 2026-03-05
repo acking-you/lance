@@ -16,14 +16,6 @@ use datafusion_expr::{
     expr::{InList, ScalarFunction},
     Between, BinaryExpr, Expr, Operator, ReturnFieldArgs, ScalarUDF,
 };
-use tokio::try_join;
-
-use super::{
-    AnyQuery, BloomFilterQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex,
-    SearchResult, TextQuery, TokenQuery,
-};
-#[cfg(feature = "geo")]
-use super::{GeoQuery, RelationQuery};
 use lance_core::{
     utils::mask::{NullableRowAddrMask, RowAddrMask},
     Error, Result,
@@ -31,37 +23,48 @@ use lance_core::{
 use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
 use roaring::RoaringBitmap;
 use snafu::location;
+use tokio::try_join;
 use tracing::instrument;
+
+use super::{
+    AnyQuery, BloomFilterQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex,
+    SearchResult, TextQuery, TokenQuery,
+};
+#[cfg(feature = "geo")]
+use super::{GeoQuery, RelationQuery};
 
 const MAX_DEPTH: usize = 500;
 
-/// An indexed expression consists of a scalar index query with a post-scan filter
+/// An indexed expression consists of a scalar index query with a post-scan
+/// filter
 ///
-/// When a user wants to filter the data returned by a scan we may be able to use
-/// one or more scalar indices to reduce the amount of data we load from the disk.
+/// When a user wants to filter the data returned by a scan we may be able to
+/// use one or more scalar indices to reduce the amount of data we load from the
+/// disk.
 ///
-/// For example, if a user provides the filter "x = 7", and we have a scalar index
-/// on x, then we can possibly identify the exact row that the user desires with our
-/// index.  A full-table scan can then turn into a take operation fetching the rows
-/// desired.  This would create an IndexedExpression with a scalar_query but no
-/// refine.
+/// For example, if a user provides the filter "x = 7", and we have a scalar
+/// index on x, then we can possibly identify the exact row that the user
+/// desires with our index.  A full-table scan can then turn into a take
+/// operation fetching the rows desired.  This would create an IndexedExpression
+/// with a scalar_query but no refine.
 ///
-/// If the user asked for "type = 'dog' && z = 3" and we had a scalar index on the
-/// "type" column then we could convert this to an indexed scan for "type='dog'"
-/// followed by an in-memory filter for z=3.  This would create an IndexedExpression
-/// with both a scalar_query AND a refine.
+/// If the user asked for "type = 'dog' && z = 3" and we had a scalar index on
+/// the "type" column then we could convert this to an indexed scan for
+/// "type='dog'" followed by an in-memory filter for z=3.  This would create an
+/// IndexedExpression with both a scalar_query AND a refine.
 ///
-/// Finally, if the user asked for "z = 3" and we do not have a scalar index on the
-/// "z" column then we must fallback to an IndexedExpression with no scalar_query and
-/// only a refine.
+/// Finally, if the user asked for "z = 3" and we do not have a scalar index on
+/// the "z" column then we must fallback to an IndexedExpression with no
+/// scalar_query and only a refine.
 ///
 /// Two IndexedExpressions can be AND'd together.  Each part is AND'd together.
-/// Two IndexedExpressions cannot be OR'd together unless both are scalar_query only
-///   or both are refine only
-/// An IndexedExpression cannot be negated if it has both a refine and a scalar_query
+/// Two IndexedExpressions cannot be OR'd together unless both are scalar_query
+/// only   or both are refine only
+/// An IndexedExpression cannot be negated if it has both a refine and a
+/// scalar_query
 ///
-/// When an operation cannot be performed we fallback to the original expression-only
-/// representation
+/// When an operation cannot be performed we fallback to the original
+/// expression-only representation
 #[derive(Debug, PartialEq)]
 pub struct IndexedExpression {
     /// The portion of the query that can be satisfied by scalar indices
@@ -73,7 +76,8 @@ pub struct IndexedExpression {
 pub trait ScalarQueryParser: std::fmt::Debug + Send + Sync {
     /// Visit a between expression
     ///
-    /// Returns an IndexedExpression if the index can accelerate between expressions
+    /// Returns an IndexedExpression if the index can accelerate between
+    /// expressions
     fn visit_between(
         &self,
         column: &str,
@@ -82,19 +86,23 @@ pub trait ScalarQueryParser: std::fmt::Debug + Send + Sync {
     ) -> Option<IndexedExpression>;
     /// Visit an in list expression
     ///
-    /// Returns an IndexedExpression if the index can accelerate in list expressions
+    /// Returns an IndexedExpression if the index can accelerate in list
+    /// expressions
     fn visit_in_list(&self, column: &str, in_list: &[ScalarValue]) -> Option<IndexedExpression>;
     /// Visit an is bool expression
     ///
-    /// Returns an IndexedExpression if the index can accelerate is bool expressions
+    /// Returns an IndexedExpression if the index can accelerate is bool
+    /// expressions
     fn visit_is_bool(&self, column: &str, value: bool) -> Option<IndexedExpression>;
     /// Visit an is null expression
     ///
-    /// Returns an IndexedExpression if the index can accelerate is null expressions
+    /// Returns an IndexedExpression if the index can accelerate is null
+    /// expressions
     fn visit_is_null(&self, column: &str) -> Option<IndexedExpression>;
     /// Visit a comparison expression
     ///
-    /// Returns an IndexedExpression if the index can accelerate comparison expressions
+    /// Returns an IndexedExpression if the index can accelerate comparison
+    /// expressions
     fn visit_comparison(
         &self,
         column: &str,
@@ -103,8 +111,9 @@ pub trait ScalarQueryParser: std::fmt::Debug + Send + Sync {
     ) -> Option<IndexedExpression>;
     /// Visit a scalar function expression
     ///
-    /// Returns an IndexedExpression if the index can accelerate the given scalar function.
-    /// For example, an ngram index can accelerate the contains function.
+    /// Returns an IndexedExpression if the index can accelerate the given
+    /// scalar function. For example, an ngram index can accelerate the
+    /// contains function.
     fn visit_scalar_function(
         &self,
         column: &str,
@@ -115,26 +124,33 @@ pub trait ScalarQueryParser: std::fmt::Debug + Send + Sync {
 
     /// Visits a potential reference to a column
     ///
-    /// This function is a little different from the other visitors.  It is used to test if a potential
-    /// column reference is a reference the index handles.
+    /// This function is a little different from the other visitors.  It is used
+    /// to test if a potential column reference is a reference the index
+    /// handles.
     ///
-    /// Most indexes are designed to run on references to the indexed column.  For example, if a query
-    /// is "x = 7" and we have a scalar index on "x" then we apply the index to the "x" column reference.
+    /// Most indexes are designed to run on references to the indexed column.
+    /// For example, if a query is "x = 7" and we have a scalar index on "x"
+    /// then we apply the index to the "x" column reference.
     ///
-    /// However, some indexes are designed to run on projections of the indexed column.  For example,
-    /// if a query is "json_extract(json, '$.name') = 'books'" and we have a JSON index on the "json" column
-    /// then we apply the index to the projection of the "json" column.
+    /// However, some indexes are designed to run on projections of the indexed
+    /// column.  For example, if a query is "json_extract(json, '$.name') =
+    /// 'books'" and we have a JSON index on the "json" column then we apply
+    /// the index to the projection of the "json" column.
     ///
-    /// This function is used to test if a potential column reference is a reference the index handles.
-    /// The default implementation matches column references but this can be overridden by indexes that
+    /// This function is used to test if a potential column reference is a
+    /// reference the index handles. The default implementation matches
+    /// column references but this can be overridden by indexes that
     /// handle projections.
     ///
-    /// The function is also passed in the data type of the column and should return the data type of the
-    /// reference.  Normally this is the same as the input for a direct column reference and possibly something
-    /// different for a projection.  E.g. a JSON column (LargeBinary) might be projected to a string or float
+    /// The function is also passed in the data type of the column and should
+    /// return the data type of the reference.  Normally this is the same as
+    /// the input for a direct column reference and possibly something
+    /// different for a projection.  E.g. a JSON column (LargeBinary) might be
+    /// projected to a string or float
     ///
-    /// Note: higher logic in the expression parser already limits references to either Expr::Column or Expr::ScalarFunction
-    /// where the first argument is an Expr::Column.  If your projection doesn't fit that mold then the
+    /// Note: higher logic in the expression parser already limits references to
+    /// either Expr::Column or Expr::ScalarFunction where the first argument
+    /// is an Expr::Column.  If your projection doesn't fit that mold then the
     /// expression parser will need to be modified.
     fn is_valid_reference(&self, func: &Expr, data_type: &DataType) -> Option<DataType> {
         match func {
@@ -213,12 +229,14 @@ impl ScalarQueryParser for MultiQueryParser {
             .iter()
             .find_map(|parser| parser.visit_scalar_function(column, data_type, func, args))
     }
-    /// TODO(low-priority): This is maybe not quite right.  We should filter down the list of parsers based
-    /// on those that consider the reference valid.  Instead what we are doing is checking all parsers if any one
+    /// TODO(low-priority): This is maybe not quite right.  We should filter
+    /// down the list of parsers based on those that consider the reference
+    /// valid.  Instead what we are doing is checking all parsers if any one
     /// parser considers the reference valid.
     ///
-    /// This will be a problem if the user creates two indexes (e.g. btree and json) on the same column and those two
-    /// indexes have different reference schemes.
+    /// This will be a problem if the user creates two indexes (e.g. btree and
+    /// json) on the same column and those two indexes have different
+    /// reference schemes.
     fn is_valid_reference(&self, func: &Expr, data_type: &DataType) -> Option<DataType> {
         self.parsers
             .iter()
@@ -321,11 +339,11 @@ impl ScalarQueryParser for SargableQueryParser {
             Operator::Lt => SargableQuery::Range(Bound::Unbounded, Bound::Excluded(value.clone())),
             Operator::LtEq => {
                 SargableQuery::Range(Bound::Unbounded, Bound::Included(value.clone()))
-            }
+            },
             Operator::Gt => SargableQuery::Range(Bound::Excluded(value.clone()), Bound::Unbounded),
             Operator::GtEq => {
                 SargableQuery::Range(Bound::Included(value.clone()), Bound::Unbounded)
-            }
+            },
             Operator::Eq => SargableQuery::Equals(value.clone()),
             // This will be negated by the caller
             Operator::NotEq => SargableQuery::Equals(value.clone()),
@@ -350,7 +368,8 @@ impl ScalarQueryParser for SargableQueryParser {
     }
 }
 
-/// A parser for bloom filter indices that only support equals, is_null, and is_in operations
+/// A parser for bloom filter indices that only support equals, is_null, and
+/// is_in operations
 #[derive(Debug)]
 pub struct BloomFilterQueryParser {
     index_name: String,
@@ -447,7 +466,9 @@ pub struct LabelListQueryParser {
 
 impl LabelListQueryParser {
     pub fn new(index_name: String) -> Self {
-        Self { index_name }
+        Self {
+            index_name,
+        }
     }
 }
 
@@ -616,11 +637,11 @@ impl ScalarQueryParser for TextQueryParser {
                 } else {
                     None
                 }
-            }
+            },
             _ => {
                 // If the scalar is not a string, we cannot handle it
                 None
-            }
+            },
         }
     }
 }
@@ -633,7 +654,9 @@ pub struct FtsQueryParser {
 
 impl FtsQueryParser {
     pub fn new(name: String) -> Self {
-        Self { index_name: name }
+        Self {
+            index_name: name,
+        }
     }
 }
 
@@ -703,7 +726,9 @@ pub struct GeoQueryParser {
 #[cfg(feature = "geo")]
 impl GeoQueryParser {
     pub fn new(index_name: String) -> Self {
-        Self { index_name }
+        Self {
+            index_name,
+        }
     }
 }
 
@@ -779,7 +804,7 @@ impl ScalarQueryParser for GeoQueryParser {
                         Arc::new(query),
                         true,
                     ))
-                }
+                },
                 (Expr::Column(_), Expr::Literal(right_value, metadata)) => {
                     let mut field = Field::new("_geo", right_value.data_type(), false);
                     if let Some(metadata) = metadata {
@@ -795,7 +820,7 @@ impl ScalarQueryParser for GeoQueryParser {
                         Arc::new(query),
                         true,
                     ))
-                }
+                },
                 _ => None,
             };
         }
@@ -825,7 +850,8 @@ impl IndexedExpression {
         }
     }
 
-    /// Create an expression that is only an index query with explicit needs_recheck
+    /// Create an expression that is only an index query with explicit
+    /// needs_recheck
     fn index_query_with_recheck(
         column: String,
         index_name: String,
@@ -845,8 +871,9 @@ impl IndexedExpression {
 
     /// Try and negate the expression
     ///
-    /// If the expression contains both an index query and a refine expression then it
-    /// cannot be negated today and None will be returned (we give up trying to use indices)
+    /// If the expression contains both an index query and a refine expression
+    /// then it cannot be negated today and None will be returned (we give
+    /// up trying to use indices)
     fn maybe_not(self) -> Option<Self> {
         match (self.scalar_query, self.refine_expr) {
             (Some(_), Some(_)) => None,
@@ -858,7 +885,7 @@ impl IndexedExpression {
                     scalar_query: Some(ScalarIndexExpr::Not(Box::new(scalar_query))),
                     refine_expr: None,
                 })
-            }
+            },
             (None, Some(refine_expr)) => Some(Self {
                 scalar_query: None,
                 refine_expr: Some(Expr::Not(Box::new(refine_expr))),
@@ -873,10 +900,9 @@ impl IndexedExpression {
     /// because (A && B) && (C && D) == (A && C) && (B && D)
     fn and(self, other: Self) -> Self {
         let scalar_query = match (self.scalar_query, other.scalar_query) {
-            (Some(scalar_query), Some(other_scalar_query)) => Some(ScalarIndexExpr::And(
-                Box::new(scalar_query),
-                Box::new(other_scalar_query),
-            )),
+            (Some(scalar_query), Some(other_scalar_query)) => {
+                Some(ScalarIndexExpr::And(Box::new(scalar_query), Box::new(other_scalar_query)))
+            },
             (Some(scalar_query), None) => Some(scalar_query),
             (None, Some(scalar_query)) => Some(scalar_query),
             (None, None) => None,
@@ -884,7 +910,7 @@ impl IndexedExpression {
         let refine_expr = match (self.refine_expr, other.refine_expr) {
             (Some(refine_expr), Some(other_refine_expr)) => {
                 Some(refine_expr.and(other_refine_expr))
-            }
+            },
             (Some(refine_expr), None) => Some(refine_expr),
             (None, Some(refine_expr)) => Some(refine_expr),
             (None, None) => None,
@@ -902,34 +928,35 @@ impl IndexedExpression {
     /// is not equivalent to:
     ///   (color == 'blue' OR color == 'green') AND (size < 20 OR size < 50)
     fn maybe_or(self, other: Self) -> Option<Self> {
-        // If either expression is missing a scalar_query then we need to load all rows from
-        // the database and so we short-circuit and return None
+        // If either expression is missing a scalar_query then we need to load all rows
+        // from the database and so we short-circuit and return None
         let scalar_query = self.scalar_query?;
         let other_scalar_query = other.scalar_query?;
-        let scalar_query = Some(ScalarIndexExpr::Or(
-            Box::new(scalar_query),
-            Box::new(other_scalar_query),
-        ));
+        let scalar_query =
+            Some(ScalarIndexExpr::Or(Box::new(scalar_query), Box::new(other_scalar_query)));
 
         let refine_expr = match (self.refine_expr, other.refine_expr) {
             // TODO
             //
-            // To handle these cases we need a way of going back from a scalar expression query to a logical DF expression (perhaps
-            // we can store the expression that led to the creation of the query)
+            // To handle these cases we need a way of going back from a scalar expression query to a
+            // logical DF expression (perhaps we can store the expression that led to
+            // the creation of the query)
             //
-            // For example, imagine we have something like "(color == 'blue' AND size < 20) OR (color == 'green' AND size < 50)"
+            // For example, imagine we have something like "(color == 'blue' AND size < 20) OR
+            // (color == 'green' AND size < 50)"
             //
-            // We can do an indexed load of all rows matching "color == 'blue' OR color == 'green'" but then we need to
-            // refine that load with the full original expression which, at the moment, we no longer have.
+            // We can do an indexed load of all rows matching "color == 'blue' OR color == 'green'"
+            // but then we need to refine that load with the full original expression
+            // which, at the moment, we no longer have.
             (Some(_), Some(_)) => {
                 return None;
-            }
+            },
             (Some(_), None) => {
                 return None;
-            }
+            },
             (None, Some(_)) => {
                 return None;
-            }
+            },
             (None, None) => None,
         };
         Some(Self {
@@ -1017,21 +1044,20 @@ impl std::fmt::Display for ScalarIndexExpr {
             Self::Not(inner) => write!(f, "NOT({})", inner),
             Self::And(lhs, rhs) => write!(f, "AND({},{})", lhs, rhs),
             Self::Or(lhs, rhs) => write!(f, "OR({},{})", lhs, rhs),
-            Self::Query(search) => write!(
-                f,
-                "[{}]@{}",
-                search.query.format(&search.column),
-                search.index_name
-            ),
+            Self::Query(search) => {
+                write!(f, "[{}]@{}", search.query.format(&search.column), search.index_name)
+            },
         }
     }
 }
 
-/// When we evaluate a scalar index query we return a batch with three columns and two rows
+/// When we evaluate a scalar index query we return a batch with three columns
+/// and two rows
 ///
 /// The first column has the block list and allow list
-/// The second column tells if the result is least/exact/more (we repeat the discriminant twice)
-/// The third column has the fragments covered bitmap in the first row and null in the second row
+/// The second column tells if the result is least/exact/more (we repeat the
+/// discriminant twice) The third column has the fragments covered bitmap in the
+/// first row and null in the second row
 pub static INDEX_EXPR_RESULT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
         Field::new("result".to_string(), DataType::Binary, true),
@@ -1065,18 +1091,18 @@ impl std::ops::BitAnd<Self> for NullableIndexExprResult {
             (Self::Exact(lhs), Self::Exact(rhs)) => Self::Exact(lhs & rhs),
             (Self::Exact(lhs), Self::AtMost(rhs)) | (Self::AtMost(lhs), Self::Exact(rhs)) => {
                 Self::AtMost(lhs & rhs)
-            }
+            },
             (Self::Exact(exact), Self::AtLeast(_)) | (Self::AtLeast(_), Self::Exact(exact)) => {
                 // We could do better here, elements in both lhs and rhs are known
                 // to be true and don't require a recheck.  We only need to recheck
                 // elements in lhs that are not in rhs
                 Self::AtMost(exact)
-            }
+            },
             (Self::AtMost(lhs), Self::AtMost(rhs)) => Self::AtMost(lhs & rhs),
             (Self::AtLeast(lhs), Self::AtLeast(rhs)) => Self::AtLeast(lhs & rhs),
             (Self::AtMost(most), Self::AtLeast(_)) | (Self::AtLeast(_), Self::AtMost(most)) => {
                 Self::AtMost(most)
-            }
+            },
         }
     }
 }
@@ -1092,15 +1118,15 @@ impl std::ops::BitOr<Self> for NullableIndexExprResult {
                 // and don't require a recheck.  We only need to recheck elements
                 // in rhs that are not in lhs
                 Self::AtMost(lhs | rhs)
-            }
+            },
             (Self::Exact(lhs), Self::AtLeast(rhs)) | (Self::AtLeast(rhs), Self::Exact(lhs)) => {
                 Self::AtLeast(lhs | rhs)
-            }
+            },
             (Self::AtMost(lhs), Self::AtMost(rhs)) => Self::AtMost(lhs | rhs),
             (Self::AtLeast(lhs), Self::AtLeast(rhs)) => Self::AtLeast(lhs | rhs),
             (Self::AtMost(_), Self::AtLeast(least)) | (Self::AtLeast(least), Self::AtMost(_)) => {
                 Self::AtLeast(least)
-            }
+            },
         }
     }
 }
@@ -1175,24 +1201,23 @@ impl IndexExprResult {
         fragments_covered_builder.append_value(fragments_covered_bytes);
         fragments_covered_builder.append_null();
         let fragments_covered_arr = Arc::new(fragments_covered_builder.finish()) as Arc<dyn Array>;
-        Ok(RecordBatch::try_new(
-            INDEX_EXPR_RESULT_SCHEMA.clone(),
-            vec![
-                Arc::new(row_addr_mask_arr),
-                Arc::new(discriminant_arr),
-                Arc::new(fragments_covered_arr),
-            ],
-        )?)
+        Ok(RecordBatch::try_new(INDEX_EXPR_RESULT_SCHEMA.clone(), vec![
+            Arc::new(row_addr_mask_arr),
+            Arc::new(discriminant_arr),
+            Arc::new(fragments_covered_arr),
+        ])?)
     }
 }
 
 impl ScalarIndexExpr {
     /// Evaluates the scalar index expression
     ///
-    /// This will result in loading one or more scalar indices and searching them
+    /// This will result in loading one or more scalar indices and searching
+    /// them
     ///
-    /// TODO: We could potentially try and be smarter about reusing loaded indices for
-    /// any situations where the session cache has been disabled.
+    /// TODO: We could potentially try and be smarter about reusing loaded
+    /// indices for any situations where the session cache has been
+    /// disabled.
     #[async_recursion]
     async fn evaluate_impl(
         &self,
@@ -1207,31 +1232,31 @@ impl ScalarIndexExpr {
                     NullableIndexExprResult::Exact(mask) => NullableIndexExprResult::Exact(!mask),
                     NullableIndexExprResult::AtMost(mask) => {
                         NullableIndexExprResult::AtLeast(!mask)
-                    }
+                    },
                     NullableIndexExprResult::AtLeast(mask) => {
                         NullableIndexExprResult::AtMost(!mask)
-                    }
+                    },
                 })
-            }
+            },
             Self::And(lhs, rhs) => {
                 let lhs_result = lhs.evaluate_impl(index_loader, metrics);
                 let rhs_result = rhs.evaluate_impl(index_loader, metrics);
                 let (lhs_result, rhs_result) = try_join!(lhs_result, rhs_result)?;
                 Ok(lhs_result & rhs_result)
-            }
+            },
             Self::Or(lhs, rhs) => {
                 let lhs_result = lhs.evaluate_impl(index_loader, metrics);
                 let rhs_result = rhs.evaluate_impl(index_loader, metrics);
                 let (lhs_result, rhs_result) = try_join!(lhs_result, rhs_result)?;
                 Ok(lhs_result | rhs_result)
-            }
+            },
             Self::Query(search) => {
                 let index = index_loader
                     .load_index(&search.column, &search.index_name, metrics)
                     .await?;
                 let search_result = index.search(search.query.as_ref(), metrics).await?;
                 Ok(search_result.into())
-            }
+            },
         }
     }
 
@@ -1254,12 +1279,12 @@ impl ScalarIndexExpr {
                 let lhs = lhs.to_expr();
                 let rhs = rhs.to_expr();
                 lhs.and(rhs)
-            }
+            },
             Self::Or(lhs, rhs) => {
                 let lhs = lhs.to_expr();
                 let rhs = rhs.to_expr();
                 lhs.or(rhs)
-            }
+            },
             Self::Query(search) => search.query.to_expr(search.column.clone()),
         }
     }
@@ -1282,7 +1307,8 @@ fn maybe_column(expr: &Expr) -> Option<&str> {
 }
 
 // Extract the full nested column path from a get_field expression chain
-// For example: get_field(get_field(metadata, "status"), "code") -> "metadata.status.code"
+// For example: get_field(get_field(metadata, "status"), "code") ->
+// "metadata.status.code"
 fn extract_nested_column_path(expr: &Expr) -> Option<String> {
     let mut current_expr = expr;
     let mut parts = Vec::new();
@@ -1303,15 +1329,15 @@ fn extract_nested_column_path(expr: &Expr) -> Option<String> {
                 }
                 // Move up to the parent expression
                 current_expr = &udf.args[0];
-            }
+            },
             Expr::Column(col) => {
                 // We've reached the base column
                 parts.push(col.name.clone());
                 break;
-            }
+            },
             _ => {
                 return None;
-            }
+            },
         }
     }
 
@@ -1323,7 +1349,8 @@ fn extract_nested_column_path(expr: &Expr) -> Option<String> {
     Some(lance_core::datatypes::format_field_path(&field_refs))
 }
 
-// Extract a column from the expression, if it is a column, and we have an index for that column, or None
+// Extract a column from the expression, if it is a column, and we have an index
+// for that column, or None
 //
 // There's two ways to get a column.  First, the obvious way, is a
 // simple column reference (e.g. x = 7).  Second, a more complex way,
@@ -1351,7 +1378,7 @@ fn maybe_indexed_column<'b>(
             } else {
                 None
             }
-        }
+        },
         Expr::ScalarFunction(udf) => {
             if udf.args.is_empty() {
                 return None;
@@ -1364,12 +1391,13 @@ fn maybe_indexed_column<'b>(
             } else {
                 None
             }
-        }
+        },
         _ => None,
     }
 }
 
-// Extract a literal scalar value from an expression, if it is a literal, or None
+// Extract a literal scalar value from an expression, if it is a literal, or
+// None
 fn maybe_scalar(expr: &Expr, expected_type: &DataType) -> Option<ScalarValue> {
     match expr {
         Expr::Literal(value, _) => safe_coerce_scalar(value, expected_type),
@@ -1384,7 +1412,7 @@ fn maybe_scalar(expr: &Expr, expected_type: &DataType) -> Option<ScalarValue> {
             Expr::Literal(value, _) => {
                 let casted = value.cast_to(&cast.data_type).ok()?;
                 safe_coerce_scalar(&casted, expected_type)
-            }
+            },
             _ => None,
         },
         Expr::ScalarFunction(scalar_function) => {
@@ -1406,28 +1434,29 @@ fn maybe_scalar(expr: &Expr, expected_type: &DataType) -> Option<ScalarValue> {
                             .ok()?;
                         let casted = value.cast_to(target_type.data_type()).ok()?;
                         safe_coerce_scalar(&casted, expected_type)
-                    }
+                    },
                     _ => None,
                 }
             } else {
                 None
             }
-        }
+        },
         _ => None,
     }
 }
 
-// Extract a list of scalar values from an expression, if it is a list of scalar values, or None
+// Extract a list of scalar values from an expression, if it is a list of scalar
+// values, or None
 fn maybe_scalar_list(exprs: &Vec<Expr>, expected_type: &DataType) -> Option<Vec<ScalarValue>> {
     let mut scalar_values = Vec::with_capacity(exprs.len());
     for expr in exprs {
         match maybe_scalar(expr, expected_type) {
             Some(scalar_val) => {
                 scalar_values.push(scalar_val);
-            }
+            },
             None => {
                 return None;
-            }
+            },
         }
     }
     Some(scalar_values)
@@ -1480,7 +1509,8 @@ fn visit_is_bool(
     }
 }
 
-// A column can be a valid indexed expression if the column is boolean (e.g. 'WHERE on_sale')
+// A column can be a valid indexed expression if the column is boolean (e.g.
+// 'WHERE on_sale')
 fn visit_column(
     col: &Expr,
     index_info: &dyn IndexInformationProvider,
@@ -1525,8 +1555,10 @@ fn visit_comparison(
         let scalar = maybe_scalar(&expr.right, &col_type)?;
         query_parser.visit_comparison(&column, &scalar, &expr.op)
     } else {
-        // Datafusion's query simplifier will canonicalize expressions and so we shouldn't reach this case.  If, for some reason, we
-        // do reach this case we can handle it in the future by inverting expr.op and swapping the left and right sides
+        // Datafusion's query simplifier will canonicalize expressions and so we
+        // shouldn't reach this case.  If, for some reason, we do reach this
+        // case we can handle it in the future by inverting expr.op and swapping the
+        // left and right sides
         None
     }
 }
@@ -1558,29 +1590,29 @@ fn maybe_range(
         // x >= a && x <= b
         (Operator::GtEq, Operator::LtEq) => {
             (Bound::Included(left_value), Bound::Included(right_value))
-        }
+        },
         // x >= a && x < b
         (Operator::GtEq, Operator::Lt) => {
             (Bound::Included(left_value), Bound::Excluded(right_value))
-        }
+        },
         // x > a && x <= b
         (Operator::Gt, Operator::LtEq) => {
             (Bound::Excluded(left_value), Bound::Included(right_value))
-        }
+        },
         // x > a && x < b
         (Operator::Gt, Operator::Lt) => (Bound::Excluded(left_value), Bound::Excluded(right_value)),
         // x <= a && x >= b
         (Operator::LtEq, Operator::GtEq) => {
             (Bound::Included(right_value), Bound::Included(left_value))
-        }
+        },
         // x <= a && x > b
         (Operator::LtEq, Operator::Gt) => {
             (Bound::Included(right_value), Bound::Excluded(left_value))
-        }
+        },
         // x < a && x >= b
         (Operator::Lt, Operator::GtEq) => {
             (Bound::Excluded(right_value), Bound::Included(left_value))
-        }
+        },
         // x < a && x > b
         (Operator::Lt, Operator::Gt) => (Bound::Excluded(right_value), Bound::Excluded(left_value)),
         _ => return None,
@@ -1594,13 +1626,15 @@ fn visit_and(
     index_info: &dyn IndexInformationProvider,
     depth: usize,
 ) -> Result<Option<IndexedExpression>> {
-    // Many scalar indices can efficiently handle a BETWEEN query as a single search and this
-    // can be much more efficient than two separate range queries.  As an optimization we check
-    // to see if this is a between query and, if so, we handle it as a single query
+    // Many scalar indices can efficiently handle a BETWEEN query as a single search
+    // and this can be much more efficient than two separate range queries.  As
+    // an optimization we check to see if this is a between query and, if so, we
+    // handle it as a single query
     //
     // Note: We can't rely on users writing the SQL BETWEEN operator because:
     //   * Some users won't realize it's an option or a good idea
-    //   * Datafusion's simplifier will rewrite the BETWEEN operator into two separate range queries
+    //   * Datafusion's simplifier will rewrite the BETWEEN operator into two
+    //     separate range queries
     if let Some(range_expr) = maybe_range(expr, index_info) {
         return Ok(Some(range_expr));
     }
@@ -1643,7 +1677,7 @@ fn visit_binary_expr(
     match &expr.op {
         Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq | Operator::Eq => {
             Ok(visit_comparison(expr, index_info))
-        }
+        },
         // visit_comparison will maybe create an Eq query which we negate
         Operator::NotEq => Ok(visit_comparison(expr, index_info).and_then(|node| node.maybe_not())),
         Operator::And => visit_and(expr, index_info, depth),
@@ -1693,10 +1727,11 @@ fn visit_node(
     }
 }
 
-/// A trait to be used in `apply_scalar_indices` to inform the function which columns are indexeds
+/// A trait to be used in `apply_scalar_indices` to inform the function which
+/// columns are indexeds
 pub trait IndexInformationProvider {
-    /// Check if an index exists for `col` and, if so, return the data type of col
-    /// as well as a query parser that can parse queries for that column
+    /// Check if an index exists for `col` and, if so, return the data type of
+    /// col as well as a query parser that can parse queries for that column
     fn get_index(&self, col: &str) -> Option<(&DataType, &dyn ScalarQueryParser)>;
 }
 
@@ -1755,7 +1790,8 @@ impl FilterPlan {
             .unwrap_or_default()
     }
 
-    /// Return true if this has a refine step, regardless of the status of prefilter
+    /// Return true if this has a refine step, regardless of the status of
+    /// prefilter
     pub fn has_refine(&self) -> bool {
         self.refine_expr.is_some()
     }
@@ -1774,7 +1810,8 @@ impl FilterPlan {
         self.refine_expr = self.full_expr.clone();
     }
 
-    /// Return true if there is no refine or recheck of any kind and there is an index query
+    /// Return true if there is no refine or recheck of any kind and there is an
+    /// index query
     pub fn is_exact_index_search(&self) -> bool {
         self.index_query.is_some() && self.refine_expr.is_none() && self.skip_recheck
     }
@@ -1833,13 +1870,11 @@ mod tests {
     use arrow_schema::{Field, Schema};
     use chrono::Utc;
     use datafusion_common::{Column, DFSchema};
-    use datafusion_expr::execution_props::ExecutionProps;
-    use datafusion_expr::simplify::SimplifyContext;
+    use datafusion_expr::{execution_props::ExecutionProps, simplify::SimplifyContext};
     use lance_datafusion::exec::{get_session_context, LanceExecutionOptions};
 
-    use crate::scalar::json::{JsonQuery, JsonQueryParser};
-
     use super::*;
+    use crate::scalar::json::{JsonQuery, JsonQueryParser};
 
     struct ColInfo {
         data_type: DataType,
@@ -1848,7 +1883,10 @@ mod tests {
 
     impl ColInfo {
         fn new(data_type: DataType, parser: Box<dyn ScalarQueryParser>) -> Self {
-            Self { data_type, parser }
+            Self {
+                data_type,
+                parser,
+            }
         }
     }
 
@@ -2022,9 +2060,7 @@ mod tests {
             "json_extract(json, '$.name') = 'foo'",
             "json",
             JsonQuery::new(
-                Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
-                    "foo".to_string(),
-                )))),
+                Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some("foo".to_string())))),
                 "$.name".to_string(),
             ),
         );
@@ -2202,28 +2238,19 @@ mod tests {
             &index_info,
             "aisle < 10",
             "aisle",
-            SargableQuery::Range(
-                Bound::Unbounded,
-                Bound::Excluded(ScalarValue::UInt32(Some(10))),
-            ),
+            SargableQuery::Range(Bound::Unbounded, Bound::Excluded(ScalarValue::UInt32(Some(10)))),
         );
         check_simple(
             &index_info,
             "aisle <= 10",
             "aisle",
-            SargableQuery::Range(
-                Bound::Unbounded,
-                Bound::Included(ScalarValue::UInt32(Some(10))),
-            ),
+            SargableQuery::Range(Bound::Unbounded, Bound::Included(ScalarValue::UInt32(Some(10)))),
         );
         check_simple(
             &index_info,
             "aisle > 10",
             "aisle",
-            SargableQuery::Range(
-                Bound::Excluded(ScalarValue::UInt32(Some(10))),
-                Bound::Unbounded,
-            ),
+            SargableQuery::Range(Bound::Excluded(ScalarValue::UInt32(Some(10))), Bound::Unbounded),
         );
         // In the future we can handle this case if we need to.  For
         // now let's make sure we don't accidentally do the wrong thing
@@ -2233,10 +2260,7 @@ mod tests {
             &index_info,
             "aisle >= 10",
             "aisle",
-            SargableQuery::Range(
-                Bound::Included(ScalarValue::UInt32(Some(10))),
-                Bound::Unbounded,
-            ),
+            SargableQuery::Range(Bound::Included(ScalarValue::UInt32(Some(10))), Bound::Unbounded),
         );
         check_simple(
             &index_info,
@@ -2260,9 +2284,7 @@ mod tests {
         let right = Box::new(ScalarIndexExpr::Query(ScalarIndexSearch {
             column: "color".to_string(),
             index_name: "color_idx".to_string(),
-            query: Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
-                "blue".to_string(),
-            )))),
+            query: Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some("blue".to_string())))),
             needs_recheck: false,
         }));
         check(
@@ -2307,21 +2329,19 @@ mod tests {
             }),
             false,
         );
-        // Examples of things that are not yet supported but should be supportable someday
+        // Examples of things that are not yet supported but should be supportable
+        // someday
 
         // OR'd group of refined index searches (see IndexedExpression::or for details)
-        check_no_index(
-            &index_info,
-            "(aisle = 10 AND size > 30) OR (color = 'blue' AND size > 20)",
-        );
+        check_no_index(&index_info, "(aisle = 10 AND size > 30) OR (color = 'blue' AND size > 20)");
 
         // Non-normalized arithmetic (can use expression simplification)
         check_no_index(&index_info, "aisle + 3 < 10");
 
-        // Currently we assume that the return of an index search tells us which rows are
-        // TRUE and all other rows are FALSE.  This will need to change but for now it is
-        // safer to not support the following cases because the return value of non-matched
-        // rows is NULL and not FALSE.
+        // Currently we assume that the return of an index search tells us which rows
+        // are TRUE and all other rows are FALSE.  This will need to change but
+        // for now it is safer to not support the following cases because the
+        // return value of non-matched rows is NULL and not FALSE.
         check_no_index(&index_info, "aisle IN (5, 6, NULL)");
         // OR-list with NULL (in future DF version this will be optimized repr of
         // small in-list with NULL so let's get ready for it)
@@ -2353,29 +2373,20 @@ mod tests {
             NullableRowAddrSet::new(RowAddrTreeMap::from_iter(&[1, 2]), RowAddrTreeMap::new()),
         ));
         // NOT(AtMost) should be AtLeast (definitely NOT in [1,2], might be elsewhere)
-        assert!(matches!(
-            apply_not(at_most),
-            NullableIndexExprResult::AtLeast(_)
-        ));
+        assert!(matches!(apply_not(at_most), NullableIndexExprResult::AtLeast(_)));
 
         // AtLeast: subset of matches (e.g., definitely in [1,2], might be more)
         let at_least = NullableIndexExprResult::AtLeast(NullableRowAddrMask::AllowList(
             NullableRowAddrSet::new(RowAddrTreeMap::from_iter(&[1, 2]), RowAddrTreeMap::new()),
         ));
         // NOT(AtLeast) should be AtMost (might NOT be in [1,2], definitely elsewhere)
-        assert!(matches!(
-            apply_not(at_least),
-            NullableIndexExprResult::AtMost(_)
-        ));
+        assert!(matches!(apply_not(at_least), NullableIndexExprResult::AtMost(_)));
 
         // Exact should stay Exact
         let exact = NullableIndexExprResult::Exact(NullableRowAddrMask::AllowList(
             NullableRowAddrSet::new(RowAddrTreeMap::from_iter(&[1, 2]), RowAddrTreeMap::new()),
         ));
-        assert!(matches!(
-            apply_not(exact),
-            NullableIndexExprResult::Exact(_)
-        ));
+        assert!(matches!(apply_not(exact), NullableIndexExprResult::Exact(_)));
     }
 
     #[tokio::test]
@@ -2409,51 +2420,27 @@ mod tests {
         };
 
         // AtMost & AtMost → AtMost
-        assert!(matches!(
-            make_at_most() & make_at_most(),
-            NullableIndexExprResult::AtMost(_)
-        ));
+        assert!(matches!(make_at_most() & make_at_most(), NullableIndexExprResult::AtMost(_)));
 
         // AtLeast & AtLeast → AtLeast
-        assert!(matches!(
-            make_at_least() & make_at_least(),
-            NullableIndexExprResult::AtLeast(_)
-        ));
+        assert!(matches!(make_at_least() & make_at_least(), NullableIndexExprResult::AtLeast(_)));
 
         // AtMost & AtLeast → AtMost (superset remains superset)
-        assert!(matches!(
-            make_at_most() & make_at_least(),
-            NullableIndexExprResult::AtMost(_)
-        ));
+        assert!(matches!(make_at_most() & make_at_least(), NullableIndexExprResult::AtMost(_)));
 
         // AtMost | AtMost → AtMost
-        assert!(matches!(
-            make_at_most() | make_at_most(),
-            NullableIndexExprResult::AtMost(_)
-        ));
+        assert!(matches!(make_at_most() | make_at_most(), NullableIndexExprResult::AtMost(_)));
 
         // AtLeast | AtLeast → AtLeast
-        assert!(matches!(
-            make_at_least() | make_at_least(),
-            NullableIndexExprResult::AtLeast(_)
-        ));
+        assert!(matches!(make_at_least() | make_at_least(), NullableIndexExprResult::AtLeast(_)));
 
         // AtMost | AtLeast → AtLeast (subset coverage guaranteed)
-        assert!(matches!(
-            make_at_most() | make_at_least(),
-            NullableIndexExprResult::AtLeast(_)
-        ));
+        assert!(matches!(make_at_most() | make_at_least(), NullableIndexExprResult::AtLeast(_)));
 
         // Exact & AtMost → AtMost
-        assert!(matches!(
-            make_exact() & make_at_most(),
-            NullableIndexExprResult::AtMost(_)
-        ));
+        assert!(matches!(make_exact() & make_at_most(), NullableIndexExprResult::AtMost(_)));
 
         // Exact | AtLeast → AtLeast
-        assert!(matches!(
-            make_exact() | make_at_least(),
-            NullableIndexExprResult::AtLeast(_)
-        ));
+        assert!(matches!(make_exact() | make_at_least(), NullableIndexExprResult::AtLeast(_)));
     }
 }

@@ -50,7 +50,7 @@ impl LinderaTokenizerBuilder for LinderaBuilder {
                         ),
                         location!(),
                     ));
-                }
+                },
             }
         } else {
             log::info!(
@@ -58,10 +58,7 @@ impl LinderaTokenizerBuilder for LinderaBuilder {
                 self.config_path.display(),
             );
             LinderaTokenizer::new().map_err(|e| {
-                Error::io(
-                    format!("Failed to initialize default tokenizer: {}", e),
-                    location!(),
-                )
+                Error::io(format!("Failed to initialize default tokenizer: {}", e), location!())
             })?
         };
         Ok(tantivy::tokenizer::TextAnalyzer::builder(tokenizer).dynamic())

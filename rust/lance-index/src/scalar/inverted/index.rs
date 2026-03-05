@@ -1,81 +1,80 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::fmt::{Debug, Display};
-use std::sync::Arc;
 use std::{
     cmp::{min, Reverse},
-    collections::BinaryHeap,
+    collections::{BinaryHeap, HashMap},
+    fmt::{Debug, Display},
+    ops::Range,
+    str::FromStr,
+    sync::{Arc, LazyLock},
 };
-use std::{collections::HashMap, ops::Range};
 
-use crate::metrics::NoOpMetricsCollector;
-use crate::prefilter::NoFilter;
-use crate::scalar::registry::{TrainingCriteria, TrainingOrdering};
-use arrow::datatypes::{self, Float32Type, Int32Type, UInt64Type};
 use arrow::{
     array::{
         AsArray, LargeBinaryBuilder, ListBuilder, StringBuilder, UInt32Builder, UInt64Builder,
     },
-    buffer::OffsetBuffer,
+    buffer::{OffsetBuffer, ScalarBuffer},
+    datatypes::{self, Float32Type, Int32Type, UInt32Type, UInt64Type},
 };
-use arrow::{buffer::ScalarBuffer, datatypes::UInt32Type};
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Float32Array, LargeBinaryArray, ListArray, OffsetSizeTrait,
     RecordBatch, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
-use datafusion::execution::SendableRecordBatchStream;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::{
+    execution::SendableRecordBatchStream, physical_plan::stream::RecordBatchStreamAdapter,
+};
 use datafusion_common::DataFusionError;
 use deepsize::DeepSizeOf;
 use fst::{Automaton, IntoStreamer, Streamer};
 use futures::{stream, FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::{iter_str_array, RecordBatchExt};
-use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
-use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
-use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
 use lance_core::{
+    cache::{CacheKey, LanceCache, WeakLanceCache},
     container::list::ExpLinkedList,
-    utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu},
+    utils::{
+        mask::{RowAddrMask, RowAddrTreeMap},
+        tokio::{get_num_compute_intensive_cpus, spawn_cpu},
+        tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
+    },
+    Error, Result, ROW_ID, ROW_ID_FIELD,
 };
-use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use roaring::RoaringBitmap;
 use snafu::location;
-use std::sync::LazyLock;
 use tokio::task::spawn_blocking;
 use tracing::{info, instrument};
 
 use super::{
     builder::{
-        doc_file_path, inverted_list_schema, posting_file_path, token_file_path, ScoredDoc,
-        BLOCK_SIZE,
+        doc_file_path, inverted_list_schema, posting_file_path, token_file_path, InnerBuilder,
+        PositionRecorder, ScoredDoc, BLOCK_SIZE,
     },
-    iter::PlainPostingListIterator,
+    encoding::{compress_positions, compress_posting_list, compress_posting_list_with_scores},
+    iter::{CompressedPostingListIterator, PlainPostingListIterator, PostingListIterator},
     query::*,
     scorer::{idf, IndexBM25Scorer, Scorer, B, K1},
+    wand::*,
+    InvertedIndexBuilder, InvertedIndexParams,
 };
-use super::{
-    builder::{InnerBuilder, PositionRecorder},
-    encoding::{compress_posting_list, compress_posting_list_with_scores},
-    iter::CompressedPostingListIterator,
+use crate::{
+    frag_reuse::FragReuseIndex,
+    metrics::NoOpMetricsCollector,
+    pbold,
+    prefilter::{NoFilter, PreFilter},
+    scalar::{
+        inverted::{
+            iter::take_fst_keys, lance_tokenizer::TextTokenizer, scorer::MemBM25Scorer,
+            tokenizer::lance_tokenizer::LanceTokenizer,
+        },
+        registry::{TrainingCriteria, TrainingOrdering},
+        AnyQuery, BuiltinIndexType, CreatedIndex, IndexReader, IndexStore, MetricsCollector,
+        ScalarIndex, ScalarIndexParams, SearchResult, TokenQuery, UpdateCriteria,
+    },
+    Index,
 };
-use super::{encoding::compress_positions, iter::PostingListIterator};
-use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
-use crate::frag_reuse::FragReuseIndex;
-use crate::pbold;
-use crate::scalar::inverted::lance_tokenizer::TextTokenizer;
-use crate::scalar::inverted::scorer::MemBM25Scorer;
-use crate::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
-use crate::scalar::{
-    AnyQuery, BuiltinIndexType, CreatedIndex, IndexReader, IndexStore, MetricsCollector,
-    ScalarIndex, ScalarIndexParams, SearchResult, TokenQuery, UpdateCriteria,
-};
-use crate::Index;
-use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
-use std::str::FromStr;
 
 // Version 0: Arrow TokenSetFormat (legacy)
 // Version 1: Fst TokenSetFormat (new default, incompatible clients < 0.38)
@@ -315,7 +314,7 @@ impl InvertedIndex {
                         let weight = scorer.query_weight(token);
                         idf_cache.insert(token.clone(), weight);
                         weight
-                    }
+                    },
                 };
                 idf_by_position.push(idf_weight);
             }
@@ -423,7 +422,8 @@ impl InvertedIndex {
     {
         // for new index format, there is a metadata file and multiple partitions,
         // each partition is a separate index containing tokens, inverted list and docs.
-        // for old index format, there is no metadata file, and it's just like a single partition
+        // for old index format, there is no metadata file, and it's just like a single
+        // partition
 
         match store.open_index_file(METADATA_FILE).await {
             Ok(reader) => {
@@ -483,11 +483,11 @@ impl InvertedIndex {
                     token_set_format,
                     partitions,
                 }))
-            }
+            },
             Err(_) => {
                 // old index format
                 Self::load_legacy_index(store, frag_reuse_index, index_cache).await
-            }
+            },
         }
     }
 }
@@ -503,10 +503,7 @@ impl Index for InvertedIndex {
     }
 
     fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
-        Err(Error::invalid_input(
-            "inverted index cannot be cast to vector index",
-            location!(),
-        ))
+        Err(Error::invalid_input("inverted index cannot be cast to vector index", location!()))
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {
@@ -561,10 +558,7 @@ impl InvertedIndex {
             .boxed()
             .await?;
 
-        Ok(RecordBatch::try_new(
-            ROW_ID_SCHEMA.clone(),
-            vec![Arc::new(UInt64Array::from(doc_ids))],
-        )?)
+        Ok(RecordBatch::try_new(ROW_ID_SCHEMA.clone(), vec![Arc::new(UInt64Array::from(doc_ids))])?)
     }
 }
 
@@ -589,7 +583,7 @@ impl ScalarIndex for InvertedIndex {
                     .unwrap();
                 let row_ids = row_ids.iter().flatten().collect_vec();
                 Ok(SearchResult::at_most(RowAddrTreeMap::from_iter(row_ids)))
-            }
+            },
         }
     }
 
@@ -624,7 +618,7 @@ impl ScalarIndex for InvertedIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        _valid_old_fragments: Option<&RoaringBitmap>,
+        _old_data_filter: Option<crate::scalar::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
         self.to_builder().update(new_data, dest_store).await?;
 
@@ -680,8 +674,8 @@ pub struct InvertedPartition {
 impl InvertedPartition {
     /// Check if this partition belongs to the specified fragment.
     ///
-    /// This method encapsulates the bit manipulation logic for fragment filtering
-    /// in distributed indexing scenarios.
+    /// This method encapsulates the bit manipulation logic for fragment
+    /// filtering in distributed indexing scenarios.
     ///
     /// # Arguments
     /// * `fragment_mask` - A mask with fragment_id in high 32 bits
@@ -757,7 +751,7 @@ impl InvertedPartition {
                             &mut new_tokens,
                             params.max_expansions,
                         )
-                    }
+                    },
                 }
             } else {
                 return Err(Error::Index {
@@ -848,11 +842,8 @@ impl InvertedPartition {
     }
 
     pub async fn into_builder(self) -> Result<InnerBuilder> {
-        let mut builder = InnerBuilder::new(
-            self.id,
-            self.inverted_list.has_positions(),
-            self.token_set_format,
-        );
+        let mut builder =
+            InnerBuilder::new(self.id, self.inverted_list.has_positions(), self.token_set_format);
         builder.tokens = self.tokens;
         builder.docs = self.docs;
 
@@ -930,7 +921,7 @@ impl TokenSet {
                 }
 
                 new_map
-            }
+            },
         };
 
         Self {
@@ -966,13 +957,13 @@ impl TokenSet {
                     token_builder.append_value(String::from_utf8_lossy(token));
                     token_id_builder.append_value(token_id as u32);
                 }
-            }
+            },
             TokenMap::HashMap(map) => {
                 for (token, token_id) in map.into_iter().sorted_unstable() {
                     token_builder.append_value(token);
                     token_id_builder.append_value(token_id);
                 }
-            }
+            },
         }
 
         let token_col = token_builder.finish();
@@ -983,13 +974,10 @@ impl TokenSet {
             arrow_schema::Field::new(TOKEN_ID_COL, DataType::UInt32, false),
         ]);
 
-        let batch = RecordBatch::try_new(
-            Arc::new(schema),
-            vec![
-                Arc::new(token_col) as ArrayRef,
-                Arc::new(token_id_col) as ArrayRef,
-            ],
-        )?;
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![
+            Arc::new(token_col) as ArrayRef,
+            Arc::new(token_id_col) as ArrayRef,
+        ])?;
         Ok(batch)
     }
 
@@ -1018,14 +1006,11 @@ impl TokenSet {
             arrow_schema::Field::new(TOKEN_TOTAL_LENGTH_COL, DataType::UInt64, false),
         ]);
 
-        let batch = RecordBatch::try_new(
-            Arc::new(schema),
-            vec![
-                Arc::new(fst_col) as ArrayRef,
-                Arc::new(next_id_col) as ArrayRef,
-                Arc::new(total_length_col) as ArrayRef,
-            ],
-        )?;
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![
+            Arc::new(fst_col) as ArrayRef,
+            Arc::new(next_id_col) as ArrayRef,
+            Arc::new(total_length_col) as ArrayRef,
+        ])?;
         Ok(batch)
     }
 
@@ -1162,7 +1147,7 @@ impl TokenSet {
                 }
 
                 map.insert(token.to_owned(), next_id);
-            }
+            },
             _ => unreachable!("tokens must be HashMap while indexing"),
         }
 
@@ -1194,18 +1179,16 @@ impl TokenSet {
                 }
 
                 new_map
-            }
+            },
         };
 
-        map.retain(
-            |_, token_id| match removed_token_ids.binary_search(token_id) {
-                Ok(_) => false,
-                Err(index) => {
-                    *token_id -= index as u32;
-                    true
-                }
+        map.retain(|_, token_id| match removed_token_ids.binary_search(token_id) {
+            Ok(_) => false,
+            Err(index) => {
+                *token_id -= index as u32;
+                true
             },
-        );
+        });
 
         self.tokens = TokenMap::HashMap(map);
     }
@@ -1329,14 +1312,14 @@ impl PostingListReader {
                     .copied()
                     .unwrap_or(self.reader.num_rows());
                 next_offset - offsets[token_id]
-            }
+            },
             None => {
                 if let Some(lengths) = &self.lengths {
                     lengths[token_id] as usize
                 } else {
                     panic!("posting list reader is not initialized")
                 }
-            }
+            },
         }
     }
 
@@ -1349,11 +1332,8 @@ impl PostingListReader {
             self.posting_batch_legacy(token_id, with_position).await
         } else {
             let token_id = token_id as usize;
-            let columns = if with_position {
-                vec![POSTING_COL, POSITION_COL]
-            } else {
-                vec![POSTING_COL]
-            };
+            let columns =
+                if with_position { vec![POSTING_COL, POSITION_COL] } else { vec![POSTING_COL] };
             let batch = self
                 .reader
                 .read_range(token_id..token_id + 1, Some(&columns))
@@ -1389,7 +1369,9 @@ impl PostingListReader {
         is_phrase_query: bool,
         metrics: &dyn MetricsCollector,
     ) -> Result<PostingList> {
-        let cache_key = PostingListKey { token_id };
+        let cache_key = PostingListKey {
+            token_id,
+        };
         let mut posting = self
             .index_cache
             .get_or_insert_with_key(cache_key, || async move {
@@ -1403,7 +1385,8 @@ impl PostingListReader {
             .clone();
 
         if is_phrase_query {
-            // hit the cache and when the cache was populated, the positions column was not loaded
+            // hit the cache and when the cache was populated, the positions column was not
+            // loaded
             let positions = self.read_positions(token_id).await?;
             posting.set_positions(positions);
         }
@@ -1481,23 +1464,32 @@ impl PostingListReader {
     }
 
     async fn read_positions(&self, token_id: u32) -> Result<ListArray> {
-        let positions = self.index_cache.get_or_insert_with_key(PositionKey { token_id }, || async move {
-            let batch = self
-                .reader
-                .read_range(self.posting_list_range(token_id), Some(&[POSITION_COL]))
-                .await.map_err(|e| {
-                    match e {
-                        Error::Schema { .. } => Error::invalid_input(
-                            "position is not found but required for phrase queries, try recreating the index with position".to_owned(),
-                            location!(),
-                        ),
-                        e => e
-                    }
-                })?;
-            Result::Ok(Positions(batch[POSITION_COL]
-                .as_list::<i32>()
-                .clone()))
-        }).await?;
+        let positions = self
+            .index_cache
+            .get_or_insert_with_key(
+                PositionKey {
+                    token_id,
+                },
+                || async move {
+                    let batch = self
+                        .reader
+                        .read_range(self.posting_list_range(token_id), Some(&[POSITION_COL]))
+                        .await
+                        .map_err(|e| match e {
+                            Error::Schema {
+                                ..
+                            } => Error::invalid_input(
+                                "position is not found but required for phrase queries, try \
+                                 recreating the index with position"
+                                    .to_owned(),
+                                location!(),
+                            ),
+                            e => e,
+                        })?;
+                    Result::Ok(Positions(batch[POSITION_COL].as_list::<i32>().clone()))
+                },
+            )
+            .await?;
         Ok(positions.0.clone())
     }
 
@@ -1507,11 +1499,11 @@ impl PostingListReader {
                 let offset = offsets[token_id as usize];
                 let posting_len = self.posting_len(token_id);
                 offset..offset + posting_len
-            }
+            },
             None => {
                 let token_id = token_id as usize;
                 token_id..token_id + 1
-            }
+            },
         }
     }
 
@@ -1583,11 +1575,11 @@ impl PostingList {
                 let posting =
                     CompressedPostingList::from_batch(batch, max_score.unwrap(), length.unwrap());
                 Ok(Self::Compressed(posting))
-            }
+            },
             None => {
                 let posting = PlainPostingList::from_batch(batch, max_score);
                 Ok(Self::Plain(posting))
-            }
+            },
         }
     }
 
@@ -1607,7 +1599,7 @@ impl PostingList {
             Self::Plain(posting) => posting.positions = Some(positions),
             Self::Compressed(posting) => {
                 posting.positions = Some(positions.value(0).as_list::<i32>().clone());
-            }
+            },
         }
     }
 
@@ -1653,7 +1645,7 @@ impl PostingList {
                     let positions = match positions {
                         Some(positions) => {
                             PositionRecorder::Position(positions.collect::<Vec<_>>().into())
-                        }
+                        },
                         None => PositionRecorder::Count(freq),
                     };
                     items.push(Item {
@@ -1665,18 +1657,18 @@ impl PostingList {
                 for item in items {
                     builder.add(item.doc_id, item.positions);
                 }
-            }
+            },
             Self::Compressed(posting) => {
                 posting.iter().for_each(|(doc_id, freq, positions)| {
                     let positions = match positions {
                         Some(positions) => {
                             PositionRecorder::Position(positions.collect::<Vec<_>>().into())
-                        }
+                        },
                         None => PositionRecorder::Count(freq),
                     };
                     builder.add(doc_id, positions);
                 });
-            }
+            },
         }
         builder
     }
@@ -1929,16 +1921,12 @@ impl PostingListBuilder {
                 None,
             )?) as ArrayRef,
             Arc::new(Float32Array::from_iter_values(std::iter::once(max_score))) as ArrayRef,
-            Arc::new(UInt32Array::from_iter_values(std::iter::once(
-                length as u32,
-            ))) as ArrayRef,
+            Arc::new(UInt32Array::from_iter_values(std::iter::once(length as u32))) as ArrayRef,
         ];
 
         if let Some(positions) = self.positions.as_ref() {
-            let mut position_builder = ListBuilder::new(ListBuilder::with_capacity(
-                LargeBinaryBuilder::new(),
-                length,
-            ));
+            let mut position_builder =
+                ListBuilder::new(ListBuilder::with_capacity(LargeBinaryBuilder::new(), length));
             for index in 0..length {
                 let positions_in_doc = positions.get(index);
                 let compressed = compress_positions(positions_in_doc)?;
@@ -2115,7 +2103,10 @@ pub struct LocatedDocInfo {
 
 impl LocatedDocInfo {
     pub fn new(row_id: u64, frequency: f32) -> Self {
-        Self { row_id, frequency }
+        Self {
+            row_id,
+            frequency,
+        }
     }
 }
 
@@ -2147,7 +2138,10 @@ pub struct RawDocInfo {
 
 impl RawDocInfo {
     pub fn new(doc_id: u32, frequency: u32) -> Self {
-        Self { doc_id, frequency }
+        Self {
+            doc_id,
+            frequency,
+        }
     }
 }
 
@@ -2264,13 +2258,10 @@ impl DocSet {
             arrow_schema::Field::new(NUM_TOKEN_COL, DataType::UInt32, false),
         ]);
 
-        let batch = RecordBatch::try_new(
-            Arc::new(schema),
-            vec![
-                Arc::new(row_id_col) as ArrayRef,
-                Arc::new(num_tokens_col) as ArrayRef,
-            ],
-        )?;
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![
+            Arc::new(row_id_col) as ArrayRef,
+            Arc::new(num_tokens_col) as ArrayRef,
+        ])?;
         Ok(batch)
     }
 
@@ -2308,8 +2299,8 @@ impl DocSet {
             });
         }
 
-        // if frag reuse happened, we'll need to remap the row_ids. And after row_ids been
-        // remapped, we'll need resort to make sure binary_search works.
+        // if frag reuse happened, we'll need to remap the row_ids. And after row_ids
+        // been remapped, we'll need resort to make sure binary_search works.
         if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
             let mut row_ids = Vec::with_capacity(row_id_col.len());
             let mut num_tokens = Vec::with_capacity(num_tokens_col.len());
@@ -2367,14 +2358,14 @@ impl DocSet {
                 Some(Some(new_row_id)) => {
                     self.row_ids.push(*new_row_id);
                     self.num_tokens.push(num_token);
-                }
+                },
                 Some(None) => {
                     removed.push(doc_id as u32);
-                }
+                },
                 None => {
                     self.row_ids.push(row_id);
                     self.num_tokens.push(num_token);
-                }
+                },
             }
         }
         removed
@@ -2544,7 +2535,7 @@ pub fn flat_bm25_search_stream(
                     token_docs,
                 )
             }
-        }
+        },
         None => MemBM25Scorer::new(0, 0, HashMap::new()),
     };
 
@@ -2582,21 +2573,27 @@ pub fn is_phrase_query(query: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::scalar::inverted::lance_tokenizer::DocType;
-    use lance_core::cache::LanceCache;
-    use lance_core::utils::tempfile::TempObjDir;
+    use arrow::{
+        array::AsArray,
+        datatypes::{Float32Type, UInt32Type},
+    };
+    use lance_core::{cache::LanceCache, utils::tempfile::TempObjDir};
     use lance_io::object_store::ObjectStore;
 
-    use crate::metrics::NoOpMetricsCollector;
-    use crate::prefilter::NoFilter;
-    use crate::scalar::inverted::builder::{inverted_list_schema, InnerBuilder, PositionRecorder};
-    use crate::scalar::inverted::encoding::decompress_posting_list;
-    use crate::scalar::inverted::query::{FtsSearchParams, Operator};
-    use crate::scalar::lance_format::LanceIndexStore;
-    use arrow::array::AsArray;
-    use arrow::datatypes::{Float32Type, UInt32Type};
-
     use super::*;
+    use crate::{
+        metrics::NoOpMetricsCollector,
+        prefilter::NoFilter,
+        scalar::{
+            inverted::{
+                builder::{inverted_list_schema, InnerBuilder, PositionRecorder},
+                encoding::decompress_posting_list,
+                lance_tokenizer::DocType,
+                query::{FtsSearchParams, Operator},
+            },
+            lance_format::LanceIndexStore,
+        },
+    };
 
     #[tokio::test]
     async fn test_posting_builder_remap() {
@@ -2780,18 +2777,9 @@ mod tests {
 
         // Create metadata file with both partitions
         let metadata = std::collections::HashMap::from_iter(vec![
-            (
-                "partitions".to_owned(),
-                serde_json::to_string(&vec![0u64, 1u64]).unwrap(),
-            ),
-            (
-                "params".to_owned(),
-                serde_json::to_string(&InvertedIndexParams::default()).unwrap(),
-            ),
-            (
-                TOKEN_SET_FORMAT_KEY.to_owned(),
-                TokenSetFormat::default().to_string(),
-            ),
+            ("partitions".to_owned(), serde_json::to_string(&vec![0u64, 1u64]).unwrap()),
+            ("params".to_owned(), serde_json::to_string(&InvertedIndexParams::default()).unwrap()),
+            (TOKEN_SET_FORMAT_KEY.to_owned(), TokenSetFormat::default().to_string()),
         ]);
         let mut writer = store
             .new_index_file(METADATA_FILE, Arc::new(arrow_schema::Schema::empty()))
@@ -2812,8 +2800,8 @@ mod tests {
 
         // Verify the partitions were loaded correctly
 
-        // Verify posting list lengths (note: partition order may differ from creation order)
-        // Verify based on actual loading order
+        // Verify posting list lengths (note: partition order may differ from creation
+        // order) Verify based on actual loading order
         if index.partitions[0].id() == 0 {
             // If partition[0] is ID=0, then it should have 1 document
             assert_eq!(index.partitions[0].inverted_list.posting_len(0), 1);
@@ -2853,14 +2841,8 @@ mod tests {
         }
 
         // Check that we got results from both partitions
-        assert!(
-            row_ids.contains(&100),
-            "Should contain row_id from partition 0"
-        );
-        assert!(
-            row_ids.iter().any(|&id| id >= 200),
-            "Should contain row_id from partition 1"
-        );
+        assert!(row_ids.contains(&100), "Should contain row_id from partition 0");
+        assert!(row_ids.iter().any(|&id| id >= 200), "Should contain row_id from partition 1");
     }
 
     #[test]
@@ -2912,18 +2894,9 @@ mod tests {
         builder1.write(store.as_ref()).await.unwrap();
 
         let metadata = std::collections::HashMap::from_iter(vec![
-            (
-                "partitions".to_owned(),
-                serde_json::to_string(&vec![0u64, 1u64]).unwrap(),
-            ),
-            (
-                "params".to_owned(),
-                serde_json::to_string(&InvertedIndexParams::default()).unwrap(),
-            ),
-            (
-                TOKEN_SET_FORMAT_KEY.to_owned(),
-                TokenSetFormat::default().to_string(),
-            ),
+            ("partitions".to_owned(), serde_json::to_string(&vec![0u64, 1u64]).unwrap()),
+            ("params".to_owned(), serde_json::to_string(&InvertedIndexParams::default()).unwrap()),
+            (TOKEN_SET_FORMAT_KEY.to_owned(), TokenSetFormat::default().to_string()),
         ]);
         let mut writer = store
             .new_index_file(METADATA_FILE, Arc::new(arrow_schema::Schema::empty()))

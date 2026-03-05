@@ -3,25 +3,28 @@
 
 use std::sync::Arc;
 
-use futures::FutureExt;
-use lance_core::{Error, Result};
-use lance_index::metrics::NoOpMetricsCollector;
-use lance_index::optimize::OptimizeOptions;
-use lance_index::progress::NoopIndexBuildProgress;
-use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::scalar::CreatedIndex;
-use lance_index::VECTOR_INDEX_VERSION;
+use futures::{FutureExt, TryStreamExt};
+use lance_core::{
+    utils::mask::{RowAddrTreeMap, RowSetOps},
+    Error, Result,
+};
+use lance_index::{
+    metrics::NoOpMetricsCollector,
+    optimize::OptimizeOptions,
+    progress::NoopIndexBuildProgress,
+    scalar::{lance_format::LanceIndexStore, CreatedIndex, OldIndexDataFilter},
+    VECTOR_INDEX_VERSION,
+};
 use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
 use snafu::location;
 use uuid::Uuid;
 
-use super::vector::ivf::optimize_vector_indices;
-use super::DatasetIndexInternalExt;
-use crate::dataset::index::LanceIndexStoreExt;
-use crate::dataset::Dataset;
-use crate::index::scalar::load_training_data;
-use crate::index::vector_index_details;
+use super::{vector::ivf::optimize_vector_indices, DatasetIndexInternalExt};
+use crate::{
+    dataset::{index::LanceIndexStoreExt, rowids::load_row_id_sequences, Dataset},
+    index::{scalar::load_training_data, vector_index_details},
+};
 
 #[derive(Debug, Clone)]
 pub struct IndexMergeResults<'a> {
@@ -32,10 +35,40 @@ pub struct IndexMergeResults<'a> {
     pub new_index_details: prost_types::Any,
 }
 
+async fn build_stable_row_id_filter(
+    dataset: &Dataset,
+    effective_old_frags: &RoaringBitmap,
+) -> Result<RowAddrTreeMap> {
+    let retained_frags = dataset
+        .manifest
+        .fragments
+        .iter()
+        .filter(|frag| effective_old_frags.contains(frag.id as u32))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if retained_frags.is_empty() {
+        return Ok(RowAddrTreeMap::new());
+    }
+
+    let row_id_sequences = load_row_id_sequences(dataset, &retained_frags)
+        .try_collect::<Vec<_>>()
+        .await?;
+
+    let row_id_maps = row_id_sequences
+        .iter()
+        .map(|(_, seq)| RowAddrTreeMap::from(seq.as_ref()))
+        .collect::<Vec<_>>();
+    let row_id_map_refs = row_id_maps.iter().collect::<Vec<_>>();
+
+    Ok(<RowAddrTreeMap as RowSetOps>::union_all(&row_id_map_refs))
+}
+
 /// Merge in-inflight unindexed data, with a specific number of previous indices
 /// into a new index, to improve the query performance.
 ///
-/// The merge behavior is controlled by [`OptimizeOptions::num_indices_to_merge].
+/// The merge behavior is controlled by
+/// [`OptimizeOptions::num_indices_to_merge].
 ///
 /// Returns
 /// -------
@@ -58,8 +91,8 @@ pub async fn merge_indices<'a>(
     merge_indices_with_unindexed_frags(dataset, old_indices, &unindexed, options).await
 }
 
-/// Merge a list of provided unindexed data, with a specific number of previous indices
-/// into a new index, to improve the query performance.
+/// Merge a list of provided unindexed data, with a specific number of previous
+/// indices into a new index, to improve the query performance.
 pub async fn merge_indices_with_unindexed_frags<'a>(
     dataset: Arc<Dataset>,
     old_indices: &[&'a IndexMetadata],
@@ -77,10 +110,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         .schema()
         .field_by_id(old_indices[0].fields[0])
         .ok_or(Error::Index {
-            message: format!(
-                "Append index: column {} does not exist",
-                old_indices[0].fields[0]
-            ),
+            message: format!("Append index: column {} does not exist", old_indices[0].fields[0]),
             location: location!(),
         })?;
 
@@ -94,13 +124,12 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             Ok(index) => indices.push(index),
             Err(e) => {
                 log::warn!(
-                    "Cannot open index on column '{}': {}. \
-                     Skipping index merge for this column.",
+                    "Cannot open index on column '{}': {}. Skipping index merge for this column.",
                     field_path,
                     e
                 );
                 return Ok(None);
-            }
+            },
         }
     }
 
@@ -143,11 +172,8 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
 
             let update_criteria = index.update_criteria();
 
-            let fragments = if update_criteria.requires_old_data {
-                None
-            } else {
-                Some(unindexed.to_vec())
-            };
+            let fragments =
+                if update_criteria.requires_old_data { None } else { Some(unindexed.to_vec()) };
             let new_data_stream = load_training_data(
                 dataset.as_ref(),
                 &field_path,
@@ -178,14 +204,24 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             } else {
                 let new_store =
                     LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid.to_string())?;
+                let old_data_filter = if dataset.manifest.uses_stable_row_ids() {
+                    // Stable row IDs are opaque IDs, so fragment-bit filtering on
+                    // (row_id >> 32) is invalid. Build an exact allow-list from retained
+                    // fragments' row-id sequences and use precise filtering.
+                    let valid_old_row_ids =
+                        build_stable_row_id_filter(dataset.as_ref(), &effective_old_frags).await?;
+                    Some(OldIndexDataFilter::RowIds(valid_old_row_ids))
+                } else {
+                    Some(OldIndexDataFilter::Fragments(effective_old_frags.clone()))
+                };
                 index
-                    .update(new_data_stream, &new_store, Some(&effective_old_frags))
+                    .update(new_data_stream, &new_store, old_data_filter)
                     .await?
             };
 
             // TODO: don't hard-code index version
             Ok((new_uuid, 1, created_index))
-        }
+        },
         it if it.is_vector() => {
             let new_data_stream = if unindexed.is_empty() {
                 None
@@ -219,20 +255,13 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     frag_bitmap.extend(idx.fragment_bitmap.as_ref().unwrap().iter());
                 });
 
-            Ok((
-                new_uuid,
-                indices_merged,
-                CreatedIndex {
-                    index_details: vector_index_details(),
-                    index_version: VECTOR_INDEX_VERSION,
-                },
-            ))
-        }
+            Ok((new_uuid, indices_merged, CreatedIndex {
+                index_details: vector_index_details(),
+                index_version: VECTOR_INDEX_VERSION,
+            }))
+        },
         _ => Err(Error::Index {
-            message: format!(
-                "Append index: invalid index type: {:?}",
-                indices[0].index_type()
-            ),
+            message: format!("Append index: invalid index type: {:?}", indices[0].index_type()),
             location: location!(),
         }),
     }?;
@@ -255,31 +284,39 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use arrow::datatypes::{Float32Type, UInt32Type};
-    use arrow_array::cast::AsArray;
-    use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator, UInt32Array};
+    use arrow_array::{
+        cast::AsArray, FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray,
+        UInt32Array,
+    };
     use arrow_schema::{DataType, Field, Schema};
     use futures::TryStreamExt;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::utils::reader_to_stream;
     use lance_datagen::{array, Dimension, RowCount};
-    use lance_index::vector::hnsw::builder::HnswBuildParams;
-    use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::{
-        vector::{ivf::IvfBuildParams, pq::PQBuildParams},
+        optimize::OptimizeOptions,
+        scalar::ScalarIndexParams,
+        vector::{
+            hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams,
+            sq::builder::SQBuildParams,
+        },
         DatasetIndexExt, IndexType,
     };
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
     use rstest::rstest;
 
-    use crate::dataset::builder::DatasetBuilder;
-    use crate::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteParams};
-    use crate::index::vector::VectorIndexParams;
-    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use super::*;
+    use crate::{
+        dataset::{
+            builder::DatasetBuilder, optimize::compact_files, MergeInsertBuilder, WhenMatched,
+            WhenNotMatched, WriteParams,
+        },
+        index::vector::VectorIndexParams,
+        utils::test::{DatagenExt, FragmentCount, FragmentRowCount},
+    };
 
     #[tokio::test]
     async fn test_append_index() {
@@ -386,11 +423,7 @@ mod tests {
         let mut num_rows = 0;
         for index in indices.iter() {
             let index = dataset
-                .open_vector_index(
-                    "vector",
-                    index.uuid.to_string().as_str(),
-                    &NoOpMetricsCollector,
-                )
+                .open_vector_index("vector", index.uuid.to_string().as_str(), &NoOpMetricsCollector)
                 .await
                 .unwrap();
             num_rows += index.num_rows();
@@ -432,13 +465,10 @@ mod tests {
             Field::new("id", DataType::UInt32, false),
         ]));
         let array = Arc::new(FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap());
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                array.clone(),
-                Arc::new(UInt32Array::from_iter_values(0..TOTAL as u32)),
-            ],
-        )
+        let batch = RecordBatch::try_new(schema.clone(), vec![
+            array.clone(),
+            Arc::new(UInt32Array::from_iter_values(0..TOTAL as u32)),
+        ])
         .unwrap();
 
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
@@ -453,15 +483,10 @@ mod tests {
         assert_eq!(stats["num_indexed_fragments"], 1);
         assert_eq!(stats["num_unindexed_fragments"], 0);
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                array.clone(),
-                Arc::new(UInt32Array::from_iter_values(
-                    TOTAL as u32..(TOTAL * 2) as u32,
-                )),
-            ],
-        )
+        let batch = RecordBatch::try_new(schema.clone(), vec![
+            array.clone(),
+            Arc::new(UInt32Array::from_iter_values(TOTAL as u32..(TOTAL * 2) as u32)),
+        ])
         .unwrap();
 
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
@@ -508,10 +533,7 @@ mod tests {
         let mut dataset = lance_datagen::gen_batch()
             .col("id", array::step::<UInt32Type>())
             .col("value", array::cycle_utf8_literals(&["a", "b", "c"]))
-            .col(
-                "vector",
-                array::rand_vec::<Float32Type>(Dimension::from(64)),
-            )
+            .col("vector", array::rand_vec::<Float32Type>(Dimension::from(64)))
             .into_dataset_with_params(
                 test_uri,
                 FragmentCount(1),
@@ -641,5 +663,81 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results[0].num_rows(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_optimize_btree_keeps_rows_with_stable_row_ids_after_compaction() {
+        async fn query_id_count(dataset: &Dataset, id: &str) -> usize {
+            dataset
+                .scan()
+                .filter(&format!("id = '{}'", id))
+                .unwrap()
+                .project(&["id"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap()
+                .num_rows()
+        }
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+        let ids = StringArray::from_iter_values((0..256).map(|i| format!("song-{i}")));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids)]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 64,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".into()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(query_id_count(&dataset, "song-42").await, 1);
+
+        compact_files(
+            &mut dataset,
+            crate::dataset::optimize::CompactionOptions {
+                target_rows_per_fragment: 512,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let frags = dataset.get_fragments();
+        assert!(!frags.is_empty());
+        assert!(frags.iter().all(|frag| frag.id() > 0));
+        assert!(dataset
+            .unindexed_fragments("id_idx")
+            .await
+            .unwrap()
+            .is_empty());
+
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        assert_eq!(query_id_count(&dataset, "song-42").await, 1);
     }
 }

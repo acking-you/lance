@@ -25,7 +25,7 @@ impl<'a> PostingListIterator<'a> {
                     posting.blocks.clone(),
                     posting.positions.clone(),
                 )))
-            }
+            },
         }
     }
 }

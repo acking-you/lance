@@ -17,12 +17,11 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
 use deepsize::DeepSizeOf;
 use futures::{stream, StreamExt, TryStreamExt};
-use lance_core::utils::mask::RowSetOps;
 use lance_core::{
     cache::{CacheKey, LanceCache, WeakLanceCache},
     error::LanceOptionExt,
     utils::{
-        mask::{NullableRowAddrSet, RowAddrTreeMap},
+        mask::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps},
         tokio::get_num_compute_intensive_cpus,
     },
     Error, Result, ROW_ID,
@@ -33,23 +32,23 @@ use snafu::location;
 use tracing::instrument;
 
 use super::{
-    btree::OrderableScalarValue, BuiltinIndexType, SargableQuery, ScalarIndexParams, SearchResult,
+    btree::OrderableScalarValue, AnyQuery, BuiltinIndexType, IndexStore, SargableQuery,
+    ScalarIndex, ScalarIndexParams, SearchResult,
 };
-use super::{AnyQuery, IndexStore, ScalarIndex};
-use crate::pbold;
 use crate::{
     frag_reuse::FragReuseIndex,
+    metrics::MetricsCollector,
+    pbold,
     scalar::{
-        expression::SargableQueryParser,
+        expression::{SargableQueryParser, ScalarQueryParser},
         registry::{
             DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
             TrainingRequest, VALUE_COLUMN_NAME,
         },
-        CreatedIndex, UpdateCriteria,
+        CreatedIndex, IndexReader, UpdateCriteria,
     },
+    Index, IndexType,
 };
-use crate::{metrics::MetricsCollector, Index, IndexType};
-use crate::{scalar::expression::ScalarQueryParser, scalar::IndexReader};
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
 pub const INDEX_STATS_METADATA_KEY: &str = "lance:index_stats";
@@ -61,7 +60,8 @@ const MAX_ROWS_PER_CHUNK: usize = 2 * 1024;
 const BITMAP_INDEX_VERSION: u32 = 0;
 
 // We only need to open a file reader if we need to load a bitmap. If all
-// bitmaps are cached we don't open it. If we do open it we should only open it once.
+// bitmaps are cached we don't open it. If we do open it we should only open it
+// once.
 #[derive(Clone)]
 struct LazyIndexReader {
     index_reader: Arc<tokio::sync::Mutex<Option<Arc<dyn IndexReader>>>>,
@@ -96,8 +96,9 @@ impl LazyIndexReader {
 
 /// A scalar index that stores a bitmap for each possible value
 ///
-/// This index works best for low-cardinality columns, where the number of unique values is small.
-/// The bitmap stores a list of row ids where the value is present.
+/// This index works best for low-cardinality columns, where the number of
+/// unique values is small. The bitmap stores a list of row ids where the value
+/// is present.
 #[derive(Clone, Debug)]
 pub struct BitmapIndex {
     /// Maps each unique value to its bitmap location in the index file
@@ -253,7 +254,9 @@ impl BitmapIndex {
             return Ok(self.null_map.clone());
         }
 
-        let cache_key = BitmapKey { value: key.clone() };
+        let cache_key = BitmapKey {
+            value: key.clone(),
+        };
 
         if let Some(cached) = self.index_cache.get_with_key(&cache_key).await {
             return Ok(cached);
@@ -369,7 +372,9 @@ impl Index for BitmapIndex {
                     bitmap = frag_reuse_index_ref.remap_row_addrs_tree_map(&bitmap);
                 }
 
-                let cache_key = BitmapKey { value: key };
+                let cache_key = BitmapKey {
+                    value: key,
+                };
                 self.index_cache
                     .insert_with_key(&cache_key, Arc::new(bitmap))
                     .await;
@@ -424,7 +429,7 @@ impl ScalarIndex for BitmapIndex {
                     };
                     ((*bitmap).clone(), null_rows)
                 }
-            }
+            },
             SargableQuery::Range(start, end) => {
                 let range_start = match start {
                     Bound::Included(val) => Bound::Included(OrderableScalarValue(val.clone())),
@@ -473,13 +478,10 @@ impl ScalarIndex for BitmapIndex {
                     RowAddrTreeMap::union_all(&bitmap_refs)
                 };
 
-                let null_rows = if !self.null_map.is_empty() {
-                    Some((*self.null_map).clone())
-                } else {
-                    None
-                };
+                let null_rows =
+                    if !self.null_map.is_empty() { Some((*self.null_map).clone()) } else { None };
                 (result, null_rows)
-            }
+            },
             SargableQuery::IsIn(values) => {
                 metrics.record_comparisons(values.len());
 
@@ -532,18 +534,18 @@ impl ScalarIndex for BitmapIndex {
                     None
                 };
                 (result, null_rows)
-            }
+            },
             SargableQuery::IsNull() => {
                 metrics.record_comparisons(1);
                 // Querying FOR nulls - they are the TRUE result, not NULL result
                 ((*self.null_map).clone(), None)
-            }
+            },
             SargableQuery::FullTextSearch(_) => {
                 return Err(Error::NotSupported {
                     source: "full text search is not supported for bitmap indexes".into(),
                     location: location!(),
                 });
-            }
+            },
         };
 
         let selection = NullableRowAddrSet::new(row_ids, null_row_ids.unwrap_or_default());
@@ -554,7 +556,8 @@ impl ScalarIndex for BitmapIndex {
         true
     }
 
-    /// Remap the row ids, creating a new remapped version of this index in `dest_store`
+    /// Remap the row ids, creating a new remapped version of this index in
+    /// `dest_store`
     async fn remap(
         &self,
         mapping: &HashMap<u64, Option<u64>>,
@@ -596,12 +599,13 @@ impl ScalarIndex for BitmapIndex {
         })
     }
 
-    /// Add the new data into the index, creating an updated version of the index in `dest_store`
+    /// Add the new data into the index, creating an updated version of the
+    /// index in `dest_store`
     async fn update(
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        _valid_old_fragments: Option<&RoaringBitmap>,
+        _old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
         let mut state = HashMap::new();
 
@@ -712,11 +716,12 @@ impl BitmapIndexPlugin {
         }
 
         // Finish file with metadata that allows lightweight statistics reads
-        let stats_json = serde_json::to_string(&BitmapStatistics { num_bitmaps }).map_err(|e| {
-            Error::Internal {
-                message: format!("failed to serialize bitmap statistics: {e}"),
-                location: location!(),
-            }
+        let stats_json = serde_json::to_string(&BitmapStatistics {
+            num_bitmaps,
+        })
+        .map_err(|e| Error::Internal {
+            message: format!("failed to serialize bitmap statistics: {e}"),
+            location: location!(),
         })?;
         let mut metadata = HashMap::new();
         metadata.insert(INDEX_STATS_METADATA_KEY.to_string(), stats_json);
@@ -852,17 +857,17 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
 
 #[cfg(test)]
 pub mod tests {
-    use super::*;
-    use crate::metrics::NoOpMetricsCollector;
-    use crate::scalar::lance_format::LanceIndexStore;
+    use std::collections::HashMap;
+
     use arrow_array::{record_batch, RecordBatch, StringArray, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
-    use lance_core::utils::mask::RowSetOps;
-    use lance_core::utils::{address::RowAddress, tempfile::TempObjDir};
+    use lance_core::utils::{address::RowAddress, mask::RowSetOps, tempfile::TempObjDir};
     use lance_io::object_store::ObjectStore;
-    use std::collections::HashMap;
+
+    use super::*;
+    use crate::{metrics::NoOpMetricsCollector, scalar::lance_format::LanceIndexStore};
 
     #[tokio::test]
     async fn test_bitmap_lazy_loading_and_cache() {
@@ -887,13 +892,10 @@ pub mod tests {
             Field::new("_rowid", DataType::UInt64, false),
         ]));
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(colors.clone())),
-                Arc::new(UInt64Array::from(row_ids.clone())),
-            ],
-        )
+        let batch = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(StringArray::from(colors.clone())),
+            Arc::new(UInt64Array::from(row_ids.clone())),
+        ])
         .unwrap();
 
         let stream = stream::once(async move { Ok(batch) });
@@ -1001,18 +1003,18 @@ pub mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_big_bitmap_index() {
-        // WARNING: This test allocates a huge state to force overflow over int32 on BinaryArray
-        // You must run it only on a machine with enough resources (or skip it normally).
-        use super::{BitmapIndex, BITMAP_LOOKUP_NAME};
-        use crate::scalar::lance_format::LanceIndexStore;
-        use crate::scalar::IndexStore;
+        // WARNING: This test allocates a huge state to force overflow over int32 on
+        // BinaryArray You must run it only on a machine with enough resources
+        // (or skip it normally).
+        use std::{collections::HashMap, sync::Arc};
+
         use arrow_schema::DataType;
         use datafusion_common::ScalarValue;
-        use lance_core::cache::LanceCache;
-        use lance_core::utils::mask::RowAddrTreeMap;
+        use lance_core::{cache::LanceCache, utils::mask::RowAddrTreeMap};
         use lance_io::object_store::ObjectStore;
-        use std::collections::HashMap;
-        use std::sync::Arc;
+
+        use super::{BitmapIndex, BITMAP_LOOKUP_NAME};
+        use crate::scalar::{lance_format::LanceIndexStore, IndexStore};
 
         // Adjust these numbers so that:
         //     m * (serialized size per bitmap) > 2^31 bytes.
@@ -1039,31 +1041,20 @@ pub mod tests {
             Arc::new(LanceCache::no_cache()),
         );
 
-        // This call should never trigger a "byte array offset overflow" error since now the code supports
-        // read by chunks
+        // This call should never trigger a "byte array offset overflow" error since now
+        // the code supports read by chunks
         let result =
             BitmapIndexPlugin::write_bitmap_index(state, &test_store, &DataType::UInt32).await;
 
-        assert!(
-            result.is_ok(),
-            "Failed to write bitmap index: {:?}",
-            result.err()
-        );
+        assert!(result.is_ok(), "Failed to write bitmap index: {:?}", result.err());
 
         // Verify the index file exists
         let index_file = test_store.open_index_file(BITMAP_LOOKUP_NAME).await;
-        assert!(
-            index_file.is_ok(),
-            "Failed to open index file: {:?}",
-            index_file.err()
-        );
+        assert!(index_file.is_ok(), "Failed to open index file: {:?}", index_file.err());
         let index_file = index_file.unwrap();
 
         // Print stats about the index file
-        tracing::info!(
-            "Index file contains {} rows in total",
-            index_file.num_rows()
-        );
+        tracing::info!("Index file contains {} rows in total", index_file.num_rows());
 
         // Load the index using BitmapIndex::load
         tracing::info!("Loading index from disk...");
@@ -1161,13 +1152,10 @@ pub mod tests {
             Field::new("_rowid", DataType::UInt64, false),
         ]));
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(colors.clone())),
-                Arc::new(UInt64Array::from(row_ids.clone())),
-            ],
-        )
+        let batch = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(StringArray::from(colors.clone())),
+            Arc::new(UInt64Array::from(row_ids.clone())),
+        ])
         .unwrap();
 
         let stream = stream::once(async move { Ok(batch) });
@@ -1276,13 +1264,10 @@ pub mod tests {
             Field::new("_rowid", DataType::UInt64, false),
         ]));
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(UInt32Array::from(values)),
-                Arc::new(UInt64Array::from(row_ids)),
-            ],
-        )
+        let batch = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(UInt32Array::from(values)),
+            Arc::new(UInt64Array::from(row_ids)),
+        ])
         .unwrap();
 
         let stream = stream::once(async move { Ok(batch) });
@@ -1341,20 +1326,15 @@ pub mod tests {
             .expect("Failed to load remapped bitmap index");
 
         // Verify the null bitmap was remapped correctly
-        let expected_null_addrs: Vec<u64> = vec![
-            RowAddress::new_from_parts(3, 0).into(),
-            RowAddress::new_from_parts(3, 1).into(),
-        ];
+        let expected_null_addrs: Vec<u64> =
+            vec![RowAddress::new_from_parts(3, 0).into(), RowAddress::new_from_parts(3, 1).into()];
         let actual_null_addrs: Vec<u64> = reloaded_idx
             .null_map
             .row_addrs()
             .unwrap()
             .map(u64::from)
             .collect();
-        assert_eq!(
-            actual_null_addrs, expected_null_addrs,
-            "Null bitmap not remapped correctly"
-        );
+        assert_eq!(actual_null_addrs, expected_null_addrs, "Null bitmap not remapped correctly");
 
         // Search for value 1 and verify remapped addresses
         let query = SargableQuery::Equals(ScalarValue::UInt32(Some(1)));
@@ -1412,10 +1392,7 @@ pub mod tests {
                 .map(u64::from)
                 .collect();
             actual.sort();
-            assert_eq!(
-                actual, expected_null_addrs,
-                "Null search results not correct"
-            );
+            assert_eq!(actual, expected_null_addrs, "Null search results not correct");
         }
     }
 
@@ -1469,7 +1446,7 @@ pub mod tests {
                 let null_rows: Vec<u64> =
                     null_row_ids.row_addrs().unwrap().map(u64::from).collect();
                 assert_eq!(null_rows, vec![2], "Should report row 2 as null");
-            }
+            },
             _ => panic!("Expected Exact search result"),
         }
 
@@ -1485,19 +1462,13 @@ pub mod tests {
                     .unwrap()
                     .map(u64::from)
                     .collect();
-                assert_eq!(
-                    actual_rows,
-                    vec![2],
-                    "IsNull should find row 2 where value is null"
-                );
+                assert_eq!(actual_rows, vec![2], "IsNull should find row 2 where value is null");
 
                 let null_row_ids = row_addrs.null_rows();
-                // When querying FOR nulls, null_row_ids should be None (nulls are the TRUE result)
-                assert!(
-                    null_row_ids.is_empty(),
-                    "null_row_ids should be None for IsNull query"
-                );
-            }
+                // When querying FOR nulls, null_row_ids should be None (nulls are the TRUE
+                // result)
+                assert!(null_row_ids.is_empty(), "null_row_ids should be None for IsNull query");
+            },
             _ => panic!("Expected Exact search result"),
         }
 
@@ -1524,7 +1495,7 @@ pub mod tests {
                 let null_rows: Vec<u64> =
                     null_row_ids.row_addrs().unwrap().map(u64::from).collect();
                 assert_eq!(null_rows, vec![2], "Should report row 2 as null");
-            }
+            },
             _ => panic!("Expected Exact search result"),
         }
     }

@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::{
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
+
 use arrow_array::{Array, ArrayRef, LargeBinaryArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream};
 use futures::Stream;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
 
 /// Transform jsonb stream into json text stream
 pub struct JsonTextStream {
@@ -17,7 +20,10 @@ pub struct JsonTextStream {
 
 impl JsonTextStream {
     pub fn new(inner: SendableRecordBatchStream, jsonb_col: String) -> Self {
-        Self { inner, jsonb_col }
+        Self {
+            inner,
+            jsonb_col,
+        }
     }
 }
 
@@ -56,7 +62,7 @@ impl Stream for JsonTextStream {
                 let new_schema = Arc::new(Schema::new(new_schema));
                 let mapped = RecordBatch::try_new(new_schema, cols).unwrap();
                 Poll::Ready(Some(Ok(mapped)))
-            }
+            },
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
@@ -66,11 +72,7 @@ impl Stream for JsonTextStream {
 
 impl RecordBatchStream for JsonTextStream {
     fn schema(&self) -> SchemaRef {
-        Arc::new(Schema::new(vec![Field::new(
-            &self.jsonb_col,
-            DataType::Utf8,
-            true,
-        )]))
+        Arc::new(Schema::new(vec![Field::new(&self.jsonb_col, DataType::Utf8, true)]))
     }
 }
 
@@ -97,15 +99,19 @@ pub fn jsonb_to_json(col: &ArrayRef, col_name: &str) -> lance_core::Result<Array
 
 #[cfg(test)]
 mod tests {
-    use crate::scalar::inverted::json::JsonTextStream;
-    use arrow_array::builder::{LargeBinaryBuilder, UInt64Builder};
-    use arrow_array::cast::AsArray;
-    use arrow_array::{ArrayRef, RecordBatch};
+    use std::sync::Arc;
+
+    use arrow_array::{
+        builder::{LargeBinaryBuilder, UInt64Builder},
+        cast::AsArray,
+        ArrayRef, RecordBatch,
+    };
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::{stream, TryStreamExt};
     use serde_json::Value;
-    use std::sync::Arc;
+
+    use crate::scalar::inverted::json::JsonTextStream;
 
     #[tokio::test]
     async fn test_json_text_stream() {
@@ -129,13 +135,10 @@ mod tests {
             Field::new("rowid", DataType::UInt64, false),
         ]));
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(jsonb_builder.finish()) as ArrayRef,
-                Arc::new(rowid_builder.finish()) as ArrayRef,
-            ],
-        )
+        let batch = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(jsonb_builder.finish()) as ArrayRef,
+            Arc::new(rowid_builder.finish()) as ArrayRef,
+        ])
         .unwrap();
 
         let stream = Box::pin(RecordBatchStreamAdapter::new(

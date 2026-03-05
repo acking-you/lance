@@ -3,16 +3,16 @@
 
 use std::io::Write;
 
-use super::builder::BLOCK_SIZE;
-use arrow::array::{AsArray, LargeBinaryBuilder};
-use arrow::array::{ListBuilder, UInt32Builder};
+use arrow::array::{AsArray, LargeBinaryBuilder, ListBuilder, UInt32Builder};
 use arrow_array::{Array, ListArray};
 use bitpacking::{BitPacker, BitPacker4x};
 use lance_core::Result;
 
-// we compress the posting list to multiple blocks of fixed number of elements (BLOCK_SIZE),
-// returns a LargeBinaryArray, where each binary is a compressed block (128 row ids + 128 frequencies)
-// each block is:
+use super::builder::BLOCK_SIZE;
+
+// we compress the posting list to multiple blocks of fixed number of elements
+// (BLOCK_SIZE), returns a LargeBinaryArray, where each binary is a compressed
+// block (128 row ids + 128 frequencies) each block is:
 // - 4 bytes for the max block score
 // - 4 bytes for the first doc id
 // - 1 byte for the number of bits used to pack the doc ids
@@ -26,8 +26,9 @@ use lance_core::Result;
 // - 4*n bytes for the frequencies
 // where n is the number of elements in the block
 
-// compress the posting list to multiple blocks of fixed number of elements (BLOCK_SIZE),
-// returns a LargeBinaryArray, where each binary is a compressed block (128 row ids + 128 frequencies)
+// compress the posting list to multiple blocks of fixed number of elements
+// (BLOCK_SIZE), returns a LargeBinaryArray, where each binary is a compressed
+// block (128 row ids + 128 frequencies)
 pub fn compress_posting_list<'a>(
     length: usize,
     doc_ids: impl Iterator<Item = &'a u32>,
@@ -40,14 +41,8 @@ pub fn compress_posting_list<'a>(
         // write the max score of the block
         let max_score = block_max_scores.next().unwrap();
         let _ = builder.write(max_score.to_le_bytes().as_ref())?;
-        compress_remainder(
-            doc_ids.copied().collect::<Vec<_>>().as_slice(),
-            &mut builder,
-        )?;
-        compress_remainder(
-            frequencies.copied().collect::<Vec<_>>().as_slice(),
-            &mut builder,
-        )?;
+        compress_remainder(doc_ids.copied().collect::<Vec<_>>().as_slice(), &mut builder)?;
+        compress_remainder(frequencies.copied().collect::<Vec<_>>().as_slice(), &mut builder)?;
         builder.append_value("");
         return Ok(builder.finish());
     }
@@ -351,10 +346,11 @@ pub fn decompress_remainder(compressed: &[u8], n: usize, dest: &mut Vec<u32>) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use arrow::array::Array;
     use itertools::Itertools;
     use rand::Rng;
+
+    use super::*;
 
     #[test]
     fn test_compress_posting_list() -> Result<()> {

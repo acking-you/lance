@@ -10,10 +10,9 @@ use std::{
 use arrow_array::{Array, LargeBinaryArray, RecordBatch, StructArray, UInt8Array};
 use arrow_schema::{DataType, Field, Field as ArrowField, Schema};
 use async_trait::async_trait;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::{
     execution::SendableRecordBatchStream,
-    physical_plan::{projection::ProjectionExec, ExecutionPlan},
+    physical_plan::{projection::ProjectionExec, stream::RecordBatchStreamAdapter, ExecutionPlan},
 };
 use datafusion_common::{config::ConfigOptions, ScalarValue};
 use datafusion_expr::{Expr, Operator, ScalarUDF};
@@ -23,14 +22,15 @@ use datafusion_physical_expr::{
 };
 use deepsize::DeepSizeOf;
 use futures::StreamExt;
-use lance_datafusion::exec::{get_session_context, LanceExecutionOptions, OneShotExec};
-use lance_datafusion::udf::json::JsonbType;
+use lance_core::{cache::LanceCache, error::LanceOptionExt, Error, Result, ROW_ID};
+use lance_datafusion::{
+    exec::{get_session_context, LanceExecutionOptions, OneShotExec},
+    udf::json::JsonbType,
+};
 use prost::Message;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use snafu::location;
-
-use lance_core::{cache::LanceCache, error::LanceOptionExt, Error, Result, ROW_ID};
 
 use crate::{
     frag_reuse::FragReuseIndex,
@@ -57,7 +57,10 @@ pub struct JsonIndex {
 
 impl JsonIndex {
     pub fn new(target_index: Arc<dyn ScalarIndex>, path: String) -> Self {
-        Self { target_index, path }
+        Self {
+            target_index,
+            path,
+        }
     }
 }
 
@@ -82,8 +85,8 @@ impl Index for JsonIndex {
     }
 
     fn index_type(&self) -> IndexType {
-        // TODO: This causes the index to appear as btree in list_indices call.  Need better logic
-        // in list_indices to use details instead of index_type.
+        // TODO: This causes the index to appear as btree in list_indices call.  Need
+        // better logic in list_indices to use details instead of index_type.
         IndexType::Scalar
     }
 
@@ -138,11 +141,11 @@ impl ScalarIndex for JsonIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        valid_old_fragments: Option<&RoaringBitmap>,
+        old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
         let target_created = self
             .target_index
-            .update(new_data, dest_store, valid_old_fragments)
+            .update(new_data, dest_store, old_data_filter)
             .await?;
         let json_details = crate::pb::JsonIndexDetails {
             path: self.path.clone(),
@@ -172,10 +175,12 @@ pub struct JsonIndexParameters {
     path: String,
 }
 
-// TODO: Do we really need to wrap the query or could we just return the target query directly?
+// TODO: Do we really need to wrap the query or could we just return the target
+// query directly?
 //
-// I think the only thing we really gain is a different format impl (e.g. it shows up as a json query
-// in the explain plan) but I don't know if that helps the user much.
+// I think the only thing we really gain is a different format impl (e.g. it
+// shows up as a json query in the explain plan) but I don't know if that helps
+// the user much.
 #[derive(Debug, Clone)]
 pub struct JsonQuery {
     target_query: Arc<dyn AnyQuery>,
@@ -184,7 +189,10 @@ pub struct JsonQuery {
 
 impl JsonQuery {
     pub fn new(target_query: Arc<dyn AnyQuery>, path: String) -> Self {
-        Self { target_query, path }
+        Self {
+            target_query,
+            path,
+        }
     }
 }
 
@@ -323,8 +331,8 @@ impl ScalarQueryParser for JsonQueryParser {
                 if udf.args.len() != 2 {
                     return None;
                 }
-                // We already know index 0 is a column reference to the column so we just need to
-                // ensure that index 1 matches our path
+                // We already know index 0 is a column reference to the column so we just need
+                // to ensure that index 1 matches our path
                 match &udf.args[1] {
                     Expr::Literal(ScalarValue::Utf8(Some(path)), _) => {
                         if path == &self.path {
@@ -339,10 +347,10 @@ impl ScalarQueryParser for JsonQueryParser {
                         } else {
                             None
                         }
-                    }
+                    },
                     _ => None,
                 }
-            }
+            },
             _ => None,
         }
     }
@@ -502,7 +510,8 @@ impl JsonIndexPlugin {
         Ok((recreated_stream, inferred_type))
     }
 
-    /// Convert the stream with JSONB values and type tags to properly typed values
+    /// Convert the stream with JSONB values and type tags to properly typed
+    /// values
     async fn convert_stream_by_type(
         data: SendableRecordBatchStream,
         target_type: DataType,
@@ -572,14 +581,14 @@ impl JsonIndexPlugin {
                                         .into(),
                                         location: location!(),
                                     });
-                                }
+                                },
                             }
                         } else {
                             builder.append_null();
                         }
                     }
                     Arc::new(builder.finish())
-                }
+                },
                 DataType::Int64 => {
                     let mut builder =
                         arrow_array::builder::Int64Builder::with_capacity(binary_array.len());
@@ -600,14 +609,14 @@ impl JsonIndexPlugin {
                                         .into(),
                                         location: location!(),
                                     });
-                                }
+                                },
                             }
                         } else {
                             builder.append_null();
                         }
                     }
                     Arc::new(builder.finish())
-                }
+                },
                 DataType::Float64 => {
                     let mut builder =
                         arrow_array::builder::Float64Builder::with_capacity(binary_array.len());
@@ -616,7 +625,8 @@ impl JsonIndexPlugin {
                             builder.append_null();
                         } else if let Some(bytes) = binary_array.value(i).into() {
                             let raw_jsonb = jsonb::RawJsonb::new(bytes);
-                            // Try to deserialize directly to f64 (serde handles int->float conversion)
+                            // Try to deserialize directly to f64 (serde handles int->float
+                            // conversion)
                             match jsonb::from_raw_jsonb::<f64>(&raw_jsonb) {
                                 Ok(float_val) => builder.append_value(float_val),
                                 Err(e) => {
@@ -628,14 +638,14 @@ impl JsonIndexPlugin {
                                         .into(),
                                         location: location!(),
                                     });
-                                }
+                                },
                             }
                         } else {
                             builder.append_null();
                         }
                     }
                     Arc::new(builder.finish())
-                }
+                },
                 DataType::Utf8 => {
                     let mut builder = arrow_array::builder::StringBuilder::with_capacity(
                         binary_array.len(),
@@ -652,24 +662,24 @@ impl JsonIndexPlugin {
                                 Err(_) => {
                                     // For non-string types, convert to string representation
                                     builder.append_value(raw_jsonb.to_string());
-                                }
+                                },
                             }
                         } else {
                             builder.append_null();
                         }
                     }
                     Arc::new(builder.finish())
-                }
+                },
                 DataType::LargeBinary => {
                     // Keep as binary for array/object types
                     value_array.clone()
-                }
+                },
                 _ => {
                     return Err(Error::InvalidInput {
                         source: format!("Unsupported target type: {:?}", target_type).into(),
                         location: location!(),
                     });
-                }
+                },
             };
 
             // Get row_id column
@@ -766,12 +776,11 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
             crate::pb::JsonIndexDetails::decode(index_details.value.as_slice()).unwrap();
         let target_details = json_details.target_details.as_ref().expect_ok().unwrap();
         let target_plugin = registry.get_plugin_by_details(target_details).unwrap();
-        // TODO: Use something like ${index_name}_${path} for the index name?  Don't have access to path here tho
+        // TODO: Use something like ${index_name}_${path} for the index name?  Don't
+        // have access to path here tho
         let target_parser = target_plugin.new_query_parser(index_name, index_details)?;
-        Some(Box::new(JsonQueryParser::new(
-            json_details.path.clone(),
-            target_parser,
-        )) as Box<dyn ScalarQueryParser>)
+        Some(Box::new(JsonQueryParser::new(json_details.path.clone(), target_parser))
+            as Box<dyn ScalarQueryParser>)
     }
 
     async fn train_index(
@@ -810,13 +819,7 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         )?;
 
         let target_index = target_plugin
-            .train_index(
-                converted_stream,
-                index_store,
-                target_request,
-                fragment_ids,
-                progress,
-            )
+            .train_index(converted_stream, index_store, target_request, fragment_ids, progress)
             .await?;
 
         let index_details = crate::pb::JsonIndexDetails {
@@ -861,10 +864,12 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::sync::Arc;
+
     use arrow_array::{ArrayRef, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
-    use std::sync::Arc;
+
+    use super::*;
 
     // Note: The old test_detect_json_value_type test has been removed as we now use
     // JSONB's inherent type information instead of string-based type detection
@@ -903,19 +908,15 @@ mod tests {
         );
         let row_ids = UInt64Array::from(vec![1, 2, 3]);
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(jsonb_array) as ArrayRef,
-                Arc::new(row_ids) as ArrayRef,
-            ],
-        )
+        let batch = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(jsonb_array) as ArrayRef,
+            Arc::new(row_ids) as ArrayRef,
+        ])
         .unwrap();
 
-        let stream = Box::pin(RecordBatchStreamAdapter::new(
-            schema.clone(),
-            stream::iter(vec![Ok(batch)]),
-        )) as SendableRecordBatchStream;
+        let stream =
+            Box::pin(RecordBatchStreamAdapter::new(schema.clone(), stream::iter(vec![Ok(batch)])))
+                as SendableRecordBatchStream;
 
         // Test type inference for integer field
         let (_result_stream, inferred_type) =
@@ -926,35 +927,31 @@ mod tests {
         assert_eq!(inferred_type, DataType::Int64);
 
         // Create new test stream for boolean field
-        let batch2 = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(LargeBinaryArray::from(vec![
-                    json_data[0]
-                        .parse::<jsonb::OwnedJsonb>()
-                        .ok()
-                        .map(|j| j.to_vec())
-                        .as_deref(),
-                    json_data[1]
-                        .parse::<jsonb::OwnedJsonb>()
-                        .ok()
-                        .map(|j| j.to_vec())
-                        .as_deref(),
-                    json_data[2]
-                        .parse::<jsonb::OwnedJsonb>()
-                        .ok()
-                        .map(|j| j.to_vec())
-                        .as_deref(),
-                ])) as ArrayRef,
-                Arc::new(UInt64Array::from(vec![1, 2, 3])) as ArrayRef,
-            ],
-        )
+        let batch2 = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(LargeBinaryArray::from(vec![
+                json_data[0]
+                    .parse::<jsonb::OwnedJsonb>()
+                    .ok()
+                    .map(|j| j.to_vec())
+                    .as_deref(),
+                json_data[1]
+                    .parse::<jsonb::OwnedJsonb>()
+                    .ok()
+                    .map(|j| j.to_vec())
+                    .as_deref(),
+                json_data[2]
+                    .parse::<jsonb::OwnedJsonb>()
+                    .ok()
+                    .map(|j| j.to_vec())
+                    .as_deref(),
+            ])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![1, 2, 3])) as ArrayRef,
+        ])
         .unwrap();
 
-        let stream2 = Box::pin(RecordBatchStreamAdapter::new(
-            schema.clone(),
-            stream::iter(vec![Ok(batch2)]),
-        )) as SendableRecordBatchStream;
+        let stream2 =
+            Box::pin(RecordBatchStreamAdapter::new(schema.clone(), stream::iter(vec![Ok(batch2)])))
+                as SendableRecordBatchStream;
 
         // Test type inference for boolean field
         let (_, inferred_type) =
@@ -965,35 +962,31 @@ mod tests {
         assert_eq!(inferred_type, DataType::Boolean);
 
         // Create test stream for string field
-        let batch3 = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(LargeBinaryArray::from(vec![
-                    json_data[0]
-                        .parse::<jsonb::OwnedJsonb>()
-                        .ok()
-                        .map(|j| j.to_vec())
-                        .as_deref(),
-                    json_data[1]
-                        .parse::<jsonb::OwnedJsonb>()
-                        .ok()
-                        .map(|j| j.to_vec())
-                        .as_deref(),
-                    json_data[2]
-                        .parse::<jsonb::OwnedJsonb>()
-                        .ok()
-                        .map(|j| j.to_vec())
-                        .as_deref(),
-                ])) as ArrayRef,
-                Arc::new(UInt64Array::from(vec![1, 2, 3])) as ArrayRef,
-            ],
-        )
+        let batch3 = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(LargeBinaryArray::from(vec![
+                json_data[0]
+                    .parse::<jsonb::OwnedJsonb>()
+                    .ok()
+                    .map(|j| j.to_vec())
+                    .as_deref(),
+                json_data[1]
+                    .parse::<jsonb::OwnedJsonb>()
+                    .ok()
+                    .map(|j| j.to_vec())
+                    .as_deref(),
+                json_data[2]
+                    .parse::<jsonb::OwnedJsonb>()
+                    .ok()
+                    .map(|j| j.to_vec())
+                    .as_deref(),
+            ])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![1, 2, 3])) as ArrayRef,
+        ])
         .unwrap();
 
-        let stream3 = Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            stream::iter(vec![Ok(batch3)]),
-        )) as SendableRecordBatchStream;
+        let stream3 =
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream::iter(vec![Ok(batch3)])))
+                as SendableRecordBatchStream;
 
         // Test type inference for string field
         let (_, inferred_type) =
