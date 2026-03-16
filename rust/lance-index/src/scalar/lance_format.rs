@@ -1,36 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Utilities for serializing and deserializing scalar indices in the lance
-//! format
+//! Utilities for serializing and deserializing scalar indices in the lance format
 
-use std::{any::Any, cmp::min, collections::HashMap, sync::Arc};
-
+use super::{IndexReader, IndexStore, IndexWriter};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
-use lance_core::{cache::LanceCache, Error, Result};
+use lance_core::{Error, Result, cache::LanceCache};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_file::{
-    previous::{
-        reader::FileReader as PreviousFileReader,
-        writer::{FileWriter as PreviousFileWriter, ManifestProvider as PreviousManifestProvider},
-    },
-    reader::{self as current_reader, FileReaderOptions, ReaderProjection},
-    writer as current_writer,
+use lance_file::previous::{
+    reader::FileReader as PreviousFileReader,
+    writer::{FileWriter as PreviousFileWriter, ManifestProvider as PreviousManifestProvider},
 };
-use lance_io::{
-    object_store::ObjectStore,
-    scheduler::{ScanScheduler, SchedulerConfig},
-    utils::CachedFileSize,
-    ReadBatchParams,
-};
+use lance_file::reader::{self as current_reader, FileReaderOptions, ReaderProjection};
+use lance_file::writer as current_writer;
+use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_io::utils::CachedFileSize;
+use lance_io::{ReadBatchParams, object_store::ObjectStore};
 use lance_table::format::SelfDescribingFileReader;
 use object_store::path::Path;
-
-use super::{IndexReader, IndexStore, IndexWriter};
+use std::cmp::min;
+use std::collections::HashMap;
+use std::{any::Any, sync::Arc};
 
 /// An index store that serializes scalar indices using the lance format
 ///
@@ -60,8 +54,10 @@ impl LanceIndexStore {
         index_dir: Path,
         metadata_cache: Arc<LanceCache>,
     ) -> Self {
-        let scheduler =
-            ScanScheduler::new(object_store.clone(), SchedulerConfig::max_bandwidth(&object_store));
+        let scheduler = ScanScheduler::new(
+            object_store.clone(),
+            SchedulerConfig::max_bandwidth(&object_store),
+        );
         Self {
             object_store,
             index_dir,
@@ -157,7 +153,9 @@ impl IndexReader for current_reader::FileReader {
         projection: Option<&[&str]>,
     ) -> Result<RecordBatch> {
         if range.is_empty() {
-            return Ok(RecordBatch::new_empty(Arc::new(self.schema().as_ref().into())));
+            return Ok(RecordBatch::new_empty(Arc::new(
+                self.schema().as_ref().into(),
+            )));
         }
         let projection = if let Some(projection) = projection {
             ReaderProjection::from_column_names(
@@ -241,10 +239,7 @@ impl IndexStore for LanceIndexStore {
             Ok(reader) => Ok(Arc::new(reader)),
             Err(e) => {
                 // If the error is a version conflict we can try to read the file with v1 reader
-                if let Error::VersionConflict {
-                    ..
-                } = e
-                {
+                if let Error::VersionConflict { .. } = e {
                     let path = self.index_dir.child(name);
                     let file_reader = PreviousFileReader::try_new_self_described(
                         &self.object_store,
@@ -256,7 +251,7 @@ impl IndexStore for LanceIndexStore {
                 } else {
                     Err(e)
                 }
-            },
+            }
         }
     }
 
@@ -266,13 +261,12 @@ impl IndexStore for LanceIndexStore {
         let other_store = dest_store.as_any().downcast_ref::<Self>();
         match other_store {
             Some(dest_store) if dest_store.object_store.scheme() == self.object_store.scheme() => {
-                // If both this store and the destination are lance stores we can use
-                // object_store's copy This does blindly assume that both stores
-                // are using the same underlying object_store but there is no
-                // easy way to verify this and it happens to always be true at the moment
+                // If both this store and the destination are lance stores we can use object_store's copy
+                // This does blindly assume that both stores are using the same underlying object_store
+                // but there is no easy way to verify this and it happens to always be true at the moment
                 let dest_path = dest_store.index_dir.child(name);
                 self.object_store.copy(&path, &dest_path).await
-            },
+            }
             _ => {
                 let reader = self.open_index_file(name).await?;
                 let mut writer = dest_store
@@ -287,7 +281,7 @@ impl IndexStore for LanceIndexStore {
                 writer.finish().await?;
 
                 Ok(())
-            },
+            }
         }
     }
 
@@ -309,39 +303,34 @@ pub mod tests {
 
     use std::{collections::HashMap, ops::Bound};
 
+    use crate::metrics::NoOpMetricsCollector;
+    use crate::pbold;
+    use crate::scalar::bitmap::BitmapIndexPlugin;
+    use crate::scalar::btree::{BTreeIndexPlugin, BTreeParameters};
+    use crate::scalar::label_list::LabelListIndexPlugin;
+    use crate::scalar::registry::{ScalarIndexPlugin, VALUE_COLUMN_NAME};
+    use crate::scalar::{
+        LabelListQuery, SargableQuery, ScalarIndex, SearchResult,
+        bitmap::BitmapIndex,
+        btree::{DEFAULT_BTREE_BATCH_SIZE, train_btree_index},
+    };
+
+    use super::*;
     use arrow::{buffer::ScalarBuffer, datatypes::UInt8Type};
     use arrow_array::{
+        ListArray, RecordBatchIterator, RecordBatchReader, StringArray, UInt64Array,
         cast::AsArray,
         types::{Int32Type, UInt64Type},
-        ListArray, RecordBatchIterator, RecordBatchReader, StringArray, UInt64Array,
     };
-    use arrow_schema::{DataType, Field, Schema as ArrowSchema, TimeUnit};
+    use arrow_schema::Schema as ArrowSchema;
+    use arrow_schema::{DataType, Field, TimeUnit};
     use arrow_select::take::TakeOptions;
     use datafusion_common::ScalarValue;
     use futures::FutureExt;
-    use lance_core::{
-        utils::{
-            mask::{RowAddrTreeMap, RowSetOps},
-            tempfile::TempDir,
-        },
-        ROW_ID,
-    };
-    use lance_datagen::{array, gen_batch, ArrayGeneratorExt, BatchCount, ByteCount, RowCount};
-
-    use super::*;
-    use crate::{
-        metrics::NoOpMetricsCollector,
-        pbold,
-        scalar::{
-            bitmap::{BitmapIndex, BitmapIndexPlugin},
-            btree::{
-                train_btree_index, BTreeIndexPlugin, BTreeParameters, DEFAULT_BTREE_BATCH_SIZE,
-            },
-            label_list::LabelListIndexPlugin,
-            registry::{ScalarIndexPlugin, VALUE_COLUMN_NAME},
-            LabelListQuery, SargableQuery, ScalarIndex, SearchResult,
-        },
-    };
+    use lance_core::ROW_ID;
+    use lance_core::utils::mask::{RowAddrTreeMap, RowSetOps};
+    use lance_core::utils::tempfile::TempDir;
+    use lance_datagen::{ArrayGeneratorExt, BatchCount, ByteCount, RowCount, array, gen_batch};
 
     fn test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
         let test_path = tempdir.obj_path();
@@ -349,7 +338,9 @@ pub mod tests {
             .now_or_never()
             .unwrap()
             .unwrap();
-        let cache = Arc::new(lance_core::cache::LanceCache::with_capacity(128 * 1024 * 1024));
+        let cache = Arc::new(lance_core::cache::LanceCache::with_capacity(
+            128 * 1024 * 1024,
+        ));
         Arc::new(LanceIndexStore::new(object_store, test_path, cache))
     }
 
@@ -367,7 +358,10 @@ pub mod tests {
         let btree_plugin = BTreeIndexPlugin;
         let data = lance_datafusion::utils::reader_to_stream(Box::new(data));
         let request = btree_plugin
-            .new_training_request(&params, &Field::new(VALUE_COLUMN_NAME, DataType::Int32, false))
+            .new_training_request(
+                &params,
+                &Field::new(VALUE_COLUMN_NAME, DataType::Int32, false),
+            )
             .unwrap();
         btree_plugin
             .train_index(
@@ -406,7 +400,10 @@ pub mod tests {
             .unwrap();
 
         let result = index
-            .search(&SargableQuery::Equals(ScalarValue::Int32(Some(10000))), &NoOpMetricsCollector)
+            .search(
+                &SargableQuery::Equals(ScalarValue::Int32(Some(10000))),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
 
@@ -468,7 +465,10 @@ pub mod tests {
             .unwrap();
 
         let data = gen_batch()
-            .col(VALUE_COLUMN_NAME, array::step_custom::<Int32Type>(4096 * 100, 1))
+            .col(
+                VALUE_COLUMN_NAME,
+                array::step_custom::<Int32Type>(4096 * 100, 1),
+            )
             .col(ROW_ID, array::step_custom::<UInt64Type>(4096 * 100, 1))
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
 
@@ -493,7 +493,10 @@ pub mod tests {
             .unwrap();
 
         let result = updated_index
-            .search(&SargableQuery::Equals(ScalarValue::Int32(Some(10000))), &NoOpMetricsCollector)
+            .search(
+                &SargableQuery::Equals(ScalarValue::Int32(Some(10000))),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
 
@@ -530,20 +533,35 @@ pub mod tests {
         let tempdir = TempDir::default();
         let index_store = test_store(&tempdir);
         let batch_one = gen_batch()
-            .col(VALUE_COLUMN_NAME, array::cycle::<Int32Type>(vec![0, 1, 4, 5]))
+            .col(
+                VALUE_COLUMN_NAME,
+                array::cycle::<Int32Type>(vec![0, 1, 4, 5]),
+            )
             .col(ROW_ID, array::cycle::<UInt64Type>(vec![0, 1, 2, 3]))
             .into_batch_rows(RowCount::from(4));
         let batch_two = gen_batch()
-            .col(VALUE_COLUMN_NAME, array::cycle::<Int32Type>(vec![10, 11, 11, 15]))
+            .col(
+                VALUE_COLUMN_NAME,
+                array::cycle::<Int32Type>(vec![10, 11, 11, 15]),
+            )
             .col(ROW_ID, array::cycle::<UInt64Type>(vec![40, 50, 60, 70]))
             .into_batch_rows(RowCount::from(4));
         let batch_three = gen_batch()
-            .col(VALUE_COLUMN_NAME, array::cycle::<Int32Type>(vec![15, 15, 15, 15]))
+            .col(
+                VALUE_COLUMN_NAME,
+                array::cycle::<Int32Type>(vec![15, 15, 15, 15]),
+            )
             .col(ROW_ID, array::cycle::<UInt64Type>(vec![400, 500, 600, 700]))
             .into_batch_rows(RowCount::from(4));
         let batch_four = gen_batch()
-            .col(VALUE_COLUMN_NAME, array::cycle::<Int32Type>(vec![15, 16, 20, 20]))
-            .col(ROW_ID, array::cycle::<UInt64Type>(vec![4000, 5000, 6000, 7000]))
+            .col(
+                VALUE_COLUMN_NAME,
+                array::cycle::<Int32Type>(vec![15, 16, 20, 20]),
+            )
+            .col(
+                ROW_ID,
+                array::cycle::<UInt64Type>(vec![4000, 5000, 6000, 7000]),
+            )
             .into_batch_rows(RowCount::from(4));
         let batches = vec![batch_one, batch_two, batch_three, batch_four];
         let schema = Arc::new(Schema::new(vec![
@@ -572,11 +590,19 @@ pub mod tests {
         // This will help us test various indexing corner cases
 
         // No results (off the left side)
-        check(&index, SargableQuery::Equals(ScalarValue::Int32(Some(-3))), &[]).await;
+        check(
+            &index,
+            SargableQuery::Equals(ScalarValue::Int32(Some(-3))),
+            &[],
+        )
+        .await;
 
         check(
             &index,
-            SargableQuery::Range(Bound::Unbounded, Bound::Included(ScalarValue::Int32(Some(-3)))),
+            SargableQuery::Range(
+                Bound::Unbounded,
+                Bound::Included(ScalarValue::Int32(Some(-3))),
+            ),
             &[],
         )
         .await;
@@ -592,42 +618,75 @@ pub mod tests {
         .await;
 
         // Hitting the middle of a bucket
-        check(&index, SargableQuery::Equals(ScalarValue::Int32(Some(4))), &[2]).await;
+        check(
+            &index,
+            SargableQuery::Equals(ScalarValue::Int32(Some(4))),
+            &[2],
+        )
+        .await;
 
         // Hitting a gap between two buckets
-        check(&index, SargableQuery::Equals(ScalarValue::Int32(Some(7))), &[]).await;
+        check(
+            &index,
+            SargableQuery::Equals(ScalarValue::Int32(Some(7))),
+            &[],
+        )
+        .await;
 
         // Hitting the lowest of the overlapping buckets
-        check(&index, SargableQuery::Equals(ScalarValue::Int32(Some(11))), &[50, 60]).await;
+        check(
+            &index,
+            SargableQuery::Equals(ScalarValue::Int32(Some(11))),
+            &[50, 60],
+        )
+        .await;
 
         // Hitting the 15 shared on all three buckets
-        check(&index, SargableQuery::Equals(ScalarValue::Int32(Some(15))), &[
-            70, 400, 500, 600, 700, 4000,
-        ])
+        check(
+            &index,
+            SargableQuery::Equals(ScalarValue::Int32(Some(15))),
+            &[70, 400, 500, 600, 700, 4000],
+        )
         .await;
 
         // Hitting the upper part of the three overlapping buckets
-        check(&index, SargableQuery::Equals(ScalarValue::Int32(Some(20))), &[6000, 7000]).await;
+        check(
+            &index,
+            SargableQuery::Equals(ScalarValue::Int32(Some(20))),
+            &[6000, 7000],
+        )
+        .await;
 
         // Ranges that capture multiple buckets
         check(
             &index,
-            SargableQuery::Range(Bound::Unbounded, Bound::Included(ScalarValue::Int32(Some(11)))),
+            SargableQuery::Range(
+                Bound::Unbounded,
+                Bound::Included(ScalarValue::Int32(Some(11))),
+            ),
             &[0, 1, 2, 3, 40, 50, 60],
         )
         .await;
 
         check(
             &index,
-            SargableQuery::Range(Bound::Unbounded, Bound::Excluded(ScalarValue::Int32(Some(11)))),
+            SargableQuery::Range(
+                Bound::Unbounded,
+                Bound::Excluded(ScalarValue::Int32(Some(11))),
+            ),
             &[0, 1, 2, 3, 40],
         )
         .await;
 
         check(
             &index,
-            SargableQuery::Range(Bound::Included(ScalarValue::Int32(Some(4))), Bound::Unbounded),
-            &[2, 3, 40, 50, 60, 70, 400, 500, 600, 700, 4000, 5000, 6000, 7000],
+            SargableQuery::Range(
+                Bound::Included(ScalarValue::Int32(Some(4))),
+                Bound::Unbounded,
+            ),
+            &[
+                2, 3, 40, 50, 60, 70, 400, 500, 600, 700, 4000, 5000, 6000, 7000,
+            ],
         )
         .await;
 
@@ -653,8 +712,13 @@ pub mod tests {
 
         check(
             &index,
-            SargableQuery::Range(Bound::Excluded(ScalarValue::Int32(Some(4))), Bound::Unbounded),
-            &[3, 40, 50, 60, 70, 400, 500, 600, 700, 4000, 5000, 6000, 7000],
+            SargableQuery::Range(
+                Bound::Excluded(ScalarValue::Int32(Some(4))),
+                Bound::Unbounded,
+            ),
+            &[
+                3, 40, 50, 60, 70, 400, 500, 600, 700, 4000, 5000, 6000, 7000,
+            ],
         )
         .await;
 
@@ -684,7 +748,9 @@ pub mod tests {
                 Bound::Excluded(ScalarValue::Int32(Some(-50))),
                 Bound::Excluded(ScalarValue::Int32(Some(1000))),
             ),
-            &[0, 1, 2, 3, 40, 50, 60, 70, 400, 500, 600, 700, 4000, 5000, 6000, 7000],
+            &[
+                0, 1, 2, 3, 40, 50, 60, 70, 400, 500, 600, 700, 4000, 5000, 6000, 7000,
+            ],
         )
         .await;
     }
@@ -779,10 +845,16 @@ pub mod tests {
         let tempdir = TempDir::default();
         let index_store = test_store(&tempdir);
         let batch = gen_batch()
-            .col(VALUE_COLUMN_NAME, array::rand_utf8(ByteCount::from(0), false).with_nulls(&[true]))
+            .col(
+                VALUE_COLUMN_NAME,
+                array::rand_utf8(ByteCount::from(0), false).with_nulls(&[true]),
+            )
             .col(ROW_ID, array::step::<UInt64Type>())
             .into_batch_rows(RowCount::from(4096));
-        assert_eq!(batch.as_ref().unwrap()[VALUE_COLUMN_NAME].null_count(), 4096);
+        assert_eq!(
+            batch.as_ref().unwrap()[VALUE_COLUMN_NAME].null_count(),
+            4096
+        );
         let batches = vec![batch];
         let schema = Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true),
@@ -791,9 +863,15 @@ pub mod tests {
         let data = RecordBatchIterator::new(batches, schema);
         let data = lance_datafusion::utils::reader_to_stream(Box::new(data));
 
-        train_btree_index(data, index_store.as_ref(), DEFAULT_BTREE_BATCH_SIZE, None, None)
-            .await
-            .unwrap();
+        train_btree_index(
+            data,
+            index_store.as_ref(),
+            DEFAULT_BTREE_BATCH_SIZE,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         let index = BTreeIndexPlugin
             .load_index(
@@ -857,16 +935,26 @@ pub mod tests {
             Field::new(ROW_ID, DataType::UInt64, false),
         ]));
 
-        let batch1 = RecordBatch::try_new(schema.clone(), vec![
-            Arc::new(StringArray::from(vec![Some("abcd"), None, Some("abcd")])),
-            Arc::new(UInt64Array::from(vec![1, 2, 3])),
-        ])
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![Some("abcd"), None, Some("abcd")])),
+                Arc::new(UInt64Array::from(vec![1, 2, 3])),
+            ],
+        )
         .unwrap();
 
-        let batch2 = RecordBatch::try_new(schema.clone(), vec![
-            Arc::new(StringArray::from(vec![Some("apple"), Some("hello"), Some("abcd")])),
-            Arc::new(UInt64Array::from(vec![4, 5, 6])),
-        ])
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some("apple"),
+                    Some("hello"),
+                    Some("abcd"),
+                ])),
+                Arc::new(UInt64Array::from(vec![4, 5, 6])),
+            ],
+        )
         .unwrap();
 
         let batches = vec![batch1, batch2];
@@ -878,7 +966,10 @@ pub mod tests {
             .unwrap();
 
         let result = index
-            .search(&SargableQuery::Equals(ScalarValue::Utf8(None)), &NoOpMetricsCollector)
+            .search(
+                &SargableQuery::Equals(ScalarValue::Utf8(None)),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
 
@@ -917,7 +1008,10 @@ pub mod tests {
             .unwrap();
 
         let result = index
-            .search(&SargableQuery::Equals(ScalarValue::Int32(Some(10000))), &NoOpMetricsCollector)
+            .search(
+                &SargableQuery::Equals(ScalarValue::Int32(Some(10000))),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
 
@@ -969,20 +1063,35 @@ pub mod tests {
         let tempdir = TempDir::default();
         let index_store = test_store(&tempdir);
         let batch_one = gen_batch()
-            .col(VALUE_COLUMN_NAME, array::cycle::<Int32Type>(vec![0, 1, 4, 5]))
+            .col(
+                VALUE_COLUMN_NAME,
+                array::cycle::<Int32Type>(vec![0, 1, 4, 5]),
+            )
             .col(ROW_ID, array::cycle::<UInt64Type>(vec![0, 1, 2, 3]))
             .into_batch_rows(RowCount::from(4));
         let batch_two = gen_batch()
-            .col(VALUE_COLUMN_NAME, array::cycle::<Int32Type>(vec![10, 11, 11, 15]))
+            .col(
+                VALUE_COLUMN_NAME,
+                array::cycle::<Int32Type>(vec![10, 11, 11, 15]),
+            )
             .col(ROW_ID, array::cycle::<UInt64Type>(vec![40, 50, 60, 70]))
             .into_batch_rows(RowCount::from(4));
         let batch_three = gen_batch()
-            .col(VALUE_COLUMN_NAME, array::cycle::<Int32Type>(vec![15, 15, 15, 15]))
+            .col(
+                VALUE_COLUMN_NAME,
+                array::cycle::<Int32Type>(vec![15, 15, 15, 15]),
+            )
             .col(ROW_ID, array::cycle::<UInt64Type>(vec![400, 500, 600, 700]))
             .into_batch_rows(RowCount::from(4));
         let batch_four = gen_batch()
-            .col(VALUE_COLUMN_NAME, array::cycle::<Int32Type>(vec![15, 16, 20, 20]))
-            .col(ROW_ID, array::cycle::<UInt64Type>(vec![4000, 5000, 6000, 7000]))
+            .col(
+                VALUE_COLUMN_NAME,
+                array::cycle::<Int32Type>(vec![15, 16, 20, 20]),
+            )
+            .col(
+                ROW_ID,
+                array::cycle::<UInt64Type>(vec![4000, 5000, 6000, 7000]),
+            )
             .into_batch_rows(RowCount::from(4));
         let batches = vec![batch_one, batch_two, batch_three, batch_four];
         let schema = Arc::new(Schema::new(vec![
@@ -1005,11 +1114,19 @@ pub mod tests {
         // This will help us test various indexing corner cases
 
         // No results (off the left side)
-        check_bitmap(&index, SargableQuery::Equals(ScalarValue::Int32(Some(-3))), &[]).await;
+        check_bitmap(
+            &index,
+            SargableQuery::Equals(ScalarValue::Int32(Some(-3))),
+            &[],
+        )
+        .await;
 
         check_bitmap(
             &index,
-            SargableQuery::Range(Bound::Unbounded, Bound::Included(ScalarValue::Int32(Some(-3)))),
+            SargableQuery::Range(
+                Bound::Unbounded,
+                Bound::Included(ScalarValue::Int32(Some(-3))),
+            ),
             &[],
         )
         .await;
@@ -1025,43 +1142,75 @@ pub mod tests {
         .await;
 
         // Hitting the middle of a bucket
-        check_bitmap(&index, SargableQuery::Equals(ScalarValue::Int32(Some(4))), &[2]).await;
+        check_bitmap(
+            &index,
+            SargableQuery::Equals(ScalarValue::Int32(Some(4))),
+            &[2],
+        )
+        .await;
 
         // Hitting a gap between two buckets
-        check_bitmap(&index, SargableQuery::Equals(ScalarValue::Int32(Some(7))), &[]).await;
+        check_bitmap(
+            &index,
+            SargableQuery::Equals(ScalarValue::Int32(Some(7))),
+            &[],
+        )
+        .await;
 
         // Hitting the lowest of the overlapping buckets
-        check_bitmap(&index, SargableQuery::Equals(ScalarValue::Int32(Some(11))), &[50, 60]).await;
+        check_bitmap(
+            &index,
+            SargableQuery::Equals(ScalarValue::Int32(Some(11))),
+            &[50, 60],
+        )
+        .await;
 
         // Hitting the 15 shared on all three buckets
-        check_bitmap(&index, SargableQuery::Equals(ScalarValue::Int32(Some(15))), &[
-            70, 400, 500, 600, 700, 4000,
-        ])
+        check_bitmap(
+            &index,
+            SargableQuery::Equals(ScalarValue::Int32(Some(15))),
+            &[70, 400, 500, 600, 700, 4000],
+        )
         .await;
 
         // Hitting the upper part of the three overlapping buckets
-        check_bitmap(&index, SargableQuery::Equals(ScalarValue::Int32(Some(20))), &[6000, 7000])
-            .await;
+        check_bitmap(
+            &index,
+            SargableQuery::Equals(ScalarValue::Int32(Some(20))),
+            &[6000, 7000],
+        )
+        .await;
 
         // Ranges that capture multiple buckets
         check_bitmap(
             &index,
-            SargableQuery::Range(Bound::Unbounded, Bound::Included(ScalarValue::Int32(Some(11)))),
+            SargableQuery::Range(
+                Bound::Unbounded,
+                Bound::Included(ScalarValue::Int32(Some(11))),
+            ),
             &[0, 1, 2, 3, 40, 50, 60],
         )
         .await;
 
         check_bitmap(
             &index,
-            SargableQuery::Range(Bound::Unbounded, Bound::Excluded(ScalarValue::Int32(Some(11)))),
+            SargableQuery::Range(
+                Bound::Unbounded,
+                Bound::Excluded(ScalarValue::Int32(Some(11))),
+            ),
             &[0, 1, 2, 3, 40],
         )
         .await;
 
         check_bitmap(
             &index,
-            SargableQuery::Range(Bound::Included(ScalarValue::Int32(Some(4))), Bound::Unbounded),
-            &[2, 3, 40, 50, 60, 70, 400, 500, 600, 700, 4000, 5000, 6000, 7000],
+            SargableQuery::Range(
+                Bound::Included(ScalarValue::Int32(Some(4))),
+                Bound::Unbounded,
+            ),
+            &[
+                2, 3, 40, 50, 60, 70, 400, 500, 600, 700, 4000, 5000, 6000, 7000,
+            ],
         )
         .await;
 
@@ -1087,8 +1236,13 @@ pub mod tests {
 
         check_bitmap(
             &index,
-            SargableQuery::Range(Bound::Excluded(ScalarValue::Int32(Some(4))), Bound::Unbounded),
-            &[3, 40, 50, 60, 70, 400, 500, 600, 700, 4000, 5000, 6000, 7000],
+            SargableQuery::Range(
+                Bound::Excluded(ScalarValue::Int32(Some(4))),
+                Bound::Unbounded,
+            ),
+            &[
+                3, 40, 50, 60, 70, 400, 500, 600, 700, 4000, 5000, 6000, 7000,
+            ],
         )
         .await;
 
@@ -1118,7 +1272,9 @@ pub mod tests {
                 Bound::Excluded(ScalarValue::Int32(Some(-50))),
                 Bound::Excluded(ScalarValue::Int32(Some(1000))),
             ),
-            &[0, 1, 2, 3, 40, 50, 60, 70, 400, 500, 600, 700, 4000, 5000, 6000, 7000],
+            &[
+                0, 1, 2, 3, 40, 50, 60, 70, 400, 500, 600, 700, 4000, 5000, 6000, 7000,
+            ],
         )
         .await;
     }
@@ -1156,7 +1312,10 @@ pub mod tests {
             .unwrap();
 
         let result = updated_index
-            .search(&SargableQuery::Equals(ScalarValue::Int32(Some(5000))), &NoOpMetricsCollector)
+            .search(
+                &SargableQuery::Equals(ScalarValue::Int32(Some(5000))),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
 
@@ -1203,26 +1362,41 @@ pub mod tests {
             .unwrap();
 
         // Remapped to new value
-        assert!(remapped_index
-            .search(&SargableQuery::Equals(ScalarValue::Int32(Some(5))), &NoOpMetricsCollector)
-            .await
-            .unwrap()
-            .row_addrs()
-            .selected(65));
+        assert!(
+            remapped_index
+                .search(
+                    &SargableQuery::Equals(ScalarValue::Int32(Some(5))),
+                    &NoOpMetricsCollector
+                )
+                .await
+                .unwrap()
+                .row_addrs()
+                .selected(65)
+        );
         // Deleted
-        assert!(remapped_index
-            .search(&SargableQuery::Equals(ScalarValue::Int32(Some(7))), &NoOpMetricsCollector)
-            .await
-            .unwrap()
-            .row_addrs()
-            .is_empty());
+        assert!(
+            remapped_index
+                .search(
+                    &SargableQuery::Equals(ScalarValue::Int32(Some(7))),
+                    &NoOpMetricsCollector
+                )
+                .await
+                .unwrap()
+                .row_addrs()
+                .is_empty()
+        );
         // Not remapped
-        assert!(remapped_index
-            .search(&SargableQuery::Equals(ScalarValue::Int32(Some(3))), &NoOpMetricsCollector)
-            .await
-            .unwrap()
-            .row_addrs()
-            .selected(3));
+        assert!(
+            remapped_index
+                .search(
+                    &SargableQuery::Equals(ScalarValue::Int32(Some(3))),
+                    &NoOpMetricsCollector
+                )
+                .await
+                .unwrap()
+                .row_addrs()
+                .selected(3)
+        );
     }
 
     async fn train_tag(
@@ -1271,8 +1445,7 @@ pub mod tests {
 
         let batch_reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
 
-        // This is probably enough data that we can be assured each tag is used at least
-        // once
+        // This is probably enough data that we can be assured each tag is used at least once
         train_tag(&index_store, batch_reader).await;
 
         // We scan through each list, if it was a match we run match_fn to check
@@ -1383,9 +1556,11 @@ pub mod tests {
             ),
             Field::new(ROW_ID, DataType::UInt64, false),
         ]));
-        let batch =
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(list_array), Arc::new(row_ids)])
-                .unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(list_array), Arc::new(row_ids)],
+        )
+        .unwrap();
 
         let batch_reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
         train_tag(&index_store, batch_reader).await;
@@ -1415,13 +1590,17 @@ pub mod tests {
                     .unwrap()
                     .map(u64::from)
                     .collect();
-                assert_eq!(actual_rows, vec![0], "Should find row 0 where list contains 1");
+                assert_eq!(
+                    actual_rows,
+                    vec![0],
+                    "Should find row 0 where list contains 1"
+                );
 
                 assert!(
                     row_ids.null_rows().is_empty(),
                     "null_row_ids should be empty when null elements are ignored"
                 );
-            },
+            }
             _ => panic!("Expected Exact search result"),
         }
     }

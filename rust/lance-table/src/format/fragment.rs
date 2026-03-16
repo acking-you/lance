@@ -12,13 +12,11 @@ use lance_file::{
 use lance_io::utils::CachedFileSize;
 use object_store::path::Path;
 use serde::{Deserialize, Serialize};
-use snafu::location;
 
-use crate::{
-    format::pb,
-    rowids::version::{
-        created_at_version_meta_to_pb, last_updated_at_version_meta_to_pb, RowDatasetVersionMeta,
-    },
+use crate::format::pb;
+
+use crate::rowids::version::{
+    RowDatasetVersionMeta, created_at_version_meta_to_pb, last_updated_at_version_meta_to_pb,
 };
 
 /// Lance Data File
@@ -135,7 +133,6 @@ impl DataFile {
                 return Err(Error::corrupt_file(
                     base_path.child(self.path.clone()),
                     "contained unsorted or duplicate field ids",
-                    location!(),
                 ));
             }
         } else if self.column_indices.len() < self.fields.len() {
@@ -144,7 +141,6 @@ impl DataFile {
             return Err(Error::corrupt_file(
                 base_path.child(self.path.clone()),
                 "contained fewer column_indices than fields",
-                location!(),
             ));
         }
         Ok(())
@@ -216,11 +212,10 @@ impl TryFrom<pb::DeletionFile> for DeletionFile {
             0 => DeletionFileType::Array,
             1 => DeletionFileType::Bitmap,
             _ => {
-                return Err(Error::NotSupported {
-                    source: "Unknown deletion file type".into(),
-                    location: location!(),
-                })
-            },
+                return Err(Error::not_supported_source(
+                    "Unknown deletion file type".into(),
+                ));
+            }
         };
         let num_deleted_rows =
             if value.num_deleted_rows == 0 { None } else { Some(value.num_deleted_rows as usize) };
@@ -439,13 +434,10 @@ impl Fragment {
                     file.file_minor_version,
                 )?;
                 if file_version != this_file_version {
-                    return Err(Error::invalid_input(
-                        format!(
-                            "All data files must have the same version.  Detected both {} and {}",
-                            file_version, this_file_version
-                        ),
-                        location!(),
-                    ));
+                    return Err(Error::invalid_input(format!(
+                        "All data files must have the same version.  Detected both {} and {}",
+                        file_version, this_file_version
+                    )));
                 }
             }
         }
@@ -529,7 +521,7 @@ mod tests {
         DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
     };
     use object_store::path::Path;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     use super::*;
 

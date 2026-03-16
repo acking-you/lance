@@ -11,7 +11,7 @@ use lance_io::{assert_io_eq, utils::tracking_store::IOTracker};
 
 use crate::{
     dataset::{
-        builder::DatasetBuilder, CommitBuilder, InsertBuilder, ReadParams, WriteMode, WriteParams,
+        CommitBuilder, InsertBuilder, ReadParams, WriteMode, WriteParams, builder::DatasetBuilder,
     },
     io::{ObjectStoreParams, StorageOptionsAccessor},
 };

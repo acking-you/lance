@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use fst::Streamer;
+use futures::{StreamExt, TryStreamExt, stream};
+use lance_core::{Error, Result, cache::LanceCache, utils::tokio::get_num_compute_intensive_cpus};
 use std::sync::Arc;
 
-use fst::Streamer;
-use futures::{stream, StreamExt, TryStreamExt};
-use lance_core::{cache::LanceCache, utils::tokio::get_num_compute_intensive_cpus, Error, Result};
-use snafu::location;
+use crate::progress::IndexBuildProgress;
+use crate::scalar::IndexStore;
 
 use super::{
-    builder::{doc_file_path, posting_file_path, token_file_path, InnerBuilder, PositionRecorder},
     InvertedPartition, PostingListBuilder, TokenMap, TokenSetFormat,
+    builder::{InnerBuilder, PositionRecorder, doc_file_path, posting_file_path, token_file_path},
 };
-use crate::{progress::IndexBuildProgress, scalar::IndexStore};
 
 pub trait Merger {
     // Merge the partitions and write new partitions,
@@ -30,10 +30,7 @@ pub(super) struct PartitionSource {
 
 impl PartitionSource {
     pub(super) fn new(store: std::sync::Arc<dyn IndexStore>, id: u64) -> Self {
-        Self {
-            store,
-            id,
-        }
+        Self { store, id }
     }
 
     async fn load(
@@ -97,11 +94,19 @@ impl<'a> SizeBasedMerger<'a> {
             log::info!("flushing partition {}", builder.id());
             let start = std::time::Instant::now();
             builder.write(self.dest_store).await?;
-            log::info!("flushed partition {} in {:?}", builder.id(), start.elapsed());
+            log::info!(
+                "flushed partition {} in {:?}",
+                builder.id(),
+                start.elapsed()
+            );
             self.partitions.push(builder.id());
             let with_position = self.with_position.expect("with_position must be set");
             let next_id = self.next_id;
-            self.builder = Some(InnerBuilder::new(next_id, with_position, self.token_set_format));
+            self.builder = Some(InnerBuilder::new(
+                next_id,
+                with_position,
+                self.token_set_format,
+            ));
             self.next_id += 1;
         }
         Ok(())
@@ -112,21 +117,23 @@ impl<'a> SizeBasedMerger<'a> {
         match self.with_position {
             Some(existing) => {
                 if existing != with_position {
-                    return Err(Error::Index {
-                        message: "partition position settings do not match".to_string(),
-                        location: location!(),
-                    });
+                    return Err(Error::index(
+                        "partition position settings do not match".to_string(),
+                    ));
                 }
-            },
+            }
             None => {
                 self.with_position = Some(with_position);
-            },
+            }
         }
 
         if self.builder.is_none() {
             let with_position = self.with_position.expect("with_position must be set");
-            self.builder =
-                Some(InnerBuilder::new(self.next_id, with_position, self.token_set_format));
+            self.builder = Some(InnerBuilder::new(
+                self.next_id,
+                with_position,
+                self.token_set_format,
+            ));
             self.next_id += 1;
         }
         Ok(())
@@ -160,7 +167,7 @@ impl<'a> SizeBasedMerger<'a> {
                     debug_assert!(index < token_id_map.len());
                     token_id_map[index] = new_token_id;
                 }
-            },
+            }
             TokenMap::Fst(map) => {
                 let mut stream = map.stream();
                 while let Some((token, token_id)) = stream.next() {
@@ -171,7 +178,7 @@ impl<'a> SizeBasedMerger<'a> {
                     debug_assert!(index < token_id_map.len());
                     token_id_map[index] = new_token_id;
                 }
-            },
+            }
         }
         let doc_id_offset = builder.docs.len() as u32;
         for (row_id, num_tokens) in part.docs.iter() {
@@ -243,8 +250,10 @@ impl Merger for SizeBasedMerger<'_> {
         let start = std::time::Instant::now();
         let parts = std::mem::take(&mut self.input);
         let num_parts = parts.len();
-        let buffer_size =
-            std::cmp::max(1, std::cmp::min(get_num_compute_intensive_cpus(), num_parts));
+        let buffer_size = std::cmp::max(
+            1,
+            std::cmp::min(get_num_compute_intensive_cpus(), num_parts),
+        );
         let cache = LanceCache::no_cache();
         let token_set_format = self.token_set_format;
         let mut stream = stream::iter(parts.into_iter().map(|part| {
@@ -261,7 +270,12 @@ impl Merger for SizeBasedMerger<'_> {
             self.progress
                 .stage_progress("merge_partitions", idx as u64)
                 .await?;
-            log::info!("merged {}/{} partitions in {:?}", idx, num_parts, start.elapsed());
+            log::info!(
+                "merged {}/{} partitions in {:?}",
+                idx,
+                num_parts,
+                start.elapsed()
+            );
         }
 
         self.flush().await?;
@@ -271,13 +285,13 @@ impl Merger for SizeBasedMerger<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use lance_core::{cache::LanceCache, utils::tempfile::TempObjDir};
-    use lance_io::object_store::ObjectStore;
-
     use super::*;
-    use crate::{metrics::NoOpMetricsCollector, scalar::lance_format::LanceIndexStore};
+    use crate::metrics::NoOpMetricsCollector;
+    use crate::scalar::lance_format::LanceIndexStore;
+    use lance_core::cache::LanceCache;
+    use lance_core::utils::tempfile::TempObjDir;
+    use lance_io::object_store::ObjectStore;
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn test_merge_reuses_token_ids_for_shared_tokens() -> Result<()> {

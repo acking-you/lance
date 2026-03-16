@@ -5,26 +5,26 @@ use std::sync::Arc;
 
 use futures::{FutureExt, TryStreamExt};
 use lance_core::{
-    utils::mask::{RowAddrTreeMap, RowSetOps},
     Error, Result,
+    utils::mask::{RowAddrTreeMap, RowSetOps},
 };
 use lance_index::{
     metrics::NoOpMetricsCollector,
     optimize::OptimizeOptions,
     progress::NoopIndexBuildProgress,
-    scalar::{lance_format::LanceIndexStore, CreatedIndex, OldIndexDataFilter},
-    VECTOR_INDEX_VERSION,
+    scalar::{CreatedIndex, OldIndexDataFilter, lance_format::LanceIndexStore},
 };
 use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
-use snafu::location;
 use uuid::Uuid;
 
-use super::{vector::ivf::optimize_vector_indices, DatasetIndexInternalExt};
-use crate::{
-    dataset::{index::LanceIndexStoreExt, rowids::load_row_id_sequences, Dataset},
-    index::{scalar::load_training_data, vector_index_details},
-};
+use super::DatasetIndexInternalExt;
+use super::vector::ivf::optimize_vector_indices;
+use crate::dataset::Dataset;
+use crate::dataset::index::LanceIndexStoreExt;
+use crate::dataset::rowids::load_row_id_sequences;
+use crate::index::scalar::load_training_data;
+use crate::index::vector_index_details;
 
 #[derive(Debug, Clone)]
 pub struct IndexMergeResults<'a> {
@@ -39,6 +39,11 @@ async fn build_stable_row_id_filter(
     dataset: &Dataset,
     effective_old_frags: &RoaringBitmap,
 ) -> Result<RowAddrTreeMap> {
+    // For stable row IDs we cannot derive fragment ownership from row_id bits.
+    // Instead, we:
+    // 1) keep only fragments still considered "effective" for the old index, and
+    // 2) load their persisted row-id sequences from dataset metadata, then
+    // 3) build one exact allow-list used to retain only still-valid old rows.
     let retained_frags = dataset
         .manifest
         .fragments
@@ -61,14 +66,14 @@ async fn build_stable_row_id_filter(
         .collect::<Vec<_>>();
     let row_id_map_refs = row_id_maps.iter().collect::<Vec<_>>();
 
+    // Merge all fragment-local row-id sets into one exact membership structure.
     Ok(<RowAddrTreeMap as RowSetOps>::union_all(&row_id_map_refs))
 }
 
 /// Merge in-inflight unindexed data, with a specific number of previous indices
 /// into a new index, to improve the query performance.
 ///
-/// The merge behavior is controlled by
-/// [`OptimizeOptions::num_indices_to_merge].
+/// The merge behavior is controlled by [`OptimizeOptions::num_indices_to_merge].
 ///
 /// Returns
 /// -------
@@ -81,18 +86,17 @@ pub async fn merge_indices<'a>(
     options: &OptimizeOptions,
 ) -> Result<Option<IndexMergeResults<'a>>> {
     if old_indices.is_empty() {
-        return Err(Error::Index {
-            message: "Append index: no previous index found".to_string(),
-            location: location!(),
-        });
+        return Err(Error::index(
+            "Append index: no previous index found".to_string(),
+        ));
     };
 
     let unindexed = dataset.unindexed_fragments(&old_indices[0].name).await?;
     merge_indices_with_unindexed_frags(dataset, old_indices, &unindexed, options).await
 }
 
-/// Merge a list of provided unindexed data, with a specific number of previous
-/// indices into a new index, to improve the query performance.
+/// Merge a list of provided unindexed data, with a specific number of previous indices
+/// into a new index, to improve the query performance.
 pub async fn merge_indices_with_unindexed_frags<'a>(
     dataset: Arc<Dataset>,
     old_indices: &[&'a IndexMetadata],
@@ -100,19 +104,18 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
     options: &OptimizeOptions,
 ) -> Result<Option<IndexMergeResults<'a>>> {
     if old_indices.is_empty() {
-        return Err(Error::Index {
-            message: "Append index: no previous index found".to_string(),
-            location: location!(),
-        });
+        return Err(Error::index(
+            "Append index: no previous index found".to_string(),
+        ));
     };
 
     let column = dataset
         .schema()
         .field_by_id(old_indices[0].fields[0])
-        .ok_or(Error::Index {
-            message: format!("Append index: column {} does not exist", old_indices[0].fields[0]),
-            location: location!(),
-        })?;
+        .ok_or(Error::index(format!(
+            "Append index: column {} does not exist",
+            old_indices[0].fields[0]
+        )))?;
 
     let field_path = dataset.schema().field_path(old_indices[0].fields[0])?;
     let mut indices = Vec::with_capacity(old_indices.len());
@@ -124,12 +127,13 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             Ok(index) => indices.push(index),
             Err(e) => {
                 log::warn!(
-                    "Cannot open index on column '{}': {}. Skipping index merge for this column.",
+                    "Cannot open index on column '{}': {}. \
+                     Skipping index merge for this column.",
                     field_path,
                     e
                 );
                 return Ok(None);
-            },
+            }
         }
     }
 
@@ -137,10 +141,10 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         .windows(2)
         .any(|w| w[0].index_type() != w[1].index_type())
     {
-        return Err(Error::Index {
-            message: format!("Append index: invalid index deltas: {:?}", old_indices),
-            location: location!(),
-        });
+        return Err(Error::index(format!(
+            "Append index: invalid index deltas: {:?}",
+            old_indices
+        )));
     }
 
     let mut frag_bitmap = RoaringBitmap::new();
@@ -172,8 +176,11 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
 
             let update_criteria = index.update_criteria();
 
-            let fragments =
-                if update_criteria.requires_old_data { None } else { Some(unindexed.to_vec()) };
+            let fragments = if update_criteria.requires_old_data {
+                None
+            } else {
+                Some(unindexed.to_vec())
+            };
             let new_data_stream = load_training_data(
                 dataset.as_ref(),
                 &field_path,
@@ -212,7 +219,9 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         build_stable_row_id_filter(dataset.as_ref(), &effective_old_frags).await?;
                     Some(OldIndexDataFilter::RowIds(valid_old_row_ids))
                 } else {
-                    Some(OldIndexDataFilter::Fragments(effective_old_frags.clone()))
+                    // Address-style row IDs encode fragment_id in high 32 bits.
+                    // Fragment bitmap filtering is valid and cheaper in this mode.
+                    Some(OldIndexDataFilter::Fragments(effective_old_frags))
                 };
                 index
                     .update(new_data_stream, &new_store, old_data_filter)
@@ -221,7 +230,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
 
             // TODO: don't hard-code index version
             Ok((new_uuid, 1, created_index))
-        },
+        }
         it if it.is_vector() => {
             let new_data_stream = if unindexed.is_empty() {
                 None
@@ -255,15 +264,22 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     frag_bitmap.extend(idx.fragment_bitmap.as_ref().unwrap().iter());
                 });
 
-            Ok((new_uuid, indices_merged, CreatedIndex {
-                index_details: vector_index_details(),
-                index_version: VECTOR_INDEX_VERSION,
-            }))
-        },
-        _ => Err(Error::Index {
-            message: format!("Append index: invalid index type: {:?}", indices[0].index_type()),
-            location: location!(),
-        }),
+            Ok((
+                new_uuid,
+                indices_merged,
+                CreatedIndex {
+                    index_details: vector_index_details(),
+                    // retain_supported_indices guarantees all old_indices have
+                    // index_version <= our max supported version, so we can safely
+                    // write the current library's version for this index type.
+                    index_version: it.version() as u32,
+                },
+            ))
+        }
+        _ => Err(Error::index(format!(
+            "Append index: invalid index type: {:?}",
+            indices[0].index_type()
+        ))),
     }?;
 
     let removed_indices = old_indices[old_indices.len() - indices_merged..].to_vec();
@@ -284,39 +300,35 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     use arrow::datatypes::{Float32Type, UInt32Type};
+    use arrow_array::cast::AsArray;
     use arrow_array::{
-        cast::AsArray, FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray,
-        UInt32Array,
+        FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray, UInt32Array,
     };
     use arrow_schema::{DataType, Field, Schema};
     use futures::TryStreamExt;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::utils::reader_to_stream;
-    use lance_datagen::{array, Dimension, RowCount};
+    use lance_datagen::{Dimension, RowCount, array};
+    use lance_index::vector::hnsw::builder::HnswBuildParams;
+    use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::{
-        optimize::OptimizeOptions,
-        scalar::ScalarIndexParams,
-        vector::{
-            hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams,
-            sq::builder::SQBuildParams,
-        },
         DatasetIndexExt, IndexType,
+        scalar::ScalarIndexParams,
+        vector::{ivf::IvfBuildParams, pq::PQBuildParams},
     };
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
     use rstest::rstest;
 
-    use super::*;
-    use crate::{
-        dataset::{
-            builder::DatasetBuilder, optimize::compact_files, MergeInsertBuilder, WhenMatched,
-            WhenNotMatched, WriteParams,
-        },
-        index::vector::VectorIndexParams,
-        utils::test::{DatagenExt, FragmentCount, FragmentRowCount},
-    };
+    use crate::dataset::builder::DatasetBuilder;
+    use crate::dataset::optimize::compact_files;
+    use crate::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteParams};
+    use crate::index::vector::VectorIndexParams;
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
     #[tokio::test]
     async fn test_append_index() {
@@ -362,11 +374,13 @@ mod tests {
         dataset.append(batches, None).await.unwrap();
 
         let index = &dataset.load_indices().await.unwrap()[0];
-        assert!(!dataset
-            .unindexed_fragments(&index.name)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            !dataset
+                .unindexed_fragments(&index.name)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         let q = array.value(5);
         let mut scanner = dataset.scan();
@@ -389,11 +403,13 @@ mod tests {
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
         let indices = dataset.load_indices().await.unwrap();
 
-        assert!(dataset
-            .unindexed_fragments(&index.name)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            dataset
+                .unindexed_fragments(&index.name)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         // There should be two indices directories existed.
         let object_store = dataset.object_store();
@@ -423,7 +439,11 @@ mod tests {
         let mut num_rows = 0;
         for index in indices.iter() {
             let index = dataset
-                .open_vector_index("vector", index.uuid.to_string().as_str(), &NoOpMetricsCollector)
+                .open_vector_index(
+                    "vector",
+                    index.uuid.to_string().as_str(),
+                    &NoOpMetricsCollector,
+                )
                 .await
                 .unwrap();
             num_rows += index.num_rows();
@@ -465,10 +485,13 @@ mod tests {
             Field::new("id", DataType::UInt32, false),
         ]));
         let array = Arc::new(FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap());
-        let batch = RecordBatch::try_new(schema.clone(), vec![
-            array.clone(),
-            Arc::new(UInt32Array::from_iter_values(0..TOTAL as u32)),
-        ])
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                array.clone(),
+                Arc::new(UInt32Array::from_iter_values(0..TOTAL as u32)),
+            ],
+        )
         .unwrap();
 
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
@@ -483,10 +506,15 @@ mod tests {
         assert_eq!(stats["num_indexed_fragments"], 1);
         assert_eq!(stats["num_unindexed_fragments"], 0);
 
-        let batch = RecordBatch::try_new(schema.clone(), vec![
-            array.clone(),
-            Arc::new(UInt32Array::from_iter_values(TOTAL as u32..(TOTAL * 2) as u32)),
-        ])
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                array.clone(),
+                Arc::new(UInt32Array::from_iter_values(
+                    TOTAL as u32..(TOTAL * 2) as u32,
+                )),
+            ],
+        )
         .unwrap();
 
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
@@ -533,7 +561,10 @@ mod tests {
         let mut dataset = lance_datagen::gen_batch()
             .col("id", array::step::<UInt32Type>())
             .col("value", array::cycle_utf8_literals(&["a", "b", "c"]))
-            .col("vector", array::rand_vec::<Float32Type>(Dimension::from(64)))
+            .col(
+                "vector",
+                array::rand_vec::<Float32Type>(Dimension::from(64)),
+            )
             .into_dataset_with_params(
                 test_uri,
                 FragmentCount(1),
@@ -726,11 +757,13 @@ mod tests {
         let frags = dataset.get_fragments();
         assert!(!frags.is_empty());
         assert!(frags.iter().all(|frag| frag.id() > 0));
-        assert!(dataset
-            .unindexed_fragments("id_idx")
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            dataset
+                .unindexed_fragments("id_idx")
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         dataset
             .optimize_indices(&OptimizeOptions::default())

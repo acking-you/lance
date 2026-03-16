@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::{ops::Range, sync::Arc};
-
 use lance_arrow::DataTypeExt;
 use lance_core::Error;
 use lance_encoding::{
@@ -21,7 +20,6 @@ use lance_io::{
 use lance_table::format::{DataFile, Fragment};
 use prost::Message;
 use prost_types::Any;
-use snafu::location;
 use tokio::io::AsyncWriteExt;
 
 use crate::{
@@ -196,7 +194,6 @@ pub async fn rewrite_files_binary_copy(
     if fragments.is_empty() || fragments.iter().any(|fragment| fragment.files.is_empty()) {
         return Err(Error::invalid_input(
             "binary copy requires at least one data file",
-            location!(),
         ));
     }
 
@@ -435,15 +432,11 @@ pub async fn rewrite_files_binary_copy(
                         .encode_to_vec();
                     let baseline_bytes = &baseline_col_encoding_bytes[col_idx];
                     if src_col_encoding_bytes != *baseline_bytes {
-                        return Err(Error::Execution {
-                            message: format!(
-                                "binary copy: The ColumnEncoding of column {} is incompatible \
-                                 with the first file, making it impossible to safely concatenate \
-                                 buffers",
-                                col_idx
-                            ),
-                            location: location!(),
-                        });
+                        return Err(Error::execution(format!(
+                            "binary copy: The ColumnEncoding of column {} is incompatible with the first file, \
+                            making it impossible to safely concatenate buffers",
+                            col_idx
+                        )));
                     }
                     let ranges: Vec<Range<u64>> = src_column_info
                         .buffer_offsets_and_sizes

@@ -2,9 +2,9 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_schema::{DataType, Field};
-use lance_arrow::{json::JSON_EXT_NAME, ARROW_EXT_NAME_KEY};
+use lance_arrow::ARROW_EXT_NAME_KEY;
+use lance_arrow::json::JSON_EXT_NAME;
 use serde_json::Value;
-use snafu::location;
 use tantivy::tokenizer::{BoxTokenStream, Token, TokenStream};
 
 /// Document type for full text search.
@@ -33,18 +33,16 @@ impl TryFrom<&Field> for DocType {
                 if matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) =>
             {
                 Ok(Self::Text)
-            },
+            }
             DataType::LargeBinary => match field.metadata().get(ARROW_EXT_NAME_KEY) {
                 Some(name) if name.as_str() == JSON_EXT_NAME => Ok(Self::Json),
-                _ => Err(lance_core::Error::InvalidInput {
-                    source: format!("field {} is not json", field.name()).into(),
-                    location: location!(),
-                }),
+                _ => Err(lance_core::Error::invalid_input_source(
+                    format!("field {} is not json", field.name()).into(),
+                )),
             },
-            _ => Err(lance_core::Error::InvalidInput {
-                source: format!("field {} is not json", field.name()).into(),
-                location: location!(),
-            }),
+            _ => Err(lance_core::Error::invalid_input_source(
+                format!("field {} is not json", field.name()).into(),
+            )),
         }
     }
 }
@@ -56,13 +54,13 @@ impl DocType {
     pub fn prefix_len(&self, token: &str) -> usize {
         match self {
             Self::Json => {
-                if let Some(pos) = token.find(',') {
-                    if let Some(second_pos) = token[pos + 1..].find(',') {
-                        return pos + second_pos + 2;
-                    }
+                if let Some(pos) = token.find(',')
+                    && let Some(second_pos) = token[pos + 1..].find(',')
+                {
+                    return pos + second_pos + 2;
                 }
                 panic!("json token must be in format of <path>,<type>,<value>")
-            },
+            }
             Self::Text => 0,
         }
     }
@@ -70,13 +68,12 @@ impl DocType {
 
 /// Lance full text search tokenizer.
 ///
-/// `LanceTokenizer` defines 2 methods for tokenization, normally they are the
-/// same, but sometimes tokenizer needs different behavior for search and index.
-/// Take json document as an example:
-/// 1. Query text is a triplet <path,type,value>, something like `a.b,str,123`.
-///    We shouldn't use json in search, because it would be too complicated.
+/// `LanceTokenizer` defines 2 methods for tokenization, normally they are the same, but sometimes
+/// tokenizer needs different behavior for search and index. Take json document as an example:
+/// 1. Query text is a triplet <path,type,value>, something like `a.b,str,123`. We shouldn't use
+///    json in search, because it would be too complicated.
 /// 2. Document text is a json string.
-pub trait LanceTokenizer: Send + Sync {
+pub trait LanceTokenizer: Send + Sync + std::fmt::Debug {
     /// Tokenize query text for search.
     fn token_stream_for_search<'a>(&'a mut self, query_text: &'a str) -> BoxTokenStream<'a>;
     /// Tokenize document text for index.
@@ -98,11 +95,15 @@ pub struct TextTokenizer {
     tokenizer: tantivy::tokenizer::TextAnalyzer,
 }
 
+impl std::fmt::Debug for TextTokenizer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TextTokenizer")
+    }
+}
+
 impl TextTokenizer {
     pub fn new(tokenizer: tantivy::tokenizer::TextAnalyzer) -> Self {
-        Self {
-            tokenizer,
-        }
+        Self { tokenizer }
     }
 }
 
@@ -131,19 +132,20 @@ pub struct JsonTokenizer {
 
 impl JsonTokenizer {
     pub fn new(tokenizer: tantivy::tokenizer::TextAnalyzer) -> Self {
-        Self {
-            tokenizer,
-        }
+        Self { tokenizer }
+    }
+}
+
+impl std::fmt::Debug for JsonTokenizer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "JsonTokenizer")
     }
 }
 
 impl LanceTokenizer for JsonTokenizer {
     fn token_stream_for_search<'a>(&'a mut self, query_text: &'a str) -> BoxTokenStream<'a> {
         let tokens = flatten_triplet(query_text, &mut self.tokenizer).unwrap();
-        BoxTokenStream::new(TTStream {
-            tokens,
-            index: 0,
-        })
+        BoxTokenStream::new(TTStream { tokens, index: 0 })
     }
 
     fn token_stream_for_doc<'a>(&'a mut self, text: &'a str) -> BoxTokenStream<'a> {
@@ -151,15 +153,12 @@ impl LanceTokenizer for JsonTokenizer {
             Ok(v) => v,
             Err(e) => {
                 panic!("JSON parse error: {:?}", e);
-            },
+            }
         };
         let mut tokens = vec![];
         let mut position = 0;
         flatten_json(&value, "", &mut tokens, &mut position, &mut self.tokenizer);
-        BoxTokenStream::new(TTStream {
-            tokens,
-            index: 0,
-        })
+        BoxTokenStream::new(TTStream { tokens, index: 0 })
     }
 
     fn box_clone(&self) -> Box<dyn LanceTokenizer> {
@@ -181,10 +180,9 @@ fn flatten_triplet(
     for triple in text.split(';') {
         let parts: Vec<&str> = triple.splitn(3, ',').collect();
         if parts.len() != 3 {
-            return Err(lance_core::Error::InvalidInput {
-                source: format!("Invalid triple format: {}", triple).into(),
-                location: location!(),
-            });
+            return Err(lance_core::Error::invalid_input_source(
+                format!("Invalid triple format: {}", triple).into(),
+            ));
         }
         let field = parts[0];
         let v_type = parts[1];
@@ -201,7 +199,7 @@ fn flatten_triplet(
                 };
                 token_vec.push(token);
                 idx += 1;
-            },
+            }
             "str" => {
                 let mut tokens = tokenizer.token_stream(value);
                 while let Some(token) = tokens.next() {
@@ -214,13 +212,12 @@ fn flatten_triplet(
                     });
                     idx += 1;
                 }
-            },
+            }
             _ => {
-                return Err(lance_core::Error::InvalidInput {
-                    source: format!("Invalid triple type: {}", v_type).into(),
-                    location: location!(),
-                })
-            },
+                return Err(lance_core::Error::invalid_input_source(
+                    format!("Invalid triple type: {}", v_type).into(),
+                ));
+            }
         }
     }
     Ok(token_vec)
@@ -236,16 +233,19 @@ fn flatten_json(
     match value {
         Value::Object(map) => {
             for (k, v) in map {
-                let next_prefix =
-                    if prefix.is_empty() { k.clone() } else { format!("{}.{}", prefix, k) };
+                let next_prefix = if prefix.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{}.{}", prefix, k)
+                };
                 flatten_json(v, &next_prefix, out, position, tokenizer);
             }
-        },
+        }
         Value::Array(arr) => {
             for v in arr.iter() {
                 flatten_json(v, prefix, out, position, tokenizer);
             }
-        },
+        }
         Value::String(text) => {
             let mut tokens = tokenizer.token_stream(text);
             while let Some(token) = tokens.next() {
@@ -259,7 +259,7 @@ fn flatten_json(
                 *position += 1;
                 out.push(token);
             }
-        },
+        }
         _ => {
             let value_type = match value {
                 Value::Null => "null",
@@ -276,7 +276,7 @@ fn flatten_json(
             };
             *position += 1;
             out.push(token);
-        },
+        }
     }
 }
 
@@ -306,12 +306,11 @@ impl TokenStream for TTStream {
 
 #[cfg(test)]
 mod tests {
+    use crate::scalar::inverted::tokenizer::lance_tokenizer::{
+        JsonTokenizer, LanceTokenizer, flatten_json, flatten_triplet,
+    };
     use serde_json::Value;
     use tantivy::tokenizer::{SimpleTokenizer, Token};
-
-    use crate::scalar::inverted::tokenizer::lance_tokenizer::{
-        flatten_json, flatten_triplet, JsonTokenizer, LanceTokenizer,
-    };
 
     #[test]
     fn test_json_tokenizer() {
@@ -387,7 +386,14 @@ mod tests {
     }
 
     fn assert_token(token: &Token, position: usize, text: &str) {
-        assert_eq!(token.position, position, "expected position {position} but {token:?}");
-        assert_eq!(token.text.as_str(), text, "expected text {text} but {token:?}");
+        assert_eq!(
+            token.position, position,
+            "expected position {position} but {token:?}"
+        );
+        assert_eq!(
+            token.text.as_str(),
+            text,
+            "expected text {text} but {token:?}"
+        );
     }
 }

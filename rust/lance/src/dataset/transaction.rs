@@ -52,32 +52,31 @@ use std::{
     sync::Arc,
 };
 
+use super::ManifestWriteConfig;
+use super::write::merge_insert::inserted_rows::KeyExistenceFilter;
+use crate::dataset::transaction::UpdateMode::RewriteRows;
+use crate::index::mem_wal::update_mem_wal_index_merged_generations;
+use crate::utils::temporal::timestamp_to_nanos;
 use deepsize::DeepSizeOf;
-use lance_core::{datatypes::Schema, Error, Result};
+use lance_core::{Error, Result, datatypes::Schema};
 use lance_file::{datatypes::Fields, version::LanceFileVersion};
 use lance_index::{frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index, mem_wal::MergedGeneration};
 use lance_io::object_store::ObjectStore;
+use lance_table::feature_flags::{FLAG_STABLE_ROW_IDS, apply_feature_flags};
+use lance_table::rowids::read_row_ids;
 use lance_table::{
-    feature_flags::{apply_feature_flags, FLAG_STABLE_ROW_IDS},
     format::{
-        pb, BasePath, DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, RowIdMeta,
+        BasePath, DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, RowIdMeta, pb,
     },
     io::{
         commit::CommitHandler,
         manifest::{read_manifest, read_manifest_indexes},
     },
-    rowids::{read_row_ids, write_row_ids, RowIdSequence},
+    rowids::{RowIdSequence, write_row_ids},
 };
 use object_store::path::Path;
 use roaring::RoaringBitmap;
-use snafu::location;
 use uuid::Uuid;
-
-use super::{write::merge_insert::inserted_rows::KeyExistenceFilter, ManifestWriteConfig};
-use crate::{
-    dataset::transaction::UpdateMode::RewriteRows,
-    index::mem_wal::update_mem_wal_index_merged_generations, utils::temporal::timestamp_to_nanos,
-};
 
 /// A change to a dataset that can be retried
 ///
@@ -2656,17 +2655,13 @@ impl Transaction {
     ) -> Result<DataStorageFormat> {
         if let Some(file_version) = Fragment::try_infer_version(fragments)? {
             // Ensure user-requested matches data files
-            if let Some(user_requested) = user_requested {
-                if user_requested != file_version {
-                    return Err(Error::invalid_input(
-                        format!(
-                            "User requested data storage version ({}) does not match version in \
-                             data files ({})",
-                            user_requested, file_version
-                        ),
-                        location!(),
-                    ));
-                }
+            if let Some(user_requested) = user_requested
+                && user_requested != file_version
+            {
+                return Err(Error::invalid_input(format!(
+                    "User requested data storage version ({}) does not match version in data files ({})",
+                    user_requested, file_version
+                )));
             }
             Ok(DataStorageFormat::new(file_version))
         } else {
@@ -2715,10 +2710,9 @@ impl Transaction {
                 .map(|m| !m.uses_stable_row_ids())
                 .unwrap_or_default()
         {
-            return Err(Error::NotSupported {
-                source: "Cannot enable stable row ids on existing dataset".into(),
-                location: location!(),
-            });
+            return Err(Error::not_supported_source(
+                "Cannot enable stable row ids on existing dataset".into(),
+            ));
         }
         let mut reference_paths = match current_manifest {
             Some(m) => m.base_paths.clone(),
@@ -2735,13 +2729,10 @@ impl Transaction {
                 // Validate uniqueness and insert them into the manifest
                 for base_path in initial_bases.iter() {
                     if reference_paths.contains_key(&base_path.id) {
-                        return Err(Error::invalid_input(
-                            format!(
-                                "Duplicate base path ID {} detected. Base path IDs must be unique.",
-                                base_path.id
-                            ),
-                            location!(),
-                        ));
+                        return Err(Error::invalid_input(format!(
+                            "Duplicate base path ID {} detected. Base path IDs must be unique.",
+                            base_path.id
+                        )));
                     }
                     reference_paths.insert(base_path.id, base_path.clone());
                 }
@@ -2749,9 +2740,7 @@ impl Transaction {
                 // OVERWRITE mode with initial_bases should have been rejected by validation
                 // This branch should never be reached
                 return Err(Error::invalid_input(
-                    "OVERWRITE mode cannot register new bases. This should have been caught by \
-                     validation.",
-                    location!(),
+                    "OVERWRITE mode cannot register new bases. This should have been caught by validation.",
                 ));
             }
         }
@@ -2771,10 +2760,9 @@ impl Transaction {
                 if let Some(current_manifest) = current_manifest {
                     current_manifest.schema.clone()
                 } else {
-                    return Err(Error::Internal {
-                        message: "Cannot create a new dataset without a schema".to_string(),
-                        location: location!(),
-                    });
+                    return Err(Error::internal(
+                        "Cannot create a new dataset without a schema".to_string(),
+                    ));
                 }
             },
         };
@@ -2799,37 +2787,30 @@ impl Transaction {
                 (None, true) => Some(0),
                 (_, false) => None,
                 (Some(_), true) => {
-                    return Err(Error::NotSupported {
-                        source: "Cannot enable stable row ids on existing dataset".into(),
-                        location: location!(),
-                    });
-                },
+                    return Err(Error::not_supported_source(
+                        "Cannot enable stable row ids on existing dataset".into(),
+                    ));
+                }
             }
         };
 
         let maybe_existing_fragments =
             current_manifest
                 .map(|m| m.fragments.as_ref())
-                .ok_or_else(|| Error::Internal {
-                    message: format!(
+                .ok_or_else(|| {
+                    Error::internal(format!(
                         "No current manifest was provided while building manifest for operation {}",
                         self.operation.name()
-                    ),
-                    location: location!(),
+                    ))
                 });
 
         match &self.operation {
-            Operation::Clone {
-                ..
-            } => {
-                return Err(Error::Internal {
-                    message: "Clone operation should not enter build_manifest.".to_string(),
-                    location: location!(),
-                })
-            },
-            Operation::Append {
-                ref fragments,
-            } => {
+            Operation::Clone { .. } => {
+                return Err(Error::internal(
+                    "Clone operation should not enter build_manifest.".to_string(),
+                ));
+            }
+            Operation::Append { fragments } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 let mut new_fragments =
                     Self::fragments_with_ids(fragments.clone(), &mut fragment_id)
@@ -2848,8 +2829,8 @@ impl Transaction {
                 final_fragments.extend(new_fragments);
             },
             Operation::Delete {
-                ref updated_fragments,
-                ref deleted_fragment_ids,
+                updated_fragments,
+                deleted_fragment_ids,
                 ..
             } => {
                 // Remove the deleted fragments
@@ -3025,12 +3006,11 @@ impl Transaction {
                                 lance_table::format::RowDatasetVersionMeta::from_sequence(
                                     &created_at_seq,
                                 )
-                                .map_err(|e| Error::Internal {
-                                    message: format!(
+                                .map_err(|e| {
+                                    Error::internal(format!(
                                         "Failed to create created_at version metadata: {}",
                                         e
-                                    ),
-                                    location: location!(),
+                                    ))
                                 })?,
                             );
 
@@ -3095,10 +3075,8 @@ impl Transaction {
                         merged_generations.clone(),
                     )?;
                 }
-            },
-            Operation::Overwrite {
-                ref fragments, ..
-            } => {
+            }
+            Operation::Overwrite { fragments, .. } => {
                 let mut new_fragments =
                     Self::fragments_with_ids(fragments.clone(), &mut fragment_id)
                         .collect::<Vec<_>>();
@@ -3117,9 +3095,9 @@ impl Transaction {
                 final_indices = Vec::new();
             },
             Operation::Rewrite {
-                ref groups,
-                ref rewritten_indices,
-                ref frag_reuse_index,
+                groups,
+                rewritten_indices,
+                frag_reuse_index,
             } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 let current_version = current_manifest.map(|m| m.version).unwrap_or_default();
@@ -3171,10 +3149,8 @@ impl Transaction {
                 ..
             } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
-            },
-            Operation::Merge {
-                ref fragments, ..
-            } => {
+            }
+            Operation::Merge { fragments, .. } => {
                 final_fragments.extend(fragments.clone());
 
                 // Some fields that have indices may have been removed, so we should
@@ -3208,13 +3184,10 @@ impl Transaction {
                 ..
             } => {
                 unreachable!()
-            },
-            Operation::DataReplacement {
-                replacements,
-            } => {
+            }
+            Operation::DataReplacement { replacements } => {
                 log::warn!(
-                    "Building manifest with DataReplacement operation. This operation is not \
-                     stable yet, please use with caution."
+                    "Building manifest with DataReplacement operation. This operation is not stable yet, please use with caution."
                 );
 
                 let (old_fragment_ids, new_datafiles): (Vec<&u64>, Vec<&DataFile>) = replacements
@@ -3240,13 +3213,9 @@ impl Transaction {
                             format!("{}File {}: {:?}\n", acc, id, fields)
                         });
 
-                    return Err(Error::invalid_input(
-                        format!(
-                            "All new data files must have the same fields, but found different \
-                             fields:\n{field_info}"
-                        ),
-                        location!(),
-                    ));
+                    return Err(Error::invalid_input(format!(
+                        "All new data files must have the same fields, but found different fields:\n{field_info}"
+                    )));
                 }
 
                 let existing_fragments = maybe_existing_fragments?;
@@ -3273,7 +3242,6 @@ impl Transaction {
                         .ok_or_else(|| {
                             Error::invalid_input(
                                 "Fragment being replaced not found in existing fragments",
-                                location!(),
                             )
                         })?;
                     let mut new_frag = frag.clone();
@@ -3312,11 +3280,7 @@ impl Transaction {
                     // Nothing changed in the current fragment, which is not expected -- error out
                     if &new_frag == frag {
                         return Err(Error::invalid_input(
-                            "Expected to modify the fragment but no changes were made. This means \
-                             the new data files does not align with any exiting datafiles. Please \
-                             check if the schema of the new data files matches the schema of the \
-                             old data files including the file major and minor versions",
-                            location!(),
+                            "Expected to modify the fragment but no changes were made. This means the new data files does not align with any exiting datafiles. Please check if the schema of the new data files matches the schema of the old data files including the file major and minor versions",
                         ));
                     }
                     final_fragments.push(new_frag);
@@ -3454,10 +3418,9 @@ impl Transaction {
                     if let Some(field) = manifest.schema.field_by_id_mut(*field_id) {
                         apply_update_map(&mut field.metadata, field_metadata_update);
                     } else {
-                        return Err(Error::InvalidInput {
-                            source: format!("Field with id {} does not exist", field_id).into(),
-                            location: location!(),
-                        });
+                        return Err(Error::invalid_input_source(
+                            format!("Field with id {} does not exist", field_id).into(),
+                        ));
                     }
                 }
             },
@@ -3477,14 +3440,10 @@ impl Transaction {
                     .values()
                     .find(|bp| bp.name == new_base.name || bp.path == new_base.path)
                 {
-                    return Err(Error::invalid_input(
-                        format!(
-                            "Conflict detected: Base path with name '{:?}' or path '{}' already \
-                             exists. Existing: name='{:?}', path='{}'",
-                            new_base.name, new_base.path, existing_base.name, existing_base.path
-                        ),
-                        location!(),
-                    ));
+                    return Err(Error::invalid_input(format!(
+                        "Conflict detected: Base path with name '{:?}' or path '{}' already exists. Existing: name='{:?}', path='{}'",
+                        new_base.name, new_base.path, existing_base.name, existing_base.path
+                    )));
                 }
 
                 // Assign a new ID if not already assigned
@@ -3538,20 +3497,20 @@ impl Transaction {
                 value_updated_field_set.contains(&u32::try_from(*field_id).unwrap())
             });
 
-            if !index_covers_modified_field {
-                if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
-                    // check if all the original fragments contains the updating rows are covered
-                    // by the index(index fragment bitmap contains these frag ids).
-                    // if not, that means not all the updating rows are indexed, so we could not
-                    // index them.
-                    let index_covers_all_original_fragments = original_fragment_ids
-                        .iter()
-                        .all(|&fragment_id| fragment_bitmap.contains(fragment_id as u32));
+            if !index_covers_modified_field
+                && let Some(fragment_bitmap) = &mut index.fragment_bitmap
+            {
+                // check if all the original fragments contains the updating rows are covered
+                // by the index(index fragment bitmap contains these frag ids).
+                // if not, that means not all the updating rows are indexed, so we could not
+                // index them.
+                let index_covers_all_original_fragments = original_fragment_ids
+                    .iter()
+                    .all(|&fragment_id| fragment_bitmap.contains(fragment_id as u32));
 
-                    if index_covers_all_original_fragments {
-                        for fragment_id in pure_update_frag_ids.iter().map(|f| *f as u32) {
-                            fragment_bitmap.insert(fragment_id);
-                        }
+                if index_covers_all_original_fragments {
+                    for fragment_id in pure_update_frag_ids.iter().map(|f| *f as u32) {
+                        fragment_bitmap.insert(fragment_id);
                     }
                 }
             }
@@ -3579,11 +3538,10 @@ impl Transaction {
                 .fields
                 .iter()
                 .any(|field_id| fields_modified_set.contains(&u32::try_from(*field_id).unwrap()))
+                && let Some(fragment_bitmap) = &mut index.fragment_bitmap
             {
-                if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
-                    for fragment_id in updated_fragments.iter().map(|f| f.id as u32) {
-                        fragment_bitmap.remove(fragment_id);
-                    }
+                for fragment_id in updated_fragments.iter().map(|f| f.id as u32) {
+                    fragment_bitmap.remove(fragment_id);
                 }
             }
         }
@@ -3673,10 +3631,10 @@ impl Transaction {
                     sorted_indices.sort_by_key(|index: &&IndexMetadata| index.dataset_version); // Sort by ascending dataset_version
 
                     // Keep only the first (oldest) if it's not a vector index
-                    if let Some(oldest) = sorted_indices.first() {
-                        if !Self::is_vector_index(oldest) {
-                            uuids_to_keep.insert(oldest.uuid);
-                        }
+                    if let Some(oldest) = sorted_indices.first()
+                        && !Self::is_vector_index(oldest)
+                    {
+                        uuids_to_keep.insert(oldest.uuid);
                     }
                 } else {
                     // At least one index has non-empty bitmap - keep all non-empty indices
@@ -3734,9 +3692,7 @@ impl Transaction {
                     new_bitmap.extend(group.new_fragments.iter().map(|frag| frag.id as u32));
                 } else {
                     return Err(Error::invalid_input(
-                        "The compaction plan included a rewrite group that was a split of indexed \
-                         and non-indexed data",
-                        location!(),
+                        "The compaction plan included a rewrite group that was a split of indexed and non-indexed data",
                     ));
                 }
             }
@@ -3753,14 +3709,10 @@ impl Transaction {
 
         for rewritten_index in rewritten_indices {
             if !modified_indices.insert(rewritten_index.old_id) {
-                return Err(Error::invalid_input(
-                    format!(
-                        "An invalid compaction plan must have been generated because multiple \
-                         tasks modified the same index: {}",
-                        rewritten_index.old_id
-                    ),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!(
+                    "An invalid compaction plan must have been generated because multiple tasks modified the same index: {}",
+                    rewritten_index.old_id
+                )));
             }
 
             // Skip indices that no longer exist (may have been removed by concurrent
@@ -3774,13 +3726,10 @@ impl Transaction {
 
             index.fragment_bitmap = Some(Self::recalculate_fragment_bitmap(
                 index.fragment_bitmap.as_ref().ok_or_else(|| {
-                    Error::invalid_input(
-                        format!(
-                            "Cannot rewrite index {} which did not store fragment bitmap",
-                            index.uuid
-                        ),
-                        location!(),
-                    )
+                    Error::invalid_input(format!(
+                        "Cannot rewrite index {} which did not store fragment bitmap",
+                        index.uuid
+                    ))
                 })?,
                 groups,
             )?);
@@ -3803,15 +3752,15 @@ impl Transaction {
                     .iter()
                     .enumerate()
                     .find(|(_, f)| f.id == group.old_fragments[0].id)
-                    .ok_or_else(|| Error::CommitConflict {
-                        version,
-                        source: format!(
-                            "dataset does not contain a fragment a rewrite operation wants to \
-                             replace: id={}",
-                            group.old_fragments[0].id
+                    .ok_or_else(|| {
+                        Error::commit_conflict_source(
+                            version,
+                            format!(
+                                "dataset does not contain a fragment a rewrite operation wants to replace: id={}",
+                                group.old_fragments[0].id
+                            )
+                            .into(),
                         )
-                        .into(),
-                        location: location!(),
                     })?
                     .0;
 
@@ -3855,10 +3804,10 @@ impl Transaction {
         let mut pure_update_frag_ids = Vec::new();
 
         for fragment in fragments {
-            let physical_rows = fragment.physical_rows.ok_or_else(|| Error::Internal {
-                message: "Fragment does not have physical rows".into(),
-                location: location!(),
-            })? as u64;
+            let physical_rows = fragment
+                .physical_rows
+                .ok_or_else(|| Error::internal("Fragment does not have physical rows"))?
+                as u64;
 
             if let Some(row_id_meta) = &fragment.row_id_meta {
                 let existing_row_count = match row_id_meta {
@@ -3882,10 +3831,10 @@ impl Transaction {
 
     fn assign_row_ids(next_row_id: &mut u64, fragments: &mut [Fragment]) -> Result<()> {
         for fragment in fragments {
-            let physical_rows = fragment.physical_rows.ok_or_else(|| Error::Internal {
-                message: "Fragment does not have physical rows".into(),
-                location: location!(),
-            })? as u64;
+            let physical_rows = fragment
+                .physical_rows
+                .ok_or_else(|| Error::internal("Fragment does not have physical rows"))?
+                as u64;
 
             if fragment.row_id_meta.is_some() {
                 // we may meet merge insert case, it only has partial row ids.
@@ -3918,12 +3867,10 @@ impl Transaction {
                         let combined_sequence = match &fragment.row_id_meta {
                             Some(RowIdMeta::Inline(data)) => read_row_ids(data)?,
                             _ => {
-                                return Err(Error::Internal {
-                                    message: "Failed to deserialize existing row ID sequence"
-                                        .into(),
-                                    location: location!(),
-                                })
-                            },
+                                return Err(Error::internal(
+                                    "Failed to deserialize existing row ID sequence",
+                                ));
+                            }
                         };
 
                         let mut row_ids: Vec<u64> = combined_sequence.iter().collect();
@@ -3938,14 +3885,11 @@ impl Transaction {
                     },
                     Ordering::Greater => {
                         // More row IDs than physical rows - this shouldn't happen
-                        return Err(Error::Internal {
-                            message: format!(
-                                "Fragment has more row IDs ({}) than physical rows ({})",
-                                existing_row_count, physical_rows
-                            ),
-                            location: location!(),
-                        });
-                    },
+                        return Err(Error::internal(format!(
+                            "Fragment has more row IDs ({}) than physical rows ({})",
+                            existing_row_count, physical_rows
+                        )));
+                    }
                 }
             } else {
                 let row_ids = *next_row_id..(*next_row_id + physical_rows);
@@ -3983,7 +3927,6 @@ impl TryFrom<pb::transaction::DataReplacementGroup> for DataReplacementGroup {
                 .new_file
                 .ok_or(Error::invalid_input(
                     "DataReplacementGroup must have a new_file",
-                    location!(),
                 ))?
                 .try_into()?,
         ))
@@ -4176,10 +4119,9 @@ impl TryFrom<pb::Transaction> for Transaction {
 
                 // Error if both are present
                 if has_new_fields && has_old_fields {
-                    return Err(Error::InvalidInput {
-                        source: "Cannot mix old and new style UpdateConfig fields".into(),
-                        location: location!(),
-                    });
+                    return Err(Error::invalid_input_source(
+                        "Cannot mix old and new style UpdateConfig fields".into(),
+                    ));
                 }
 
                 if has_old_fields {
@@ -4266,11 +4208,10 @@ impl TryFrom<pb::Transaction> for Transaction {
                 new_bases: new_bases.into_iter().map(BasePath::from).collect(),
             },
             None => {
-                return Err(Error::Internal {
-                    message: "Transaction message did not contain an operation".to_string(),
-                    location: location!(),
-                });
-            },
+                return Err(Error::internal(
+                    "Transaction message did not contain an operation".to_string(),
+                ));
+            }
         };
         Ok(Self {
             read_version: message.read_version,
@@ -4296,29 +4237,20 @@ impl TryFrom<&pb::transaction::rewrite::RewrittenIndex> for RewrittenIndex {
                 .as_ref()
                 .map(Uuid::try_from)
                 .ok_or_else(|| {
-                    Error::invalid_input(
-                        "required field (old_id) missing from message".to_string(),
-                        location!(),
-                    )
+                    Error::invalid_input("required field (old_id) missing from message".to_string())
                 })??,
             new_id: message
                 .new_id
                 .as_ref()
                 .map(Uuid::try_from)
                 .ok_or_else(|| {
-                    Error::invalid_input(
-                        "required field (new_id) missing from message".to_string(),
-                        location!(),
-                    )
+                    Error::invalid_input("required field (new_id) missing from message".to_string())
                 })??,
             new_index_details: message
                 .new_index_details
                 .as_ref()
                 .ok_or_else(|| {
-                    Error::invalid_input(
-                        "new_index_details is a required field".to_string(),
-                        location!(),
-                    )
+                    Error::invalid_input("new_index_details is a required field".to_string())
                 })?
                 .clone(),
             new_index_version: message.new_index_version,
@@ -4607,11 +4539,11 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
         ) => return Ok(()),
         (Some(manifest), _) => manifest,
         (None, _) => {
-            return Err(Error::invalid_input(
-                format!("Cannot apply operation {} to non-existent dataset", operation.name()),
-                location!(),
-            ));
-        },
+            return Err(Error::invalid_input(format!(
+                "Cannot apply operation {} to non-existent dataset",
+                operation.name()
+            )));
+        }
     };
 
     match operation {
@@ -4654,19 +4586,19 @@ fn schema_fragments_valid(
     schema: &Schema,
     fragments: &[Fragment],
 ) -> Result<()> {
-    if let Some(manifest) = manifest {
-        if manifest.data_storage_format.lance_file_version()? == LanceFileVersion::Legacy {
-            return schema_fragments_legacy_valid(schema, fragments);
-        }
+    if let Some(manifest) = manifest
+        && manifest.data_storage_format.lance_file_version()? == LanceFileVersion::Legacy
+    {
+        return schema_fragments_legacy_valid(schema, fragments);
     }
     // validate that each data file at least contains one field.
     for fragment in fragments {
         for data_file in &fragment.files {
             if data_file.fields.iter().len() == 0 {
-                return Err(Error::invalid_input(
-                    format!("Datafile {} does not contain any fields", data_file.path),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!(
+                    "Datafile {} does not contain any fields",
+                    data_file.path
+                )));
             }
         }
     }
@@ -4687,10 +4619,10 @@ fn schema_fragments_legacy_valid(schema: &Schema, fragments: &[Fragment]) -> Res
                 .flat_map(|f| f.fields.iter())
                 .any(|f_id| f_id == &field.id)
             {
-                return Err(Error::invalid_input(
-                    format!("Fragment {} does not contain field {:?}", fragment.id, field),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!(
+                    "Fragment {} does not contain field {:?}",
+                    fragment.id, field
+                )));
             }
         }
     }
@@ -4707,15 +4639,12 @@ fn merge_fragments_valid(manifest: &Manifest, new_fragments: &[Fragment]) -> Res
     // Additional validation: ensure we're not accidentally reducing the fragment
     // count
     if new_fragments.len() < original_fragments.len() {
-        return Err(Error::invalid_input(
-            format!(
-                "Merge operation reduced fragment count from {} to {}. Merge operations should \
-                 only add columns, not reduce fragments.",
-                original_fragments.len(),
-                new_fragments.len()
-            ),
-            location!(),
-        ));
+        return Err(Error::invalid_input(format!(
+            "Merge operation reduced fragment count from {} to {}. \
+             Merge operations should only add columns, not reduce fragments.",
+            original_fragments.len(),
+            new_fragments.len()
+        )));
     }
 
     // Collect new fragment IDs
@@ -4729,17 +4658,14 @@ fn merge_fragments_valid(manifest: &Manifest, new_fragments: &[Fragment]) -> Res
         if let Some(new_fragment) = new_fragment_map.get(&original_fragment.id) {
             // Validate physical_rows (row count) hasn't changed
             if original_fragment.physical_rows != new_fragment.physical_rows {
-                return Err(Error::invalid_input(
-                    format!(
-                        "Merge operation changed row count for fragment {}. Original: {:?}, New: \
-                         {:?}. Merge operations should preserve fragment row counts and only add \
-                         new columns.",
-                        original_fragment.id,
-                        original_fragment.physical_rows,
-                        new_fragment.physical_rows
-                    ),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!(
+                    "Merge operation changed row count for fragment {}. \
+                     Original: {:?}, New: {:?}. \
+                     Merge operations should preserve fragment row counts and only add new columns.",
+                    original_fragment.id,
+                    original_fragment.physical_rows,
+                    new_fragment.physical_rows
+                )));
             }
         } else {
             missing_fragments.push(original_fragment.id);
@@ -4747,17 +4673,14 @@ fn merge_fragments_valid(manifest: &Manifest, new_fragments: &[Fragment]) -> Res
     }
 
     if !missing_fragments.is_empty() {
-        return Err(Error::invalid_input(
-            format!(
-                "Merge operation is missing original fragments: {:?}. Merge operations should \
-                 preserve all original fragments and only add new columns. Expected fragments: \
-                 {:?}, but got: {:?}",
-                missing_fragments,
-                original_fragments.iter().map(|f| f.id).collect::<Vec<_>>(),
-                new_fragment_map.keys().copied().collect::<Vec<_>>()
-            ),
-            location!(),
-        ));
+        return Err(Error::invalid_input(format!(
+            "Merge operation is missing original fragments: {:?}. \
+             Merge operations should preserve all original fragments and only add new columns. \
+             Expected fragments: {:?}, but got: {:?}",
+            missing_fragments,
+            original_fragments.iter().map(|f| f.id).collect::<Vec<_>>(),
+            new_fragment_map.keys().copied().collect::<Vec<_>>()
+        )));
     }
 
     Ok(())
@@ -4849,10 +4772,12 @@ mod tests {
         let empty_fragments = vec![];
         let result = merge_fragments_valid(&manifest, &empty_fragments);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("reduced fragment count"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("reduced fragment count")
+        );
 
         // Test 2: Missing original fragments should fail
         let missing_fragments = vec![
@@ -4863,10 +4788,12 @@ mod tests {
         ];
         let result = merge_fragments_valid(&manifest, &missing_fragments);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("missing original fragments"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("missing original fragments")
+        );
 
         // Test 3: Reduced fragment count should fail
         let reduced_fragments = vec![
@@ -4876,10 +4803,12 @@ mod tests {
         ];
         let result = merge_fragments_valid(&manifest, &reduced_fragments);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("reduced fragment count"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("reduced fragment count")
+        );
 
         // Test 4: Valid merge with all original fragments plus new ones should succeed
         let valid_fragments = vec![
@@ -5433,9 +5362,11 @@ mod tests {
 
         // Should keep only non-empty indices
         assert_eq!(indices.len(), 2);
-        assert!(indices
-            .iter()
-            .all(|idx| idx.dataset_version == 2 || idx.dataset_version == 4));
+        assert!(
+            indices
+                .iter()
+                .all(|idx| idx.dataset_version == 2 || idx.dataset_version == 4)
+        );
     }
 
     #[test]
@@ -5605,9 +5536,11 @@ mod tests {
         // Verify idx_c kept non-empty only
         let idx_c_indices: Vec<_> = indices.iter().filter(|idx| idx.name == "idx_c").collect();
         assert_eq!(idx_c_indices.len(), 2);
-        assert!(idx_c_indices
-            .iter()
-            .all(|idx| idx.dataset_version == 2 || idx.dataset_version == 3));
+        assert!(
+            idx_c_indices
+                .iter()
+                .all(|idx| idx.dataset_version == 2 || idx.dataset_version == 3)
+        );
 
         // Verify idx_d kept
         assert!(indices.iter().any(|idx| idx.name == "idx_d"));

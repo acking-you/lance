@@ -6,13 +6,13 @@ use std::sync::Arc;
 use arrow_schema::Field;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
-use lance_core::{cache::LanceCache, Result};
+use lance_core::{Result, cache::LanceCache};
 
+use crate::progress::IndexBuildProgress;
+use crate::registry::IndexPluginRegistry;
 use crate::{
     frag_reuse::FragReuseIndex,
-    progress::IndexBuildProgress,
-    registry::IndexPluginRegistry,
-    scalar::{expression::ScalarQueryParser, CreatedIndex, IndexStore, ScalarIndex},
+    scalar::{CreatedIndex, IndexStore, ScalarIndex, expression::ScalarQueryParser},
 };
 
 pub const VALUE_COLUMN_NAME: &str = "value";
@@ -57,12 +57,12 @@ impl TrainingCriteria {
 /// A trait that describes what criteria is needed to train an index
 ///
 /// The training process has two steps.  First, the parameters are given to the
-/// plugin and it creates a TrainingRequest.  Then, the caller prepares the
-/// training data and calls train_index.
+/// plugin and it creates a TrainingRequest.  Then, the caller prepares the training
+/// data and calls train_index.
 ///
-/// The call to train_index will include the training request.  This allows the
-/// plugin to stash any deserialized parameter info in the request and fetch it
-/// later during training by downcasting to the appropriate type.
+/// The call to train_index will include the training request.  This allows the plugin
+/// to stash any deserialized parameter info in the request and fetch it later during
+/// training by downcasting to the appropriate type.
 pub trait TrainingRequest: std::any::Any + Send + Sync {
     fn as_any(&self) -> &dyn std::any::Any;
     fn criteria(&self) -> &TrainingCriteria;
@@ -75,9 +75,7 @@ pub(crate) struct DefaultTrainingRequest {
 
 impl DefaultTrainingRequest {
     pub fn new(criteria: TrainingCriteria) -> Self {
-        Self {
-            criteria,
-        }
+        Self { criteria }
     }
 }
 
@@ -96,22 +94,19 @@ impl TrainingRequest for DefaultTrainingRequest {
 pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     /// Creates a new training request from the given parameters
     ///
-    /// This training request specifies the criteria that the data must satisfy
-    /// to train the index. For example, does the index require the input
-    /// data to be sorted?
+    /// This training request specifies the criteria that the data must satisfy to train the index.
+    /// For example, does the index require the input data to be sorted?
     fn new_training_request(&self, params: &str, field: &Field)
-        -> Result<Box<dyn TrainingRequest>>;
+    -> Result<Box<dyn TrainingRequest>>;
 
     /// Train a new index
     ///
-    /// The provided data must fulfill all the criteria returned by
-    /// `training_criteria`. It is the caller's responsibility to ensure
-    /// this.
+    /// The provided data must fulfill all the criteria returned by `training_criteria`.
+    /// It is the caller's responsibility to ensure this.
     ///
-    /// Returns index details that describe the index.  These details can
-    /// potentially be useful for planning (although this will currently
-    /// require inside information on the index type) and they will need to
-    /// be provided when loading the index.
+    /// Returns index details that describe the index.  These details can potentially be
+    /// useful for planning (although this will currently require inside information on
+    /// the index type) and they will need to be provided when loading the index.
     ///
     /// It is the caller's responsibility to store these details somewhere.
     async fn train_index(
@@ -125,12 +120,12 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
 
     /// A short name for the index
     ///
-    /// This is a friendly name for display purposes and also can be used as an
-    /// alias for the index type URL.  If multiple plugins have the same
-    /// name, then the first one found will be used.
+    /// This is a friendly name for display purposes and also can be used as an alias for
+    /// the index type URL.  If multiple plugins have the same name, then the first one
+    /// found will be used.
     ///
-    /// By convention this is MixedCase with no spaces.  When used as an alias,
-    /// it will be compared case-insensitively.
+    /// By convention this is MixedCase with no spaces.  When used as an alias, it will be
+    /// compared case-insensitively.
     fn name(&self) -> &str;
 
     /// Returns true if the index returns an exact answer (e.g. not AtMost)
@@ -138,8 +133,8 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
 
     /// The version of the index plugin
     ///
-    /// We assume that indexes are not forwards compatible.  If an index was
-    /// written with a newer version than this, it cannot be read
+    /// We assume that indexes are not forwards compatible.  If an index was written with a
+    /// newer version than this, it cannot be read
     fn version(&self) -> u32;
 
     /// Returns a new query parser for the index
@@ -153,8 +148,8 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
 
     /// Load an index from storage
     ///
-    /// The index details should match the details that were returned when the
-    /// index was originally trained.
+    /// The index details should match the details that were returned when the index was
+    /// originally trained.
     async fn load_index(
         &self,
         index_store: Arc<dyn IndexStore>,
@@ -163,8 +158,7 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>>;
 
-    /// Optional hook allowing a plugin to provide statistics without loading
-    /// the index.
+    /// Optional hook allowing a plugin to provide statistics without loading the index.
     async fn load_statistics(
         &self,
         _index_store: Arc<dyn IndexStore>,
@@ -173,15 +167,14 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         Ok(None)
     }
 
-    /// Optional hook that plugins can use if they need to be aware of the
-    /// registry
+    /// Optional hook that plugins can use if they need to be aware of the registry
     fn attach_registry(&self, _registry: Arc<IndexPluginRegistry>) {}
 
     /// Returns a JSON string representation of the provided index details
     ///
-    /// These details will be user-visible and should be considered part of the
-    /// public API.  As a result, efforts should be made to ensure the
-    /// information is backwards compatible and avoid breaking changes.
+    /// These details will be user-visible and should be considered part of the public
+    /// API.  As a result, efforts should be made to ensure the information is backwards
+    /// compatible and avoid breaking changes.
     fn details_as_json(&self, _details: &prost_types::Any) -> Result<serde_json::Value> {
         // Return an empty JSON object as the default implementation
         Ok(serde_json::json!({}))

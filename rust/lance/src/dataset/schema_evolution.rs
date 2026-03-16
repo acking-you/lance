@@ -16,7 +16,6 @@ use lance_encoding::{
     version::LanceFileVersion,
 };
 use lance_table::format::Fragment;
-use snafu::location;
 
 use super::{
     fragment::FileFragment,
@@ -33,10 +32,7 @@ use optimize::{
 
 async fn validate_no_nulls_before_making_non_nullable(dataset: &Dataset, path: &str) -> Result<()> {
     let field = dataset.schema().field(path).ok_or_else(|| {
-        Error::invalid_input(
-            format!("Column \"{}\" does not exist in the dataset", path),
-            location!(),
-        )
+        Error::invalid_input(format!("Column \"{}\" does not exist in the dataset", path))
     })?;
 
     if !field.nullable {
@@ -51,21 +47,18 @@ async fn validate_no_nulls_before_making_non_nullable(dataset: &Dataset, path: &
         // `RecordBatch::column_by_name`. We project exactly one column and validate it
         // directly.
         if batch.num_columns() != 1 {
-            return Err(Error::Internal {
-                message: format!(
-                    "Expected exactly one column in validation scan for {}, got {}",
-                    path,
-                    batch.num_columns()
-                ),
-                location: location!(),
-            });
+            return Err(Error::internal(format!(
+                "Expected exactly one column in validation scan for {}, got {}",
+                path,
+                batch.num_columns()
+            )));
         }
         let col = batch.column(0);
         if col.null_count() > 0 {
-            return Err(Error::invalid_input(
-                format!("Column \"{}\" contains NULL values and cannot be made non-nullable", path),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Column \"{}\" contains NULL values and cannot be made non-nullable",
+                path
+            )));
         }
     }
 
@@ -206,25 +199,18 @@ fn check_field_conflict(
     match (left.data_type(), right.data_type()) {
         (DataType::Struct(fl), DataType::Struct(fr)) => {
             if !version.support_add_sub_column() {
-                return Err(Error::invalid_input(
-                    format!(
-                        "Column {} is a struct col, add sub column is not supported in Lance file \
-                         version {}",
-                        left.name(),
-                        version
-                    ),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!(
+                    "Column {} is a struct col, add sub column is not supported in Lance file version {}",
+                    left.name(),
+                    version
+                )));
             }
 
             if left.is_packed() || right.is_packed() {
-                return Err(Error::invalid_input(
-                    format!(
-                        "Column {} is packed struct and already exists in the dataset",
-                        left.name()
-                    ),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!(
+                    "Column {} is packed struct and already exists in the dataset",
+                    left.name()
+                )));
             }
 
             for l_field in fl.iter() {
@@ -238,21 +224,18 @@ fn check_field_conflict(
         (DataType::LargeList(fl), DataType::LargeList(fr)) => check_field_conflict(fl, fr, version),
         (DataType::FixedSizeList(fl, _), DataType::FixedSizeList(fr, _)) => {
             check_field_conflict(fl, fr, version)
-        },
-        (l_type, r_type) if l_type == r_type => Err(Error::invalid_input(
-            format!("Column {} already exists in the dataset", left.name()),
-            location!(),
-        )),
-        (_, _) => Err(Error::invalid_input(
-            format!(
-                "Type conflicts between {}({}) and {}({})",
-                left.name(),
-                left.data_type(),
-                right.name(),
-                right.data_type()
-            ),
-            location!(),
-        )),
+        }
+        (l_type, r_type) if l_type == r_type => Err(Error::invalid_input(format!(
+            "Column {} already exists in the dataset",
+            left.name()
+        ))),
+        (_, _) => Err(Error::invalid_input(format!(
+            "Type conflicts between {}({}) and {}({})",
+            left.name(),
+            left.data_type(),
+            right.name(),
+            right.data_type()
+        ))),
     }
 }
 
@@ -383,10 +366,9 @@ pub(super) async fn add_columns_to_fragments(
             // nullable
             let schema = Schema::try_from(output_schema.as_ref())?;
             if !schema.all_fields_nullable() {
-                return Err(Error::InvalidInput {
-                    source: "All-null columns must be nullable.".into(),
-                    location: location!(),
-                });
+                return Err(Error::invalid_input_source(
+                    "All-null columns must be nullable.".into(),
+                ));
             }
 
             let fragments = fragments
@@ -400,10 +382,9 @@ pub(super) async fn add_columns_to_fragments(
             // have missing columns and we can't mix legacy and non-legacy
             // readers when reading the fragment.
             if dataset.is_legacy_storage() {
-                return Err(Error::NotSupported {
-                    source: "Cannot add all-null columns to legacy dataset version.".into(),
-                    location: location!(),
-                });
+                return Err(Error::not_supported_source(
+                    "Cannot add all-null columns to legacy dataset version.".into(),
+                ));
             }
 
             Ok((output_schema, fragments))
@@ -535,7 +516,6 @@ async fn add_columns_from_stream(
                     stream.next().await.ok_or_else(|| {
                         Error::invalid_input(
                             "Stream ended before producing values for all rows in dataset",
-                            location!(),
                         )
                     })??
                 };
@@ -563,10 +543,9 @@ async fn add_columns_from_stream(
 
     // Ensure the stream is fully consumed
     if last_seen_batch.is_some() || stream.next().await.is_some() {
-        return Err(Error::InvalidInput {
-            source: "Stream produced more values than expected for dataset".into(),
-            location: location!(),
-        });
+        return Err(Error::invalid_input_source(
+            "Stream produced more values than expected for dataset".into(),
+        ));
     }
 
     Ok(new_fragments)
@@ -590,16 +569,17 @@ pub(super) async fn alter_columns(
 
     for alteration in alterations {
         let field_src = dataset.schema().field(&alteration.path).ok_or_else(|| {
-            Error::invalid_input(
-                format!("Column \"{}\" does not exist in the dataset", alteration.path),
-                location!(),
-            )
+            Error::invalid_input(format!(
+                "Column \"{}\" does not exist in the dataset",
+                alteration.path
+            ))
         })?;
 
-        if let Some(nullable) = alteration.nullable {
-            if field_src.nullable && !nullable {
-                validate_no_nulls_before_making_non_nullable(dataset, &alteration.path).await?;
-            }
+        if let Some(nullable) = alteration.nullable
+            && field_src.nullable
+            && !nullable
+        {
+            validate_no_nulls_before_making_non_nullable(dataset, &alteration.path).await?;
         }
 
         let field_dest = new_schema.mut_field_by_id(field_src.id).unwrap();
@@ -614,15 +594,12 @@ pub(super) async fn alter_columns(
             if !(can_cast_types(&field_src.data_type(), data_type)
                 && is_upcast_downcast(&field_src.data_type(), data_type))
             {
-                return Err(Error::invalid_input(
-                    format!(
-                        "Cannot cast column \"{}\" from {:?} to {:?}",
-                        alteration.path,
-                        field_src.data_type(),
-                        data_type
-                    ),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!(
+                    "Cannot cast column \"{}\" from {:?} to {:?}",
+                    alteration.path,
+                    field_src.data_type(),
+                    data_type
+                )));
             }
 
             let arrow_field =
@@ -744,10 +721,10 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
     // Check if columns are present in the dataset and construct the new schema.
     for col in columns {
         if dataset.schema().field(col).is_none() {
-            return Err(Error::invalid_input(
-                format!("Column {} does not exist in the dataset", col),
-                location!(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "Column {} does not exist in the dataset",
+                col
+            )));
         }
     }
 
@@ -756,7 +733,9 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
     let new_schema = exclude(&dataset.manifest.schema, &columns_to_remove, &version)?;
 
     if new_schema.fields.is_empty() {
-        return Err(Error::invalid_input("Cannot drop all columns from a dataset", location!()));
+        return Err(Error::invalid_input(
+            "Cannot drop all columns from a dataset",
+        ));
     }
 
     let transaction = Transaction::new(
@@ -777,17 +756,16 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
 
 /// Exclude the fields from `other` Schema, and returns a new Schema.
 pub fn exclude(source: &Schema, other: &Schema, version: &LanceFileVersion) -> Result<Schema> {
-    let other: Schema = other.try_into().map_err(|_| Error::Schema {
-        message: "The other schema is not compatible with this schema".to_string(),
-        location: location!(),
+    let other: Schema = other.try_into().map_err(|_| {
+        Error::schema("The other schema is not compatible with this schema".to_string())
     })?;
     let mut fields = vec![];
     for field in source.fields.iter() {
         if let Some(other_field) = other.field(&field.name) {
-            if version.support_remove_sub_column(field) {
-                if let Some(f) = field.exclude(other_field) {
-                    fields.push(f)
-                }
+            if version.support_remove_sub_column(field)
+                && let Some(f) = field.exclude(other_field)
+            {
+                fields.push(f)
             }
         } else {
             fields.push(field.clone());
@@ -1212,9 +1190,10 @@ mod test {
                 )
                 .await
                 .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("All-null columns must be nullable."));
+        assert!(
+            err.to_string()
+                .contains("All-null columns must be nullable.")
+        );
 
         let data = dataset.scan().try_into_batch().await?;
         let expected_schema = ArrowSchema::new(vec![
@@ -1264,9 +1243,10 @@ mod test {
                 )
                 .await
                 .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("Cannot add all-null columns to legacy dataset version"));
+        assert!(
+            err.to_string()
+                .contains("Cannot add all-null columns to legacy dataset version")
+        );
 
         Ok(())
     }
@@ -1765,7 +1745,7 @@ mod test {
         use arrow_array::{Float16Array, Float32Array, Int64Array, ListArray};
         use half::f16;
         use lance_arrow::FixedSizeListArrayExt;
-        use lance_index::{scalar::ScalarIndexParams, DatasetIndexExt, IndexType};
+        use lance_index::{DatasetIndexExt, IndexType, scalar::ScalarIndexParams};
         use lance_linalg::distance::MetricType;
         use lance_testing::datagen::generate_random_array;
 

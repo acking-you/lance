@@ -1,25 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{any::Any, sync::Arc};
-
+use crate::Result;
+use crate::scalar::rtree::sort::Sorter;
 use arrow_array::{ArrayRef, UInt32Array};
 use arrow_schema::{ArrowError, DataType as ArrowDataType, Field as ArrowField, Field};
 use async_trait::async_trait;
-use datafusion::{
-    execution::SendableRecordBatchStream,
-    logical_expr::{ColumnarValue, Signature, Volatility},
-    physical_expr::PhysicalSortExpr,
-    physical_plan::{projection::ProjectionExec, sorts::sort::SortExec, ExecutionPlan},
-};
-use datafusion_common::{config::ConfigOptions, DataFusionError, Result as DataFusionResult};
+use datafusion::execution::SendableRecordBatchStream;
+use datafusion::logical_expr::{ColumnarValue, Signature, Volatility};
+use datafusion::physical_expr::PhysicalSortExpr;
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion_common::config::ConfigOptions;
+use datafusion_common::{DataFusionError, Result as DataFusionResult};
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
-use datafusion_physical_expr::{expressions::Column as DFColumn, PhysicalExpr, ScalarFunctionExpr};
-use geoarrow_array::{array::from_arrow_array, GeoArrowArray, GeoArrowArrayAccessor};
-use lance_datafusion::exec::{execute_plan, LanceExecutionOptions, OneShotExec};
-use lance_geo::bbox::{bounding_box, BoundingBox};
-
-use crate::{scalar::rtree::sort::Sorter, Result};
+use datafusion_physical_expr::expressions::Column as DFColumn;
+use datafusion_physical_expr::{PhysicalExpr, ScalarFunctionExpr};
+use geoarrow_array::array::from_arrow_array;
+use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor};
+use lance_datafusion::exec::{LanceExecutionOptions, OneShotExec, execute_plan};
+use lance_geo::bbox::{BoundingBox, bounding_box};
+use std::any::Any;
+use std::sync::Arc;
 
 const HILBERT_FIELD_NAME: &str = "_hilbert";
 
@@ -29,9 +32,7 @@ pub struct HilbertSorter {
 
 impl HilbertSorter {
     pub fn new(bbox: BoundingBox) -> Self {
-        Self {
-            bbox,
-        }
+        Self { bbox }
     }
 }
 
@@ -60,8 +61,10 @@ impl Sorter for HilbertSorter {
             HILBERT_FIELD_NAME.to_string(),
         ));
 
-        let projection =
-            Arc::new(ProjectionExec::try_new(projection_exprs, source as Arc<dyn ExecutionPlan>)?);
+        let projection = Arc::new(ProjectionExec::try_new(
+            projection_exprs,
+            source as Arc<dyn ExecutionPlan>,
+        )?);
 
         // 2. sort_by _hilbert
         let sort_expr = PhysicalSortExpr {
@@ -69,13 +72,18 @@ impl Sorter for HilbertSorter {
             options: arrow_schema::SortOptions::default(),
         };
 
-        let sort_exec =
-            Arc::new(SortExec::new([sort_expr].into(), projection as Arc<dyn ExecutionPlan>));
+        let sort_exec = Arc::new(SortExec::new(
+            [sort_expr].into(),
+            projection as Arc<dyn ExecutionPlan>,
+        ));
 
-        let sorted_stream = execute_plan(sort_exec, LanceExecutionOptions {
-            use_spilling: true,
-            ..Default::default()
-        })?;
+        let sorted_stream = execute_plan(
+            sort_exec,
+            LanceExecutionOptions {
+                use_spilling: true,
+                ..Default::default()
+            },
+        )?;
 
         Ok(sorted_stream)
     }
@@ -130,7 +138,11 @@ impl HilbertUDF {
             HILBERT_UDF_NAME,
             Arc::new(self.into()),
             vec![Arc::new(DFColumn::new("bbox", 0)) as Arc<dyn PhysicalExpr>],
-            Arc::new(ArrowField::new(HILBERT_FIELD_NAME, ArrowDataType::UInt32, false)),
+            Arc::new(ArrowField::new(
+                HILBERT_FIELD_NAME,
+                ArrowDataType::UInt32,
+                false,
+            )),
             Arc::new(ConfigOptions::default()),
         ))
     }
@@ -157,9 +169,9 @@ impl ScalarUDFImpl for HilbertUDF {
         let value = match &func_args.args[0] {
             ColumnarValue::Array(array) => from_arrow_array(array.as_ref(), &self.bbox_field)
                 .map_err(|e| DataFusionError::from(ArrowError::from(e))),
-            _ => {
-                Err(DataFusionError::Execution("hilbert only supports array arguments".to_owned()))
-            },
+            _ => Err(DataFusionError::Execution(
+                "hilbert only supports array arguments".to_owned(),
+            )),
         }?;
 
         let rect_array = bounding_box(value.as_ref()).map_err(DataFusionError::from)?;
@@ -182,7 +194,9 @@ impl ScalarUDFImpl for HilbertUDF {
             hilbert_values.push(hilbert_curve(x, y));
         }
 
-        Ok(ColumnarValue::Array(Arc::new(UInt32Array::from(hilbert_values)) as ArrayRef))
+        Ok(ColumnarValue::Array(
+            Arc::new(UInt32Array::from(hilbert_values)) as ArrayRef,
+        ))
     }
 }
 
@@ -246,21 +260,21 @@ fn hilbert_curve(x: u32, y: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
+    use super::*;
     use arrow_array::{RecordBatch, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-    use futures::{stream, StreamExt};
+    use futures::{StreamExt, stream};
     use geo_traits::{CoordTrait, PointTrait};
     use geo_types::Point;
-    use geoarrow_array::{array::PointArray, builder::PointBuilder, GeoArrowArray};
+    use geoarrow_array::GeoArrowArray;
+    use geoarrow_array::array::PointArray;
+    use geoarrow_array::builder::PointBuilder;
     use geoarrow_schema::{Dimension, PointType};
     use lance_core::ROW_ID;
     use lance_geo::bbox::total_bounds;
     use rand::Rng;
-
-    use super::*;
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn test_hilbert_sort_same_x() {
@@ -281,14 +295,19 @@ mod tests {
         let point_arr = point_builder.finish();
         let bbox = total_bounds(&point_arr).unwrap();
 
-        let batch = RecordBatch::try_new(schema.clone(), vec![
-            point_arr.into_array_ref(),
-            Arc::new(UInt64Array::from_iter(0..num_points)),
-        ])
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                point_arr.into_array_ref(),
+                Arc::new(UInt64Array::from_iter(0..num_points)),
+            ],
+        )
         .unwrap();
 
-        let stream =
-            Box::pin(RecordBatchStreamAdapter::new(schema, stream::once(async move { Ok(batch) })));
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(async move { Ok(batch) }),
+        ));
 
         let sorter = HilbertSorter::new(bbox);
         let mut sorted = sorter.sort(stream).await.unwrap();

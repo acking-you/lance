@@ -108,7 +108,7 @@ mod tests {
     };
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-    use futures::{stream, TryStreamExt};
+    use futures::{TryStreamExt, stream};
     use serde_json::Value;
 
     use crate::scalar::inverted::json::JsonTextStream;

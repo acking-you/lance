@@ -10,38 +10,37 @@ use std::{
 use arrow_array::{Array, LargeBinaryArray, RecordBatch, StructArray, UInt8Array};
 use arrow_schema::{DataType, Field, Field as ArrowField, Schema};
 use async_trait::async_trait;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::{
     execution::SendableRecordBatchStream,
-    physical_plan::{projection::ProjectionExec, stream::RecordBatchStreamAdapter, ExecutionPlan},
+    physical_plan::{ExecutionPlan, projection::ProjectionExec},
 };
-use datafusion_common::{config::ConfigOptions, ScalarValue};
+use datafusion_common::{ScalarValue, config::ConfigOptions};
 use datafusion_expr::{Expr, Operator, ScalarUDF};
 use datafusion_physical_expr::{
-    expressions::{Column, Literal},
     PhysicalExpr, ScalarFunctionExpr,
+    expressions::{Column, Literal},
 };
 use deepsize::DeepSizeOf;
 use futures::StreamExt;
-use lance_core::{cache::LanceCache, error::LanceOptionExt, Error, Result, ROW_ID};
-use lance_datafusion::{
-    exec::{get_session_context, LanceExecutionOptions, OneShotExec},
-    udf::json::JsonbType,
-};
+use lance_datafusion::exec::{LanceExecutionOptions, OneShotExec, get_session_context};
+use lance_datafusion::udf::json::JsonbType;
 use prost::Message;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
-use snafu::location;
+
+use lance_core::{Error, ROW_ID, Result, cache::LanceCache, error::LanceOptionExt};
 
 use crate::{
+    Index, IndexType,
     frag_reuse::FragReuseIndex,
     metrics::MetricsCollector,
     registry::IndexPluginRegistry,
     scalar::{
+        AnyQuery, CreatedIndex, IndexStore, ScalarIndex, SearchResult, UpdateCriteria,
         expression::{IndexedExpression, ScalarIndexExpr, ScalarIndexSearch, ScalarQueryParser},
         registry::{ScalarIndexPlugin, TrainingCriteria, TrainingRequest, VALUE_COLUMN_NAME},
-        AnyQuery, CreatedIndex, IndexStore, ScalarIndex, SearchResult, UpdateCriteria,
     },
-    Index, IndexType,
 };
 
 const JSON_INDEX_VERSION: u32 = 0;
@@ -57,10 +56,7 @@ pub struct JsonIndex {
 
 impl JsonIndex {
     pub fn new(target_index: Arc<dyn ScalarIndex>, path: String) -> Self {
-        Self {
-            target_index,
-            path,
-        }
+        Self { target_index, path }
     }
 }
 
@@ -85,8 +81,8 @@ impl Index for JsonIndex {
     }
 
     fn index_type(&self) -> IndexType {
-        // TODO: This causes the index to appear as btree in list_indices call.  Need
-        // better logic in list_indices to use details instead of index_type.
+        // TODO: This causes the index to appear as btree in list_indices call.  Need better logic
+        // in list_indices to use details instead of index_type.
         IndexType::Scalar
     }
 
@@ -175,12 +171,10 @@ pub struct JsonIndexParameters {
     path: String,
 }
 
-// TODO: Do we really need to wrap the query or could we just return the target
-// query directly?
+// TODO: Do we really need to wrap the query or could we just return the target query directly?
 //
-// I think the only thing we really gain is a different format impl (e.g. it
-// shows up as a json query in the explain plan) but I don't know if that helps
-// the user much.
+// I think the only thing we really gain is a different format impl (e.g. it shows up as a json query
+// in the explain plan) but I don't know if that helps the user much.
 #[derive(Debug, Clone)]
 pub struct JsonQuery {
     target_query: Arc<dyn AnyQuery>,
@@ -189,10 +183,7 @@ pub struct JsonQuery {
 
 impl JsonQuery {
     pub fn new(target_query: Arc<dyn AnyQuery>, path: String) -> Self {
-        Self {
-            target_query,
-            path,
-        }
+        Self { target_query, path }
     }
 }
 
@@ -331,8 +322,8 @@ impl ScalarQueryParser for JsonQueryParser {
                 if udf.args.len() != 2 {
                     return None;
                 }
-                // We already know index 0 is a column reference to the column so we just need
-                // to ensure that index 1 matches our path
+                // We already know index 0 is a column reference to the column so we just need to
+                // ensure that index 1 matches our path
                 match &udf.args[1] {
                     Expr::Literal(ScalarValue::Utf8(Some(path)), _) => {
                         if path == &self.path {
@@ -347,10 +338,10 @@ impl ScalarQueryParser for JsonQueryParser {
                         } else {
                             None
                         }
-                    },
+                    }
                     _ => None,
                 }
-            },
+            }
             _ => None,
         }
     }
@@ -442,46 +433,34 @@ impl JsonIndexPlugin {
             let batch = batch_result?;
 
             // Determine type from first non-null value if not yet set
-            if inferred_type.is_none() {
-                if let Some(json_result_column) = batch.column_by_name("json_result") {
-                    if let Some(struct_array) =
-                        json_result_column.as_any().downcast_ref::<StructArray>()
-                    {
-                        if let Some(type_array) = struct_array.column_by_name("type_tag") {
-                            if let Some(uint8_array) =
-                                type_array.as_any().downcast_ref::<UInt8Array>()
-                            {
-                                // Find first non-null value to determine type
-                                for i in 0..uint8_array.len() {
-                                    if !uint8_array.is_null(i) {
-                                        let type_tag = uint8_array.value(i);
-                                        let jsonb_type =
-                                            JsonbType::from_u8(type_tag).ok_or_else(|| {
-                                                Error::InvalidInput {
-                                                    source: format!(
-                                                        "Invalid type tag: {}",
-                                                        type_tag
-                                                    )
-                                                    .into(),
-                                                    location: location!(),
-                                                }
-                                            })?;
+            if inferred_type.is_none()
+                && let Some(json_result_column) = batch.column_by_name("json_result")
+                && let Some(struct_array) =
+                    json_result_column.as_any().downcast_ref::<StructArray>()
+                && let Some(type_array) = struct_array.column_by_name("type_tag")
+                && let Some(uint8_array) = type_array.as_any().downcast_ref::<UInt8Array>()
+            {
+                // Find first non-null value to determine type
+                for i in 0..uint8_array.len() {
+                    if !uint8_array.is_null(i) {
+                        let type_tag = uint8_array.value(i);
+                        let jsonb_type = JsonbType::from_u8(type_tag).ok_or_else(|| {
+                            Error::invalid_input_source(
+                                format!("Invalid type tag: {}", type_tag).into(),
+                            )
+                        })?;
 
-                                        // Map JsonbType to Arrow DataType
-                                        inferred_type = Some(match jsonb_type {
-                                            JsonbType::Null => continue, // Skip null values
-                                            JsonbType::Boolean => DataType::Boolean,
-                                            JsonbType::Int64 => DataType::Int64,
-                                            JsonbType::Float64 => DataType::Float64,
-                                            JsonbType::String => DataType::Utf8,
-                                            JsonbType::Array => DataType::LargeBinary,
-                                            JsonbType::Object => DataType::LargeBinary,
-                                        });
-                                        break;
-                                    }
-                                }
-                            }
-                        }
+                        // Map JsonbType to Arrow DataType
+                        inferred_type = Some(match jsonb_type {
+                            JsonbType::Null => continue, // Skip null values
+                            JsonbType::Boolean => DataType::Boolean,
+                            JsonbType::Int64 => DataType::Int64,
+                            JsonbType::Float64 => DataType::Float64,
+                            JsonbType::String => DataType::Utf8,
+                            JsonbType::Array => DataType::LargeBinary,
+                            JsonbType::Object => DataType::LargeBinary,
+                        });
+                        break;
                     }
                 }
             }
@@ -493,14 +472,10 @@ impl JsonIndexPlugin {
         let inferred_type = inferred_type.unwrap_or(DataType::Utf8);
 
         // Recreate stream from collected batches
-        let schema =
-            all_batches
-                .first()
-                .map(|b| b.schema())
-                .ok_or_else(|| Error::InvalidInput {
-                    source: "No batches in stream".into(),
-                    location: location!(),
-                })?;
+        let schema = all_batches
+            .first()
+            .map(|b| b.schema())
+            .ok_or_else(|| Error::invalid_input_source("No batches in stream".into()))?;
 
         let recreated_stream = Box::pin(RecordBatchStreamAdapter::new(
             schema,
@@ -510,8 +485,7 @@ impl JsonIndexPlugin {
         Ok((recreated_stream, inferred_type))
     }
 
-    /// Convert the stream with JSONB values and type tags to properly typed
-    /// values
+    /// Convert the stream with JSONB values and type tags to properly typed values
     async fn convert_stream_by_type(
         data: SendableRecordBatchStream,
         target_type: DataType,
@@ -527,168 +501,141 @@ impl JsonIndexPlugin {
             let batch = batch_result?;
 
             // Extract the struct column containing value and type_tag
-            let json_result_column =
-                batch
-                    .column_by_name("json_result")
-                    .ok_or_else(|| Error::InvalidInput {
-                        source: "Missing json_result column".into(),
-                        location: location!(),
-                    })?;
+            let json_result_column = batch
+                .column_by_name("json_result")
+                .ok_or_else(|| Error::invalid_input_source("Missing json_result column".into()))?;
 
             let struct_array = json_result_column
                 .as_any()
                 .downcast_ref::<StructArray>()
-                .ok_or_else(|| Error::InvalidInput {
-                    source: "json_result is not a struct".into(),
-                    location: location!(),
-                })?;
+                .ok_or_else(|| Error::invalid_input_source("json_result is not a struct".into()))?;
 
-            let value_array =
-                struct_array
-                    .column_by_name("value")
-                    .ok_or_else(|| Error::InvalidInput {
-                        source: "Missing value column in struct".into(),
-                        location: location!(),
-                    })?;
+            let value_array = struct_array.column_by_name("value").ok_or_else(|| {
+                Error::invalid_input_source("Missing value column in struct".into())
+            })?;
 
             let binary_array = value_array
                 .as_any()
                 .downcast_ref::<LargeBinaryArray>()
-                .ok_or_else(|| Error::InvalidInput {
-                    source: "value is not LargeBinary".into(),
-                    location: location!(),
-                })?;
+                .ok_or_else(|| Error::invalid_input_source("value is not LargeBinary".into()))?;
 
             // Convert based on target type using serde deserialization
-            let converted_array: Arc<dyn Array> = match target_type {
-                DataType::Boolean => {
-                    let mut builder =
-                        arrow_array::builder::BooleanBuilder::with_capacity(binary_array.len());
-                    for i in 0..binary_array.len() {
-                        if binary_array.is_null(i) {
-                            builder.append_null();
-                        } else if let Some(bytes) = binary_array.value(i).into() {
-                            let raw_jsonb = jsonb::RawJsonb::new(bytes);
-                            // Try to deserialize directly to bool
-                            match jsonb::from_raw_jsonb::<bool>(&raw_jsonb) {
-                                Ok(bool_val) => builder.append_value(bool_val),
-                                Err(e) => {
-                                    return Err(Error::InvalidInput {
-                                        source: format!(
-                                            "Failed to deserialize JSONB to bool at index {}: {}",
-                                            i, e
-                                        )
-                                        .into(),
-                                        location: location!(),
-                                    });
-                                },
+            let converted_array: Arc<dyn Array> =
+                match target_type {
+                    DataType::Boolean => {
+                        let mut builder =
+                            arrow_array::builder::BooleanBuilder::with_capacity(binary_array.len());
+                        for i in 0..binary_array.len() {
+                            if binary_array.is_null(i) {
+                                builder.append_null();
+                            } else if let Some(bytes) = binary_array.value(i).into() {
+                                let raw_jsonb = jsonb::RawJsonb::new(bytes);
+                                // Try to deserialize directly to bool
+                                match jsonb::from_raw_jsonb::<bool>(&raw_jsonb) {
+                                    Ok(bool_val) => builder.append_value(bool_val),
+                                    Err(e) => {
+                                        return Err(Error::invalid_input_source(format!(
+                                        "Failed to deserialize JSONB to bool at index {}: {}",
+                                        i, e
+                                    )
+                                    .into()));
+                                    }
+                                }
+                            } else {
+                                builder.append_null();
                             }
-                        } else {
-                            builder.append_null();
                         }
+                        Arc::new(builder.finish())
                     }
-                    Arc::new(builder.finish())
-                },
-                DataType::Int64 => {
-                    let mut builder =
-                        arrow_array::builder::Int64Builder::with_capacity(binary_array.len());
-                    for i in 0..binary_array.len() {
-                        if binary_array.is_null(i) {
-                            builder.append_null();
-                        } else if let Some(bytes) = binary_array.value(i).into() {
-                            let raw_jsonb = jsonb::RawJsonb::new(bytes);
-                            // Try to deserialize directly to i64
-                            match jsonb::from_raw_jsonb::<i64>(&raw_jsonb) {
-                                Ok(int_val) => builder.append_value(int_val),
-                                Err(e) => {
-                                    return Err(Error::InvalidInput {
-                                        source: format!(
-                                            "Failed to deserialize JSONB to i64 at index {}: {}",
-                                            i, e
-                                        )
-                                        .into(),
-                                        location: location!(),
-                                    });
-                                },
+                    DataType::Int64 => {
+                        let mut builder =
+                            arrow_array::builder::Int64Builder::with_capacity(binary_array.len());
+                        for i in 0..binary_array.len() {
+                            if binary_array.is_null(i) {
+                                builder.append_null();
+                            } else if let Some(bytes) = binary_array.value(i).into() {
+                                let raw_jsonb = jsonb::RawJsonb::new(bytes);
+                                // Try to deserialize directly to i64
+                                match jsonb::from_raw_jsonb::<i64>(&raw_jsonb) {
+                                    Ok(int_val) => builder.append_value(int_val),
+                                    Err(e) => {
+                                        return Err(Error::invalid_input_source(format!(
+                                        "Failed to deserialize JSONB to i64 at index {}: {}",
+                                        i, e
+                                    )
+                                    .into()));
+                                    }
+                                }
+                            } else {
+                                builder.append_null();
                             }
-                        } else {
-                            builder.append_null();
                         }
+                        Arc::new(builder.finish())
                     }
-                    Arc::new(builder.finish())
-                },
-                DataType::Float64 => {
-                    let mut builder =
-                        arrow_array::builder::Float64Builder::with_capacity(binary_array.len());
-                    for i in 0..binary_array.len() {
-                        if binary_array.is_null(i) {
-                            builder.append_null();
-                        } else if let Some(bytes) = binary_array.value(i).into() {
-                            let raw_jsonb = jsonb::RawJsonb::new(bytes);
-                            // Try to deserialize directly to f64 (serde handles int->float
-                            // conversion)
-                            match jsonb::from_raw_jsonb::<f64>(&raw_jsonb) {
-                                Ok(float_val) => builder.append_value(float_val),
-                                Err(e) => {
-                                    return Err(Error::InvalidInput {
-                                        source: format!(
-                                            "Failed to deserialize JSONB to f64 at index {}: {}",
-                                            i, e
-                                        )
-                                        .into(),
-                                        location: location!(),
-                                    });
-                                },
+                    DataType::Float64 => {
+                        let mut builder =
+                            arrow_array::builder::Float64Builder::with_capacity(binary_array.len());
+                        for i in 0..binary_array.len() {
+                            if binary_array.is_null(i) {
+                                builder.append_null();
+                            } else if let Some(bytes) = binary_array.value(i).into() {
+                                let raw_jsonb = jsonb::RawJsonb::new(bytes);
+                                // Try to deserialize directly to f64 (serde handles int->float conversion)
+                                match jsonb::from_raw_jsonb::<f64>(&raw_jsonb) {
+                                    Ok(float_val) => builder.append_value(float_val),
+                                    Err(e) => {
+                                        return Err(Error::invalid_input_source(format!(
+                                        "Failed to deserialize JSONB to f64 at index {}: {}",
+                                        i, e
+                                    )
+                                    .into()));
+                                    }
+                                }
+                            } else {
+                                builder.append_null();
                             }
-                        } else {
-                            builder.append_null();
                         }
+                        Arc::new(builder.finish())
                     }
-                    Arc::new(builder.finish())
-                },
-                DataType::Utf8 => {
-                    let mut builder = arrow_array::builder::StringBuilder::with_capacity(
-                        binary_array.len(),
-                        1024,
-                    );
-                    for i in 0..binary_array.len() {
-                        if binary_array.is_null(i) {
-                            builder.append_null();
-                        } else if let Some(bytes) = binary_array.value(i).into() {
-                            let raw_jsonb = jsonb::RawJsonb::new(bytes);
-                            // Try to deserialize to String, or use to_string() for any type
-                            match jsonb::from_raw_jsonb::<String>(&raw_jsonb) {
-                                Ok(str_val) => builder.append_value(&str_val),
-                                Err(_) => {
-                                    // For non-string types, convert to string representation
-                                    builder.append_value(raw_jsonb.to_string());
-                                },
+                    DataType::Utf8 => {
+                        let mut builder = arrow_array::builder::StringBuilder::with_capacity(
+                            binary_array.len(),
+                            1024,
+                        );
+                        for i in 0..binary_array.len() {
+                            if binary_array.is_null(i) {
+                                builder.append_null();
+                            } else if let Some(bytes) = binary_array.value(i).into() {
+                                let raw_jsonb = jsonb::RawJsonb::new(bytes);
+                                // Try to deserialize to String, or use to_string() for any type
+                                match jsonb::from_raw_jsonb::<String>(&raw_jsonb) {
+                                    Ok(str_val) => builder.append_value(&str_val),
+                                    Err(_) => {
+                                        // For non-string types, convert to string representation
+                                        builder.append_value(raw_jsonb.to_string());
+                                    }
+                                }
+                            } else {
+                                builder.append_null();
                             }
-                        } else {
-                            builder.append_null();
                         }
+                        Arc::new(builder.finish())
                     }
-                    Arc::new(builder.finish())
-                },
-                DataType::LargeBinary => {
-                    // Keep as binary for array/object types
-                    value_array.clone()
-                },
-                _ => {
-                    return Err(Error::InvalidInput {
-                        source: format!("Unsupported target type: {:?}", target_type).into(),
-                        location: location!(),
-                    });
-                },
-            };
+                    DataType::LargeBinary => {
+                        // Keep as binary for array/object types
+                        value_array.clone()
+                    }
+                    _ => {
+                        return Err(Error::invalid_input_source(
+                            format!("Unsupported target type: {:?}", target_type).into(),
+                        ));
+                    }
+                };
 
             // Get row_id column
             let row_id_column = batch
                 .column_by_name(ROW_ID)
-                .ok_or_else(|| Error::InvalidInput {
-                    source: "Missing row_id column".into(),
-                    location: location!(),
-                })?
+                .ok_or_else(|| Error::invalid_input_source("Missing row_id column".into()))?
                 .clone();
 
             // Create new batch with converted values
@@ -707,10 +654,7 @@ impl JsonIndexPlugin {
         let schema = converted_batches
             .first()
             .map(|b| b.schema())
-            .ok_or_else(|| Error::InvalidInput {
-                source: "No batches to convert".into(),
-                location: location!(),
-            })?;
+            .ok_or_else(|| Error::invalid_input_source("No batches to convert".into()))?;
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema,
@@ -731,10 +675,9 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         field: &Field,
     ) -> Result<Box<dyn TrainingRequest>> {
         if !matches!(field.data_type(), DataType::Binary | DataType::LargeBinary) {
-            return Err(Error::InvalidInput {
-                source: "A JSON index can only be created on a Binary or LargeBinary field.".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "A JSON index can only be created on a Binary or LargeBinary field.".into(),
+            ));
         }
 
         // Initially use Utf8, will be refined during training with type inference
@@ -776,11 +719,12 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
             crate::pb::JsonIndexDetails::decode(index_details.value.as_slice()).unwrap();
         let target_details = json_details.target_details.as_ref().expect_ok().unwrap();
         let target_plugin = registry.get_plugin_by_details(target_details).unwrap();
-        // TODO: Use something like ${index_name}_${path} for the index name?  Don't
-        // have access to path here tho
+        // TODO: Use something like ${index_name}_${path} for the index name?  Don't have access to path here tho
         let target_parser = target_plugin.new_query_parser(index_name, index_details)?;
-        Some(Box::new(JsonQueryParser::new(json_details.path.clone(), target_parser))
-            as Box<dyn ScalarQueryParser>)
+        Some(Box::new(JsonQueryParser::new(
+            json_details.path.clone(),
+            target_parser,
+        )) as Box<dyn ScalarQueryParser>)
     }
 
     async fn train_index(
@@ -819,7 +763,13 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         )?;
 
         let target_index = target_plugin
-            .train_index(converted_stream, index_store, target_request, fragment_ids, progress)
+            .train_index(
+                converted_stream,
+                index_store,
+                target_request,
+                fragment_ids,
+                progress,
+            )
             .await?;
 
         let index_details = crate::pb::JsonIndexDetails {
@@ -864,12 +814,10 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
+    use super::*;
     use arrow_array::{ArrayRef, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
-
-    use super::*;
+    use std::sync::Arc;
 
     // Note: The old test_detect_json_value_type test has been removed as we now use
     // JSONB's inherent type information instead of string-based type detection
@@ -908,15 +856,19 @@ mod tests {
         );
         let row_ids = UInt64Array::from(vec![1, 2, 3]);
 
-        let batch = RecordBatch::try_new(schema.clone(), vec![
-            Arc::new(jsonb_array) as ArrayRef,
-            Arc::new(row_ids) as ArrayRef,
-        ])
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(jsonb_array) as ArrayRef,
+                Arc::new(row_ids) as ArrayRef,
+            ],
+        )
         .unwrap();
 
-        let stream =
-            Box::pin(RecordBatchStreamAdapter::new(schema.clone(), stream::iter(vec![Ok(batch)])))
-                as SendableRecordBatchStream;
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            stream::iter(vec![Ok(batch)]),
+        )) as SendableRecordBatchStream;
 
         // Test type inference for integer field
         let (_result_stream, inferred_type) =
@@ -927,31 +879,35 @@ mod tests {
         assert_eq!(inferred_type, DataType::Int64);
 
         // Create new test stream for boolean field
-        let batch2 = RecordBatch::try_new(schema.clone(), vec![
-            Arc::new(LargeBinaryArray::from(vec![
-                json_data[0]
-                    .parse::<jsonb::OwnedJsonb>()
-                    .ok()
-                    .map(|j| j.to_vec())
-                    .as_deref(),
-                json_data[1]
-                    .parse::<jsonb::OwnedJsonb>()
-                    .ok()
-                    .map(|j| j.to_vec())
-                    .as_deref(),
-                json_data[2]
-                    .parse::<jsonb::OwnedJsonb>()
-                    .ok()
-                    .map(|j| j.to_vec())
-                    .as_deref(),
-            ])) as ArrayRef,
-            Arc::new(UInt64Array::from(vec![1, 2, 3])) as ArrayRef,
-        ])
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(LargeBinaryArray::from(vec![
+                    json_data[0]
+                        .parse::<jsonb::OwnedJsonb>()
+                        .ok()
+                        .map(|j| j.to_vec())
+                        .as_deref(),
+                    json_data[1]
+                        .parse::<jsonb::OwnedJsonb>()
+                        .ok()
+                        .map(|j| j.to_vec())
+                        .as_deref(),
+                    json_data[2]
+                        .parse::<jsonb::OwnedJsonb>()
+                        .ok()
+                        .map(|j| j.to_vec())
+                        .as_deref(),
+                ])) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![1, 2, 3])) as ArrayRef,
+            ],
+        )
         .unwrap();
 
-        let stream2 =
-            Box::pin(RecordBatchStreamAdapter::new(schema.clone(), stream::iter(vec![Ok(batch2)])))
-                as SendableRecordBatchStream;
+        let stream2 = Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            stream::iter(vec![Ok(batch2)]),
+        )) as SendableRecordBatchStream;
 
         // Test type inference for boolean field
         let (_, inferred_type) =
@@ -962,31 +918,35 @@ mod tests {
         assert_eq!(inferred_type, DataType::Boolean);
 
         // Create test stream for string field
-        let batch3 = RecordBatch::try_new(schema.clone(), vec![
-            Arc::new(LargeBinaryArray::from(vec![
-                json_data[0]
-                    .parse::<jsonb::OwnedJsonb>()
-                    .ok()
-                    .map(|j| j.to_vec())
-                    .as_deref(),
-                json_data[1]
-                    .parse::<jsonb::OwnedJsonb>()
-                    .ok()
-                    .map(|j| j.to_vec())
-                    .as_deref(),
-                json_data[2]
-                    .parse::<jsonb::OwnedJsonb>()
-                    .ok()
-                    .map(|j| j.to_vec())
-                    .as_deref(),
-            ])) as ArrayRef,
-            Arc::new(UInt64Array::from(vec![1, 2, 3])) as ArrayRef,
-        ])
+        let batch3 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(LargeBinaryArray::from(vec![
+                    json_data[0]
+                        .parse::<jsonb::OwnedJsonb>()
+                        .ok()
+                        .map(|j| j.to_vec())
+                        .as_deref(),
+                    json_data[1]
+                        .parse::<jsonb::OwnedJsonb>()
+                        .ok()
+                        .map(|j| j.to_vec())
+                        .as_deref(),
+                    json_data[2]
+                        .parse::<jsonb::OwnedJsonb>()
+                        .ok()
+                        .map(|j| j.to_vec())
+                        .as_deref(),
+                ])) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![1, 2, 3])) as ArrayRef,
+            ],
+        )
         .unwrap();
 
-        let stream3 =
-            Box::pin(RecordBatchStreamAdapter::new(schema, stream::iter(vec![Ok(batch3)])))
-                as SendableRecordBatchStream;
+        let stream3 = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter(vec![Ok(batch3)]),
+        )) as SendableRecordBatchStream;
 
         // Test type inference for string field
         let (_, inferred_type) =

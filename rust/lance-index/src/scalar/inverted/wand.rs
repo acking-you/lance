@@ -1,35 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{
-    cell::UnsafeCell,
-    cmp::Reverse,
-    collections::BinaryHeap,
-    fmt::Debug,
-    ops::Deref,
-    sync::{Arc, LazyLock},
-};
+use std::ops::Deref;
+use std::sync::{Arc, LazyLock};
+use std::{cell::UnsafeCell, collections::BinaryHeap};
+use std::{cmp::Reverse, fmt::Debug};
 
-use arrow::{
-    array::AsArray,
-    datatypes::{Int32Type, UInt32Type},
-};
+use arrow::array::AsArray;
+use arrow::datatypes::{Int32Type, UInt32Type};
 use arrow_array::{Array, UInt32Array};
 use arrow_schema::DataType;
 use itertools::Itertools;
-use lance_core::{
-    utils::{address::RowAddress, mask::RowAddrMask},
-    Result,
-};
+use lance_core::Result;
+use lance_core::utils::address::RowAddress;
+use lance_core::utils::mask::RowAddrMask;
+
+use crate::metrics::MetricsCollector;
 
 use super::{
-    builder::{ScoredDoc, BLOCK_SIZE},
+    CompressedPostingList, DocSet, PostingList, RawDocInfo,
+    builder::ScoredDoc,
     encoding::{decompress_positions, decompress_posting_block, decompress_posting_remainder},
-    query::{FtsSearchParams, Operator},
-    scorer::{idf, Scorer, K1},
-    CompressedPostingList, DocInfo, DocSet, PostingList, RawDocInfo,
+    query::FtsSearchParams,
+    scorer::Scorer,
 };
-use crate::metrics::MetricsCollector;
+use super::{DocInfo, builder::BLOCK_SIZE};
+use super::{
+    query::Operator,
+    scorer::{K1, idf},
+};
 
 const TERMINATED_DOC_ID: u64 = u64::MAX;
 
@@ -144,8 +143,8 @@ impl PostingIterator {
     #[inline]
     fn compressed_state_ptr(&self) -> *mut CompressedState {
         debug_assert!(self.compressed.is_some());
-        // this method is called very frequently, so we prefer to use `UnsafeCell`
-        // instead of `RefCell` to avoid the overhead of runtime borrow checking
+        // this method is called very frequently, so we prefer to use `UnsafeCell` instead of
+        // `RefCell` to avoid the overhead of runtime borrow checking
         self.compressed.as_ref().unwrap().get()
     }
 
@@ -224,12 +223,9 @@ impl PostingIterator {
                 // Read from the decompressed block
                 let doc_id = compressed.doc_ids[block_offset];
                 let frequency = compressed.freqs[block_offset];
-                let doc = DocInfo::Raw(RawDocInfo {
-                    doc_id,
-                    frequency,
-                });
+                let doc = DocInfo::Raw(RawDocInfo { doc_id, frequency });
                 Some(doc)
-            },
+            }
             PostingList::Plain(ref list) => Some(DocInfo::Located(list.doc(self.index))),
         }
     }
@@ -278,10 +274,10 @@ impl PostingIterator {
                     self.index = (block_idx + 1) * BLOCK_SIZE;
                 }
                 self.block_idx = self.index / BLOCK_SIZE;
-            },
+            }
             PostingList::Plain(ref list) => {
                 self.index += list.row_ids[self.index..].partition_point(|&id| id < least_id);
-            },
+            }
         }
     }
 
@@ -295,11 +291,11 @@ impl PostingIterator {
                 {
                     self.block_idx += 1;
                 }
-            },
+            }
             PostingList::Plain(_) => {
                 // we don't have block max score for legacy index,
                 // and no compression, so just do nothing
-            },
+            }
         }
     }
 
@@ -315,7 +311,7 @@ impl PostingIterator {
         match self.list {
             PostingList::Compressed(ref list) => {
                 Some(list.block_least_doc_id(self.block_idx) as u64)
-            },
+            }
             PostingList::Plain(ref plain) => plain.row_ids.get(self.index).cloned(),
         }
     }
@@ -328,7 +324,7 @@ impl PostingIterator {
                     return None;
                 }
                 Some(list.block_least_doc_id(self.block_idx + 1) as u64)
-            },
+            }
             PostingList::Plain(ref plain) => plain.row_ids.get(self.index + 1).cloned(),
         }
     }
@@ -357,8 +353,7 @@ pub struct Wand<'a, S: Scorer> {
 
 // we were using row id as doc id in the past, which is u64,
 // but now we are using the index as doc id, which is u32.
-// so here WAND is a generic struct that can be used for both u32 and u64 doc
-// ids.
+// so here WAND is a generic struct that can be used for both u32 and u64 doc ids.
 impl<'a, S: Scorer> Wand<'a, S> {
     pub(crate) fn new(
         operator: Operator,
@@ -399,17 +394,17 @@ impl<'a, S: Scorer> Wand<'a, S> {
                     <= FLAT_SEARCH_PERCENT_THRESHOLD.deref() * self.docs.len() as u64 =>
             {
                 return self.flat_search(params, row_ids, metrics);
-            },
-            _ => {},
+            }
+            _ => {}
         }
 
         let mut candidates = BinaryHeap::with_capacity(std::cmp::min(limit, BLOCK_SIZE * 10));
         let mut num_comparisons = 0;
         while let Some((pivot, doc)) = self.next()? {
-            if let Some(cur_doc) = self.cur_doc {
-                if cur_doc.doc_id() >= doc.doc_id() {
-                    continue;
-                }
+            if let Some(cur_doc) = self.cur_doc
+                && cur_doc.doc_id() >= doc.doc_id()
+            {
+                continue;
             }
             self.cur_doc = Some(doc);
             num_comparisons += 1;
@@ -418,7 +413,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 DocInfo::Raw(doc) => {
                     // if the doc is not located, we need to find the row id
                     self.docs.row_id(doc.doc_id)
-                },
+                }
                 DocInfo::Located(doc) => doc.row_id,
             };
             if !mask.selected(row_id) {
@@ -442,12 +437,12 @@ impl<'a, S: Scorer> Wand<'a, S> {
             if candidates.len() < limit {
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
                 if candidates.len() == limit {
-                    self.threshold = candidates.peek().unwrap().0 .0.score.0 * params.wand_factor;
+                    self.threshold = candidates.peek().unwrap().0.0.score.0 * params.wand_factor;
                 }
-            } else if score > candidates.peek().unwrap().0 .0.score.0 {
+            } else if score > candidates.peek().unwrap().0.0.score.0 {
                 candidates.pop();
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
-                self.threshold = candidates.peek().unwrap().0 .0.score.0 * params.wand_factor;
+                self.threshold = candidates.peek().unwrap().0.0.score.0 * params.wand_factor;
             }
             self.move_preceding(pivot, doc.doc_id() + 1);
         }
@@ -496,8 +491,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             }
             current_doc = doc_id;
 
-            // even we already know the candidate doc id, we still need to know how many
-            // terms are required to hit the threshold
+            // even we already know the candidate doc id, we still need to know how many terms are required to hit the threshold
             let mut pivot = 0;
             let mut approximate_upper_bound = self.postings[0].approximate_upper_bound();
             while pivot + 1 < self.postings.len() && approximate_upper_bound < self.threshold {
@@ -505,11 +499,11 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 pivot += 1;
             }
 
-            if let Some(least_id) = self.postings[0].block_first_doc() {
-                if least_id > doc_id {
-                    current_doc = least_id;
-                    continue;
-                }
+            if let Some(least_id) = self.postings[0].block_first_doc()
+                && least_id > doc_id
+            {
+                current_doc = least_id;
+                continue;
             }
             let mut max_pivot = 0;
             while max_pivot + 1 < self.postings.len() {
@@ -517,7 +511,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 match self.postings[max_pivot + 1].block_first_doc() {
                     Some(block_doc_id) if block_doc_id <= doc_id => {
                         max_pivot += 1;
-                    },
+                    }
                     _ => break,
                 }
             }
@@ -569,12 +563,12 @@ impl<'a, S: Scorer> Wand<'a, S> {
             if candidates.len() < limit {
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
                 if candidates.len() == limit {
-                    self.threshold = candidates.peek().unwrap().0 .0.score.0 * params.wand_factor;
+                    self.threshold = candidates.peek().unwrap().0.0.score.0 * params.wand_factor;
                 }
-            } else if score > candidates.peek().unwrap().0 .0.score.0 {
+            } else if score > candidates.peek().unwrap().0.0.score.0 {
                 candidates.pop();
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
-                self.threshold = candidates.peek().unwrap().0 .0.score.0 * params.wand_factor;
+                self.threshold = candidates.peek().unwrap().0.0.score.0 * params.wand_factor;
             }
         }
         metrics.record_comparisons(num_comparisons);
@@ -639,9 +633,8 @@ impl<'a, S: Scorer> Wand<'a, S> {
             }
 
             // all the posting iterators preceding pivot have reached this doc id,
-            // this means the sum of upper bound of all terms is not less than the
-            // threshold, this document is a candidate, but we still need to
-            // check filters, positions, etc.
+            // this means the sum of upper bound of all terms is not less than the threshold,
+            // this document is a candidate, but we still need to check filters, positions, etc.
             return Ok(Some((max_pivot, doc)));
         }
         Ok(None)
@@ -691,10 +684,9 @@ impl<'a, S: Scorer> Wand<'a, S> {
         (picked_term, least_id)
     }
 
-    // find the first term that the sum of upper bound of all preceding terms and
-    // itself, are greater than or equal to the threshold.
-    // returns the least pivot and the max index of the terms that have the same doc
-    // id.
+    // find the first term that the sum of upper bound of all preceding terms and itself,
+    // are greater than or equal to the threshold.
+    // returns the least pivot and the max index of the terms that have the same doc id.
     fn find_pivot_term(&self) -> Option<(usize, usize)> {
         if self.operator == Operator::And {
             // for AND query, we always require all terms to be present in the document,
@@ -726,9 +718,8 @@ impl<'a, S: Scorer> Wand<'a, S> {
         Some((pivot, max_pivot))
     }
 
-    // pick the term that has the maximum upper bound and the current doc id is less
-    // than the given doc id so that we can move the posting iterator to the
-    // next doc id that is possible to be candidate
+    // pick the term that has the maximum upper bound and the current doc id is less than the given doc id
+    // so that we can move the posting iterator to the next doc id that is possible to be candidate
     fn move_term(&mut self, picked_term: usize, least_id: u64) {
         self.postings[picked_term].next(least_id);
         let doc_id = self.postings[picked_term]
@@ -813,7 +804,11 @@ impl<'a, S: Scorer> Wand<'a, S> {
                     return false;
                 };
 
-                let move_to = if last > next { last } else { std::cmp::max(last + 1, next - slop) };
+                let move_to = if last > next {
+                    last
+                } else {
+                    std::cmp::max(last + 1, next - slop)
+                };
                 max_relative_pos = max_relative_pos.max(Some(move_to));
                 if !(last <= next && next <= last + slop) {
                     all_same = false;
@@ -868,15 +863,14 @@ impl PositionIterator {
                 ),
                 _ => {
                     unreachable!("position iterator only supports Int32 and UInt32");
-                },
+                }
             }
         } else {
             None
         }
     }
 
-    // move to the next position that the relative position is greater than or equal
-    // to least_pos
+    // move to the next position that the relative position is greater than or equal to least_pos
     fn next(&mut self, least_relative_pos: i32) {
         let least_pos = least_relative_pos + self.position_in_query;
         self.index = match self.positions.data_type() {
@@ -901,11 +895,11 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::scalar::inverted::scorer::IndexBM25Scorer;
     use crate::{
         metrics::NoOpMetricsCollector,
         scalar::inverted::{
-            encoding::compress_posting_list, scorer::IndexBM25Scorer, CompressedPostingList,
-            PlainPostingList,
+            CompressedPostingList, PlainPostingList, encoding::compress_posting_list,
         },
     };
 
@@ -949,8 +943,7 @@ mod tests {
             docs.append(i as u64, 1);
         }
 
-        // when the pivot is greater than 0, and the first posting list is exhausted
-        // after shallow_next
+        // when the pivot is greater than 0, and the first posting list is exhausted after shallow_next
         let postings = vec![
             PostingIterator::new(
                 String::from("test"),
@@ -1064,6 +1057,9 @@ mod tests {
         let posting = PostingIterator::new(String::from("test"), 0, 0, posting_list, 1);
 
         let actual = posting.block_max_score();
-        assert!((actual - expected).abs() < 1e-6, "block max score should match stored value");
+        assert!(
+            (actual - expected).abs() < 1e-6,
+            "block max score should match stored value"
+        );
     }
 }

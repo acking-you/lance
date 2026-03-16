@@ -1,30 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashMap, ops::Bound, sync::Arc};
+use std::collections::HashMap;
+use std::{ops::Bound, sync::Arc};
 
+use arrow_array::Array;
 use arrow_array::{
-    cast::AsArray, types::UInt64Type, Array, ArrayRef, BooleanArray, RecordBatch, UInt64Array,
+    ArrayRef, BooleanArray, RecordBatch, UInt64Array, cast::AsArray, types::UInt64Type,
 };
+
 use datafusion_common::DFSchema;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::create_physical_expr;
 use deepsize::DeepSizeOf;
 use lance_arrow::RecordBatchExt;
-use lance_core::{
-    utils::{
-        address::RowAddress,
-        mask::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps},
-    },
-    Result,
-};
+use lance_core::Result;
+use lance_core::utils::address::RowAddress;
+use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use roaring::RoaringBitmap;
 use tracing::instrument;
 
-use crate::{
-    metrics::MetricsCollector,
-    scalar::{btree::BTREE_VALUES_COLUMN, AnyQuery, SargableQuery},
-};
+use crate::metrics::MetricsCollector;
+use crate::scalar::btree::BTREE_VALUES_COLUMN;
+use crate::scalar::{AnyQuery, SargableQuery};
 
 const VALUES_COL_IDX: usize = 0;
 const IDS_COL_IDX: usize = 1;
@@ -63,8 +61,11 @@ impl FlatIndex {
                 .copied(),
         )?;
 
-        let null_addrs_map =
-            if has_nulls { Self::get_null_addrs(&data)? } else { RowAddrTreeMap::default() };
+        let null_addrs_map = if has_nulls {
+            Self::get_null_addrs(&data)?
+        } else {
+            RowAddrTreeMap::default()
+        };
 
         let df_schema = DFSchema::try_from(data.schema())?;
 
@@ -116,7 +117,10 @@ impl FlatIndex {
         );
         let new_vals =
             arrow_select::take::take(batch.column(VALUES_COL_IDX), &new_val_indices, None)?;
-        Ok(RecordBatch::try_new(batch.schema(), vec![new_vals, new_ids])?)
+        Ok(RecordBatch::try_new(
+            batch.schema(),
+            vec![new_vals, new_ids],
+        )?)
     }
 
     fn get_null_addrs(sorted_batch: &RecordBatch) -> Result<RowAddrTreeMap> {
@@ -150,14 +154,14 @@ impl FlatIndex {
                         self.all_addrs_map.clone(),
                     ));
                 }
-            },
+            }
             // x IS NULL we can use pre-computed nulls
             SargableQuery::IsNull() => {
                 return Ok(NullableRowAddrSet::new(
                     self.null_addrs_map.clone(),
                     Default::default(),
                 ));
-            },
+            }
             // x < NULL or x > NULL means all rows are NULL
             SargableQuery::Range(lower_bound, upper_bound) => match (lower_bound, upper_bound) {
                 (Bound::Unbounded, Bound::Unbounded) => {
@@ -165,7 +169,7 @@ impl FlatIndex {
                         self.all_addrs_map.clone(),
                         Default::default(),
                     ));
-                },
+                }
                 (Bound::Unbounded, Bound::Included(upper) | Bound::Excluded(upper)) => {
                     if upper.is_null() {
                         return Ok(NullableRowAddrSet::new(
@@ -173,7 +177,7 @@ impl FlatIndex {
                             self.all_addrs_map.clone(),
                         ));
                     }
-                },
+                }
                 (Bound::Included(lower) | Bound::Excluded(lower), Bound::Unbounded) => {
                     if lower.is_null() {
                         return Ok(NullableRowAddrSet::new(
@@ -181,10 +185,10 @@ impl FlatIndex {
                             self.all_addrs_map.clone(),
                         ));
                     }
-                },
-                _ => {},
+                }
+                _ => {}
             },
-            _ => {},
+            _ => {}
         };
 
         // No shortcut possible, need to actually evaluate the query
@@ -231,19 +235,22 @@ impl FlatIndex {
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{record_batch, types::Int32Type};
-    use datafusion_common::ScalarValue;
-    use lance_datagen::{array, gen_batch, RowCount};
-
-    use super::*;
     use crate::{
         metrics::NoOpMetricsCollector,
         scalar::btree::{BTREE_IDS_COLUMN, BTREE_VALUES_COLUMN},
     };
 
+    use super::*;
+    use arrow_array::{record_batch, types::Int32Type};
+    use datafusion_common::ScalarValue;
+    use lance_datagen::{RowCount, array, gen_batch};
+
     fn example_index() -> FlatIndex {
         let batch = gen_batch()
-            .col("values", array::cycle::<Int32Type>(vec![10, 100, 1000, 1234]))
+            .col(
+                "values",
+                array::cycle::<Int32Type>(vec![10, 100, 1000, 1234]),
+            )
             .col("ids", array::cycle::<UInt64Type>(vec![5, 0, 3, 100]))
             .into_batch_rows(RowCount::from(4))
             .unwrap();
@@ -328,8 +335,8 @@ mod tests {
         assert_eq!(remapped.data, expected.data);
     }
 
-    // It's possible, during compaction, that an entire page of values is deleted.
-    // We just serialize it as an empty record batch.
+    // It's possible, during compaction, that an entire page of values is deleted.  We just serialize
+    // it as an empty record batch.
     #[tokio::test]
     async fn test_remap_to_nothing() {
         let index = example_index();
@@ -376,28 +383,43 @@ mod tests {
 
         check(SargableQuery::IsNull(), &[0], &[]);
 
-        check(SargableQuery::Range(Bound::Included(three.clone()), Bound::Unbounded), &[2], &[0]);
+        check(
+            SargableQuery::Range(Bound::Included(three.clone()), Bound::Unbounded),
+            &[2],
+            &[0],
+        );
 
         // x < NULL or x > NULL returns everything as NULL
-        check(SargableQuery::Range(Bound::Unbounded, Bound::Included(null.clone())), &[], &[
-            0, 1, 2,
-        ]);
+        check(
+            SargableQuery::Range(Bound::Unbounded, Bound::Included(null.clone())),
+            &[],
+            &[0, 1, 2],
+        );
 
-        check(SargableQuery::Range(Bound::Excluded(null.clone()), Bound::Unbounded), &[], &[
-            0, 1, 2,
-        ]);
+        check(
+            SargableQuery::Range(Bound::Excluded(null.clone()), Bound::Unbounded),
+            &[],
+            &[0, 1, 2],
+        );
 
         // x BETWEEN 3 AND NULL returns everything as NULL unless we know it is FALSE
         check(
-            SargableQuery::Range(Bound::Included(three.clone()), Bound::Included(null.clone())),
+            SargableQuery::Range(
+                Bound::Included(three.clone()),
+                Bound::Included(null.clone()),
+            ),
             &[],
             &[0, 2],
         );
-        check(SargableQuery::Range(Bound::Included(null.clone()), Bound::Included(three)), &[], &[
-            0, 1,
-        ]);
-        check(SargableQuery::Range(Bound::Included(null.clone()), Bound::Included(null)), &[], &[
-            0, 1, 2,
-        ]);
+        check(
+            SargableQuery::Range(Bound::Included(null.clone()), Bound::Included(three)),
+            &[],
+            &[0, 1],
+        );
+        check(
+            SargableQuery::Range(Bound::Included(null.clone()), Bound::Included(null)),
+            &[],
+            &[0, 1, 2],
+        );
     }
 }

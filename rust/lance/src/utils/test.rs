@@ -15,12 +15,10 @@ use lance_datagen::{BatchCount, BatchGeneratorBuilder, ByteCount, RowCount};
 use lance_file::version::LanceFileVersion;
 use lance_table::format::Fragment;
 use rand::{prelude::SliceRandom, Rng, SeedableRng};
-use snafu::location;
-
-use crate::{
-    dataset::{fragment::write::FragmentCreateBuilder, transaction::Operation, WriteParams},
-    Dataset,
-};
+use crate::dataset::WriteParams;
+use crate::dataset::fragment::write::FragmentCreateBuilder;
+use crate::dataset::transaction::Operation;
+use crate::Dataset;
 
 mod throttle_store;
 
@@ -94,13 +92,14 @@ impl TestDatasetGenerator {
 
                 let fields = field_structure(&fragment);
                 let first_fields = fragments.first().map(field_structure);
-                if let Some(first_fields) = first_fields {
-                    if fields == first_fields && schema.fields.len() > 1 {
-                        // The layout is the same as the first fragment, try again
-                        // If there's only one field, then we can't expect a different
-                        // layout, so there's an exception for that.
-                        continue;
-                    }
+                if let Some(first_fields) = first_fields
+                    && fields == first_fields
+                    && schema.fields.len() > 1
+                {
+                    // The layout is the same as the first fragment, try again
+                    // If there's only one field, then we can't expect a different
+                    // layout, so there's an exception for that.
+                    continue;
                 }
 
                 fragment.id = id;
@@ -463,28 +462,26 @@ pub fn assert_string_matches(actual: &str, expected_pattern: &str) -> lance_core
             _ => remainder.contains(piece),
         };
         if !res {
-            return Err(lance_core::Error::InvalidInput {
-                source: format!(
+            return Err(lance_core::Error::invalid_input_source(
+                format!(
                     "Expected string to match:\nExpected: {}\nActual: {}",
                     expected_pattern, actual
                 )
                 .into(),
-                location: location!(),
-            });
+            ));
         }
         let idx = remainder.find(piece).unwrap();
         remainder = &remainder[idx + piece.len()..];
     }
 
     if !remainder.is_empty() {
-        return Err(lance_core::Error::InvalidInput {
-            source: format!(
+        return Err(lance_core::Error::invalid_input_source(
+            format!(
                 "Expected string to match:\nExpected: {}\nActual: {}",
                 expected_pattern, actual
             )
             .into(),
-            location: location!(),
-        });
+        ));
     }
 
     Ok(())

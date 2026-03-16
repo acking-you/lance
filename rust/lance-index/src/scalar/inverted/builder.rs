@@ -1,60 +1,47 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{
-    collections::HashMap,
-    fmt::Debug,
-    pin::Pin,
-    str::FromStr,
-    sync::{atomic::AtomicU64, Arc, LazyLock},
-    task::{Context, Poll},
+use super::{
+    InvertedIndexParams,
+    index::*,
+    merger::{Merger, PartitionSource, SizeBasedMerger},
 };
-
-use arrow::{array::AsArray, datatypes};
+use crate::scalar::IndexStore;
+use crate::scalar::inverted::json::JsonTextStream;
+use crate::scalar::inverted::lance_tokenizer::DocType;
+use crate::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
+use crate::scalar::lance_format::LanceIndexStore;
+use crate::vector::graph::OrderedFloat;
+use crate::{progress::IndexBuildProgress, progress::noop_progress};
+use arrow::array::AsArray;
+use arrow::datatypes;
 use arrow_array::{Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use bitpacking::{BitPacker, BitPacker4x};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream};
 use deepsize::DeepSizeOf;
 use futures::{Stream, StreamExt, TryStreamExt};
-use lance_arrow::{iter_str_array, json::JSON_EXT_NAME, ARROW_EXT_NAME_KEY};
-use lance_core::{
-    cache::LanceCache,
-    error::LanceOptionExt,
-    utils::{
-        tempfile::TempDir,
-        tokio::{get_num_compute_intensive_cpus, spawn_cpu},
-    },
-    Error, Result, ROW_ID, ROW_ID_FIELD,
-};
+use lance_arrow::json::JSON_EXT_NAME;
+use lance_arrow::{ARROW_EXT_NAME_KEY, iter_str_array};
+use lance_core::cache::LanceCache;
+use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
+use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
+use lance_core::{error::LanceOptionExt, utils::tempfile::TempDir};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 use smallvec::SmallVec;
-use snafu::location;
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::LazyLock;
+use std::task::{Context, Poll};
+use std::{fmt::Debug, sync::atomic::AtomicU64};
 use tracing::instrument;
-
-use super::{
-    index::*,
-    merger::{Merger, PartitionSource, SizeBasedMerger},
-    InvertedIndexParams,
-};
-use crate::{
-    progress::{noop_progress, IndexBuildProgress},
-    scalar::{
-        inverted::{
-            json::JsonTextStream, lance_tokenizer::DocType,
-            tokenizer::lance_tokenizer::LanceTokenizer,
-        },
-        lance_format::LanceIndexStore,
-        IndexStore,
-    },
-    vector::graph::OrderedFloat,
-};
 
 // the number of elements in each block
 // each block contains 128 row ids and 128 frequencies
-// WARNING: changing this value will break the compatibility with existing
-// indexes
+// WARNING: changing this value will break the compatibility with existing indexes
 pub const BLOCK_SIZE: usize = BitPacker4x::BLOCK_LEN;
 
 // the number of shards to split the indexing work,
@@ -111,13 +98,12 @@ impl InvertedIndexBuilder {
         )
     }
 
-    /// Creates an InvertedIndexBuilder from existing index with fragment
-    /// filtering. This method is used to create a builder from an existing
-    /// index while applying fragment-based filtering for distributed
-    /// indexing scenarios. fragment_mask Optional mask with fragment_id in
-    /// high 32 bits for filtering. Constructed as `(fragment_id as u64) <<
-    /// 32`. When provided, ensures that generated IDs belong to the
-    /// specified fragment.
+    /// Creates an InvertedIndexBuilder from existing index with fragment filtering.
+    /// This method is used to create a builder from an existing index while applying
+    /// fragment-based filtering for distributed indexing scenarios.
+    /// fragment_mask Optional mask with fragment_id in high 32 bits for filtering.
+    /// Constructed as `(fragment_id as u64) << 32`.
+    /// When provided, ensures that generated IDs belong to the specified fragment.
     pub fn from_existing_index(
         params: InvertedIndexParams,
         store: Option<Arc<dyn IndexStore>>,
@@ -302,7 +288,10 @@ impl InvertedIndexBuilder {
         let metadata = HashMap::from_iter(vec![
             ("partitions".to_owned(), serde_json::to_string(&partitions)?),
             ("params".to_owned(), serde_json::to_string(&self.params)?),
-            (TOKEN_SET_FORMAT_KEY.to_owned(), self.token_set_format.to_string()),
+            (
+                TOKEN_SET_FORMAT_KEY.to_owned(),
+                self.token_set_format.to_string(),
+            ),
         ]);
         let mut writer = dest_store
             .new_index_file(METADATA_FILE, Arc::new(Schema::empty()))
@@ -313,10 +302,8 @@ impl InvertedIndexBuilder {
 
     /// Write partition metadata file for a single partition
     ///
-    /// In a distributed environment, each worker node can write partition
-    /// metadata files for the partitions it processes, which are then
-    /// merged into a final metadata file using the `merge_metadata_files`
-    /// function.
+    /// In a distributed environment, each worker node can write partition metadata files for the partitions it processes,
+    /// which are then merged into a final metadata file using the `merge_metadata_files` function.
     pub(crate) async fn write_part_metadata(
         &self,
         dest_store: &dyn IndexStore,
@@ -326,7 +313,10 @@ impl InvertedIndexBuilder {
         let metadata = HashMap::from_iter(vec![
             ("partitions".to_owned(), serde_json::to_string(&partitions)?),
             ("params".to_owned(), serde_json::to_string(&self.params)?),
-            (TOKEN_SET_FORMAT_KEY.to_owned(), self.token_set_format.to_string()),
+            (
+                TOKEN_SET_FORMAT_KEY.to_owned(),
+                self.token_set_format.to_string(),
+            ),
         ]);
         // Use partition ID to generate a unique temporary filename
         let file_name = part_metadata_file_path(partition);
@@ -342,8 +332,11 @@ impl InvertedIndexBuilder {
         dest_store: &dyn IndexStore,
         partitions: &[u64],
     ) -> Result<()> {
-        let total =
-            if self.fragment_mask.is_none() { Some(1) } else { Some(partitions.len() as u64) };
+        let total = if self.fragment_mask.is_none() {
+            Some(1)
+        } else {
+            Some(partitions.len() as u64)
+        };
         self.progress
             .stage_start("write_metadata", total, "files")
             .await?;
@@ -373,7 +366,11 @@ impl InvertedIndexBuilder {
             partitions.sort_unstable();
 
             self.progress
-                .stage_start("copy_partitions", Some(partitions.len() as u64), "partitions")
+                .stage_start(
+                    "copy_partitions",
+                    Some(partitions.len() as u64),
+                    "partitions",
+                )
                 .await?;
             let mut copied = 0;
             for part in self.partitions.iter() {
@@ -424,7 +421,11 @@ impl InvertedIndexBuilder {
             )
             .collect::<Vec<_>>();
         self.progress
-            .stage_start("merge_partitions", Some(partitions.len() as u64), "partitions")
+            .stage_start(
+                "merge_partitions",
+                Some(partitions.len() as u64),
+                "partitions",
+            )
             .await?;
         let mut merger = SizeBasedMerger::new(
             dest_store,
@@ -498,8 +499,7 @@ impl InnerBuilder {
 
         // for the posting lists, we need to remap the doc ids:
         // - if the a row is removed, we need to shift the doc ids of the following rows
-        // - if a row is updated (assigned a new row id), we don't need to do anything
-        //   with the posting lists
+        // - if a row is updated (assigned a new row id), we don't need to do anything with the posting lists
         let mut token_id = 0;
         let mut removed_token_ids = Vec::new();
         self.posting_lists.retain_mut(|posting_list| {
@@ -534,7 +534,10 @@ impl InnerBuilder {
     ) -> Result<()> {
         let id = self.id;
         let mut writer = store
-            .new_index_file(&posting_file_path(self.id), inverted_list_schema(self.with_position))
+            .new_index_file(
+                &posting_file_path(self.id),
+                inverted_list_schema(self.with_position),
+            )
             .await?;
         let posting_lists = std::mem::take(&mut self.posting_lists);
 
@@ -547,30 +550,31 @@ impl InnerBuilder {
         let schema = inverted_list_schema(self.with_position);
         let docs_for_batches = docs.clone();
         let schema_for_batches = schema.clone();
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(2);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let producer = spawn_cpu(move || {
             for posting_list in posting_lists {
-                let batch =
-                    posting_list.to_batch_with_docs(&docs_for_batches, schema_for_batches.clone());
-                let is_err = batch.is_err();
-                if tx.blocking_send(batch).is_err() {
-                    break;
-                }
-                if is_err {
-                    break;
+                let batch = posting_list
+                    .to_batch_with_docs(&docs_for_batches, schema_for_batches.clone())?;
+                if let Err(err) = tx.send(batch) {
+                    return Err(Error::execution(format!(
+                        "failed to send posting list batch to writer: {err}"
+                    )));
                 }
             }
-            Ok(())
+            Result::Ok(())
         });
 
         let mut write_duration = std::time::Duration::ZERO;
         let mut num_posting_lists = 0;
         while let Some(batch) = rx.recv().await {
-            let batch = batch?;
             num_posting_lists += 1;
             let start = std::time::Instant::now();
-            writer.write_record_batch(batch).await?;
+            if let Err(err) = writer.write_record_batch(batch).await {
+                drop(rx);
+                // Wait for producer to stop; preserve the write error as the primary failure.
+                let _ = producer.await;
+                return Err(err);
+            }
             write_duration += start.elapsed();
 
             if num_posting_lists % 500_000 == 0 {
@@ -582,11 +586,9 @@ impl InnerBuilder {
                 );
             }
         }
-
-        // Errors from batch generation are sent through the channel and surfaced via
-        // `batch?`. Awaiting the producer here is just to propagate
-        // panics/cancellation.
+        drop(rx);
         producer.await?;
+
         writer.finish().await?;
         Ok(())
     }
@@ -719,7 +721,9 @@ impl IndexWorker {
             }
             self.builder
                 .posting_lists
-                .resize_with(self.builder.tokens.len(), || PostingListBuilder::new(with_position));
+                .resize_with(self.builder.tokens.len(), || {
+                    PostingListBuilder::new(with_position)
+                });
             let doc_id = self.builder.docs.append(row_id, token_num);
             self.total_doc_length += doc.len();
 
@@ -946,11 +950,11 @@ impl FlattenStream {
             DataType::List(f) if matches!(f.data_type(), DataType::Utf8) => DataType::Utf8,
             DataType::List(f) if matches!(f.data_type(), DataType::LargeUtf8) => {
                 DataType::LargeUtf8
-            },
+            }
             DataType::LargeList(f) if matches!(f.data_type(), DataType::Utf8) => DataType::Utf8,
             DataType::LargeList(f) if matches!(f.data_type(), DataType::LargeUtf8) => {
                 DataType::LargeUtf8
-            },
+            }
             _ => panic!(
                 "expect data type List(Utf8) or List(LargeUtf8) but got {:?}",
                 field.data_type()
@@ -985,14 +989,14 @@ impl Stream for FlattenStream {
                                 e
                             ))
                         })
-                    },
+                    }
                     _ => unreachable!(
                         "expect data type List or LargeList but got {:?}",
                         self.field_type
                     ),
                 };
                 Poll::Ready(Some(batch))
-            },
+            }
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
@@ -1003,7 +1007,11 @@ impl Stream for FlattenStream {
 impl RecordBatchStream for FlattenStream {
     fn schema(&self) -> SchemaRef {
         let schema = Schema::new(vec![
-            Field::new(self.inner.schema().field(0).name(), self.data_type.clone(), true),
+            Field::new(
+                self.inner.schema().field(0).name(),
+                self.data_type.clone(),
+                true,
+            ),
             ROW_ID_FIELD.clone(),
         ]);
 
@@ -1028,18 +1036,19 @@ fn flatten_string_list<Offset: arrow::array::OffsetSizeTrait>(
     let docs = match docs.value_type() {
         datatypes::DataType::Utf8 | datatypes::DataType::LargeUtf8 => docs.values().clone(),
         _ => {
-            return Err(Error::Index {
-                message: format!(
-                    "expect data type String or LargeString but got {}",
-                    docs.value_type()
-                ),
-                location: location!(),
-            });
-        },
+            return Err(Error::index(format!(
+                "expect data type String or LargeString but got {}",
+                docs.value_type()
+            )));
+        }
     };
 
     let schema = Schema::new(vec![
-        Field::new(batch.schema().field(0).name(), docs.data_type().clone(), true),
+        Field::new(
+            batch.schema().field(0).name(),
+            docs.data_type().clone(),
+            true,
+        ),
         ROW_ID_FIELD.clone(),
     ]);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![docs, row_ids])?;
@@ -1089,24 +1098,25 @@ async fn list_metadata_files(object_store: &ObjectStore, index_dir: &Path) -> Re
                 if file_name.starts_with("part_") && file_name.ends_with("_metadata.lance") {
                     part_metadata_files.push(file_name.to_string());
                 }
-            },
+            }
             Err(_) => continue,
         }
     }
 
     if part_metadata_files.is_empty() {
-        return Err(Error::InvalidInput {
-            source: format!("No partition metadata files found in index directory: {}", index_dir)
-                .into(),
-            location: location!(),
-        });
+        return Err(Error::invalid_input_source(
+            format!(
+                "No partition metadata files found in index directory: {}",
+                index_dir
+            )
+            .into(),
+        ));
     }
 
     Ok(part_metadata_files)
 }
 
-/// Merge partition metadata files with partition ID remapping to sequential IDs
-/// starting from 0
+/// Merge partition metadata files with partition ID remapping to sequential IDs starting from 0
 async fn merge_metadata_files(
     store: Arc<dyn IndexStore>,
     part_metadata_files: &[String],
@@ -1120,37 +1130,30 @@ async fn merge_metadata_files(
         let reader = store.open_index_file(file_name).await?;
         let metadata = &reader.schema().metadata;
 
-        let partitions_str = metadata.get("partitions").ok_or(Error::Index {
-            message: format!("partitions not found in {}", file_name),
-            location: location!(),
-        })?;
+        let partitions_str = metadata.get("partitions").ok_or(Error::index(format!(
+            "partitions not found in {}",
+            file_name
+        )))?;
 
-        let partition_ids: Vec<u64> =
-            serde_json::from_str(partitions_str).map_err(|e| Error::Index {
-                message: format!("Failed to parse partitions: {}", e),
-                location: location!(),
-            })?;
+        let partition_ids: Vec<u64> = serde_json::from_str(partitions_str)
+            .map_err(|e| Error::index(format!("Failed to parse partitions: {}", e)))?;
 
         all_partitions.extend(partition_ids);
 
         if params.is_none() {
-            let params_str = metadata.get("params").ok_or(Error::Index {
-                message: format!("params not found in {}", file_name),
-                location: location!(),
-            })?;
-            params =
-                Some(serde_json::from_str::<InvertedIndexParams>(params_str).map_err(|e| {
-                    Error::Index {
-                        message: format!("Failed to parse params: {}", e),
-                        location: location!(),
-                    }
-                })?);
+            let params_str = metadata
+                .get("params")
+                .ok_or(Error::index(format!("params not found in {}", file_name)))?;
+            params = Some(
+                serde_json::from_str::<InvertedIndexParams>(params_str)
+                    .map_err(|e| Error::index(format!("Failed to parse params: {}", e)))?,
+            );
         }
 
-        if token_set_format.is_none() {
-            if let Some(name) = metadata.get(TOKEN_SET_FORMAT_KEY) {
-                token_set_format = Some(TokenSetFormat::from_str(name)?);
-            }
+        if token_set_format.is_none()
+            && let Some(name) = metadata.get(TOKEN_SET_FORMAT_KEY)
+        {
+            token_set_format = Some(TokenSetFormat::from_str(name)?);
         }
     }
 
@@ -1187,13 +1190,10 @@ async fn merge_metadata_files(
                     for (temp_name, old_name, _) in temp_files.iter().rev() {
                         let _ = store.rename_index_file(temp_name, old_name).await;
                     }
-                    return Err(Error::Index {
-                        message: format!(
-                            "Failed to move {} to temp {}: {}",
-                            old_path, temp_path, e
-                        ),
-                        location: location!(),
-                    });
+                    return Err(Error::index(format!(
+                        "Failed to move {} to temp {}: {}",
+                        old_path, temp_path, e
+                    )));
                 }
                 temp_files.push((temp_path, old_path, new_path));
             }
@@ -1215,10 +1215,10 @@ async fn merge_metadata_files(
                     let _ = store.rename_index_file(temp_name, orig_name).await;
                 }
             }
-            return Err(Error::Index {
-                message: format!("Failed to rename {} to {}: {}", temp_path, final_path, e),
-                location: location!(),
-            });
+            return Err(Error::index(format!(
+                "Failed to rename {} to {}: {}",
+                temp_path, final_path, e
+            )));
         }
         completed_renames.push((final_path.clone(), temp_path.clone()));
     }
@@ -1266,50 +1266,43 @@ pub fn document_input(
             if matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) =>
         {
             Ok(Box::pin(FlattenStream::new(input)))
-        },
+        }
         DataType::LargeBinary => match field.metadata().get(ARROW_EXT_NAME_KEY) {
             Some(name) if name.as_str() == JSON_EXT_NAME => {
                 Ok(Box::pin(JsonTextStream::new(input, column.to_string())))
-            },
-            _ => Err(Error::InvalidInput {
-                source: format!("column {} is not json", column).into(),
-                location: location!(),
-            }),
+            }
+            _ => Err(Error::invalid_input_source(
+                format!("column {} is not json", column).into(),
+            )),
         },
-        _ => Err(Error::InvalidInput {
-            source: format!(
+        _ => Err(Error::invalid_input_source(
+            format!(
                 "column {} has type {}, is not utf8, large utf8 type/list, or large binary",
                 column,
                 field.data_type()
             )
             .into(),
-            location: location!(),
-        }),
+        )),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        any::Any,
-        sync::atomic::{AtomicU64, AtomicUsize, Ordering},
-    };
-
+    use super::*;
+    use crate::metrics::NoOpMetricsCollector;
+    use crate::progress::IndexBuildProgress;
+    use crate::scalar::{IndexReader, IndexWriter};
     use arrow_array::{RecordBatch, StringArray, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
-    use lance_core::{cache::LanceCache, utils::tempfile::TempDir, ROW_ID};
-    use snafu::location;
+    use lance_core::ROW_ID;
+    use lance_core::cache::LanceCache;
+    use lance_core::utils::tempfile::TempDir;
+    use std::any::Any;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use tokio::sync::Mutex;
-
-    use super::*;
-    use crate::{
-        metrics::NoOpMetricsCollector,
-        progress::IndexBuildProgress,
-        scalar::{IndexReader, IndexWriter},
-    };
 
     fn make_doc_batch(doc: &str, row_id: u64) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
@@ -1385,19 +1378,27 @@ mod tests {
         }
 
         async fn open_index_file(&self, _name: &str) -> Result<Arc<dyn IndexReader>> {
-            Err(Error::not_supported("CountingStore does not support reading", location!()))
+            Err(Error::not_supported(
+                "CountingStore does not support reading",
+            ))
         }
 
         async fn copy_index_file(&self, _name: &str, _dest_store: &dyn IndexStore) -> Result<()> {
-            Err(Error::not_supported("CountingStore does not support copying", location!()))
+            Err(Error::not_supported(
+                "CountingStore does not support copying",
+            ))
         }
 
         async fn rename_index_file(&self, _name: &str, _new_name: &str) -> Result<()> {
-            Err(Error::not_supported("CountingStore does not support renaming", location!()))
+            Err(Error::not_supported(
+                "CountingStore does not support renaming",
+            ))
         }
 
         async fn delete_index_file(&self, _name: &str) -> Result<()> {
-            Err(Error::not_supported("CountingStore does not support deleting", location!()))
+            Err(Error::not_supported(
+                "CountingStore does not support deleting",
+            ))
         }
     }
 

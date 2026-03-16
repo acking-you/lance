@@ -20,22 +20,25 @@ use async_trait::async_trait;
 pub use builder::InvertedIndexBuilder;
 use datafusion::execution::SendableRecordBatchStream;
 pub use index::*;
-use lance_core::{cache::LanceCache, Error, Result};
-use snafu::location;
+use lance_core::{Result, cache::LanceCache};
+pub use scorer::MemBM25Scorer;
 use tantivy::tokenizer::Language;
 pub use tokenizer::*;
 
-use super::IndexStore;
+use lance_core::Error;
+
+use crate::pbold;
+use crate::progress::IndexBuildProgress;
 use crate::{
     frag_reuse::FragReuseIndex,
-    pbold,
-    progress::IndexBuildProgress,
     scalar::{
+        CreatedIndex, ScalarIndex,
         expression::{FtsQueryParser, ScalarQueryParser},
         registry::{ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest},
-        CreatedIndex, ScalarIndex,
     },
 };
+
+use super::IndexStore;
 
 #[derive(Debug, Default)]
 pub struct InvertedIndexPlugin;
@@ -115,23 +118,15 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         field: &Field,
     ) -> Result<Box<dyn TrainingRequest>> {
         match field.data_type() {
-            DataType::Utf8 | DataType::LargeUtf8 | DataType::LargeBinary => {},
-            DataType::List(f) if matches!(f.data_type(), DataType::Utf8 | DataType::LargeUtf8) => {
-            },
-            DataType::LargeList(f)
-                if matches!(f.data_type(), DataType::Utf8 | DataType::LargeUtf8) => {},
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::LargeBinary => (),
+            DataType::List(f) if matches!(f.data_type(), DataType::Utf8 | DataType::LargeUtf8) => (),
+            DataType::LargeList(f) if matches!(f.data_type(), DataType::Utf8 | DataType::LargeUtf8) => (),
 
-            _ => {
-                return Err(Error::InvalidInput {
-                    source: format!(
-                        "A inverted index can only be created on a Utf8 or LargeUtf8 field/list \
-                         or LargeBinary field. Column has type {:?}",
-                        field.data_type()
-                    )
-                    .into(),
-                    location: location!(),
-                })
-            },
+            _ => return Err(Error::invalid_input_source(format!(
+                "A inverted index can only be created on a Utf8 or LargeUtf8 field/list or LargeBinary field. Column has type {:?}",
+                field.data_type()
+            )
+                .into()))
         }
 
         let params = serde_json::from_str::<InvertedIndexParams>(params)?;
@@ -164,14 +159,12 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
 
     /// Train a new index
     ///
-    /// The provided data must fulfill all the criteria returned by
-    /// `training_criteria`. It is the caller's responsibility to ensure
-    /// this.
+    /// The provided data must fulfill all the criteria returned by `training_criteria`.
+    /// It is the caller's responsibility to ensure this.
     ///
-    /// Returns index details that describe the index.  These details can
-    /// potentially be useful for planning (although this will currently
-    /// require inside information on the index type) and they will need to
-    /// be provided when loading the index.
+    /// Returns index details that describe the index.  These details can potentially be
+    /// useful for planning (although this will currently require inside information on
+    /// the index type) and they will need to be provided when loading the index.
     ///
     /// It is the caller's responsibility to store these details somewhere.
     async fn train_index(
@@ -184,9 +177,10 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
     ) -> Result<CreatedIndex> {
         let request = (request as Box<dyn std::any::Any>)
             .downcast::<InvertedIndexTrainingRequest>()
-            .map_err(|_| Error::InvalidInput {
-                source: "must provide training request created by new_training_request".into(),
-                location: location!(),
+            .map_err(|_| {
+                Error::invalid_input_source(
+                    "must provide training request created by new_training_request".into(),
+                )
             })?;
         Self::train_inverted_index(
             data,
@@ -200,8 +194,8 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
 
     /// Load an index from storage
     ///
-    /// The index details should match the details that were returned when the
-    /// index was originally trained.
+    /// The index details should match the details that were returned when the index was
+    /// originally trained.
     async fn load_index(
         &self,
         index_store: Arc<dyn IndexStore>,
@@ -209,7 +203,10 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        Ok(InvertedIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
+        Ok(
+            InvertedIndex::load(index_store, frag_reuse_index, cache).await?
+                as Arc<dyn ScalarIndex>,
+        )
     }
 
     fn details_as_json(&self, details: &prost_types::Any) -> Result<serde_json::Value> {
