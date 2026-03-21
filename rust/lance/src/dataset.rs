@@ -30,7 +30,7 @@ use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::reader::FileReaderOptions;
 use lance_file::version::LanceFileVersion;
-use lance_index::{DatasetIndexExt, IndexType};
+use lance_index::{DatasetIndexExt, IndexType, frag_reuse::FRAG_REUSE_INDEX_NAME};
 use lance_io::object_store::{
     LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams, StorageOptions,
     StorageOptionsAccessor, StorageOptionsProvider,
@@ -1548,6 +1548,51 @@ impl Dataset {
 
     pub fn object_store(&self) -> &ObjectStore {
         &self.object_store
+    }
+
+    /// Remove stale frag_reuse index metadata from a dataset that no longer needs it.
+    ///
+    /// Older Lance versions could leave a `__lance_frag_reuse` manifest entry behind after the
+    /// corresponding compaction state was already obsolete. Datasets with stable row ids do not
+    /// need frag_reuse. Datasets without stable row ids can also drop frag_reuse safely when there
+    /// are no other indices left to remap against.
+    pub async fn repair_missing_frag_reuse_index(&self) -> Result<Option<Self>> {
+        let indices =
+            read_manifest_indexes(self.object_store(), self.manifest_location(), self.manifest())
+                .await?;
+        let uses_stable_row_ids = self.manifest().uses_stable_row_ids();
+        let has_non_frag_reuse_index = indices.iter().any(|index| index.name != FRAG_REUSE_INDEX_NAME);
+        if !uses_stable_row_ids && has_non_frag_reuse_index {
+            return Ok(None);
+        }
+        let broken_indices = indices
+            .into_iter()
+            .filter(|index| index.name == FRAG_REUSE_INDEX_NAME)
+            .collect::<Vec<_>>();
+
+        if broken_indices.is_empty() {
+            return Ok(None);
+        }
+
+        let mut dataset = self.clone();
+        let transaction = Transaction::new(
+            self.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![],
+                removed_indices: broken_indices.clone(),
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await?;
+
+        info!(
+            removed_frag_reuse_indices = broken_indices.len(),
+            dataset_version = self.manifest.version,
+            "removed broken frag_reuse index metadata from stable-row-id dataset"
+        );
+        Ok(Some(dataset))
     }
 
     /// Clone this dataset with a different object store binding.

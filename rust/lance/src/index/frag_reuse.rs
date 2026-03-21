@@ -6,18 +6,17 @@ use crate::dataset::optimize::remapping::transpose_row_ids_from_digest;
 use lance_core::Error;
 use lance_index::DatasetIndexExt;
 use lance_index::frag_reuse::{
-    FRAG_REUSE_DETAILS_FILE_NAME, FRAG_REUSE_INDEX_NAME, FragReuseGroup, FragReuseIndex,
-    FragReuseIndexDetails, FragReuseVersion,
+    FRAG_REUSE_INDEX_NAME, FragReuseGroup, FragReuseIndex, FragReuseIndexDetails,
+    FragReuseVersion,
 };
 use lance_table::format::IndexMetadata;
 use lance_table::format::pb::fragment_reuse_index_details::{Content, InlineContent};
-use lance_table::format::pb::{ExternalFile, FragmentReuseIndexDetails};
+use lance_table::format::pb::FragmentReuseIndexDetails;
 use prost::Message;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 /// Load fragment reuse index details from index metadata
@@ -137,29 +136,16 @@ pub(crate) async fn build_frag_reuse_index_metadata(
     new_fragment_bitmap: RoaringBitmap,
 ) -> lance_core::Result<IndexMetadata> {
     let index_id = uuid::Uuid::new_v4();
-    let new_index_details_proto = InlineContent::from(&new_index_details);
-    let proto = if new_index_details_proto.encoded_len() > 204800 {
-        let file_path = dataset
-            .indices_dir()
-            .child(index_id.to_string())
-            .child(FRAG_REUSE_DETAILS_FILE_NAME);
-        let mut writer = dataset.object_store.create(&file_path).await?;
-        writer
-            .write_all(new_index_details_proto.encode_to_vec().as_slice())
-            .await?;
-        writer.shutdown().await?;
-        let external_file = ExternalFile {
-            path: FRAG_REUSE_DETAILS_FILE_NAME.to_owned(),
-            offset: 0,
-            size: new_index_details_proto.encoded_len() as u64,
-        };
-        FragmentReuseIndexDetails {
-            content: Some(Content::External(external_file)),
-        }
-    } else {
-        FragmentReuseIndexDetails {
-            content: Some(Content::Inline(new_index_details_proto)),
-        }
+    // Keep frag_reuse details inline with the manifest.
+    //
+    // Unlike user-facing scalar/vector index files, frag_reuse is transient
+    // rewrite metadata needed to keep deferred index remapping correct. Storing
+    // it in a separate `details.binpb` sidecar creates a two-phase write where
+    // the manifest can commit successfully while the sidecar is missing, leaving
+    // the latest table version unreadable. Keeping the payload inline makes the
+    // rewrite metadata part of the same atomic manifest commit.
+    let proto = FragmentReuseIndexDetails {
+        content: Some(Content::Inline(InlineContent::from(&new_index_details))),
     };
 
     Ok(IndexMetadata {
@@ -173,4 +159,49 @@ pub(crate) async fn build_frag_reuse_index_metadata(
         created_at: Some(chrono::Utc::now()),
         base_id: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use arrow_array::types::Int32Type;
+    use lance_table::format::pb::fragment_reuse_index_details::Content as PbContent;
+
+    #[tokio::test]
+    async fn test_frag_reuse_large_payload_stays_inline() {
+        let dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(1))
+            .await
+            .unwrap();
+
+        let details = FragReuseIndexDetails {
+            versions: vec![FragReuseVersion {
+                dataset_version: dataset.version().version,
+                groups: vec![FragReuseGroup {
+                    changed_row_addrs: vec![42; 300_000],
+                    old_frags: vec![],
+                    new_frags: vec![],
+                }],
+            }],
+        };
+
+        let index_meta =
+            build_frag_reuse_index_metadata(&dataset, None, details.clone(), RoaringBitmap::new())
+                .await
+                .unwrap();
+        let proto = index_meta
+            .index_details
+            .as_ref()
+            .unwrap()
+            .to_msg::<FragmentReuseIndexDetails>()
+            .unwrap();
+
+        assert!(matches!(proto.content, Some(PbContent::Inline(_))));
+        let loaded = load_frag_reuse_index_details(&dataset, &index_meta)
+            .await
+            .unwrap();
+        assert_eq!(loaded.as_ref(), &details);
+    }
 }
