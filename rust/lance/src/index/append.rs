@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use futures::{FutureExt, TryStreamExt};
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use lance_core::{
     Error, Result,
     utils::mask::{RowAddrTreeMap, RowSetOps},
@@ -22,7 +22,7 @@ use super::DatasetIndexInternalExt;
 use super::vector::ivf::optimize_vector_indices;
 use crate::dataset::Dataset;
 use crate::dataset::index::LanceIndexStoreExt;
-use crate::dataset::rowids::load_row_id_sequences;
+use crate::dataset::rowids::load_row_id_sequence;
 use crate::index::scalar::load_training_data;
 use crate::index::vector_index_details;
 
@@ -39,34 +39,34 @@ async fn build_stable_row_id_filter(
     dataset: &Dataset,
     effective_old_frags: &RoaringBitmap,
 ) -> Result<RowAddrTreeMap> {
-    // For stable row IDs we cannot derive fragment ownership from row_id bits.
-    // Instead, we:
-    // 1) keep only fragments still considered "effective" for the old index, and
-    // 2) load their persisted row-id sequences from dataset metadata, then
-    // 3) build one exact allow-list used to retain only still-valid old rows.
     let retained_frags = dataset
-        .manifest
-        .fragments
-        .iter()
-        .filter(|frag| effective_old_frags.contains(frag.id as u32))
-        .cloned()
+        .get_fragments()
+        .into_iter()
+        .filter(|frag| effective_old_frags.contains(frag.id() as u32))
         .collect::<Vec<_>>();
 
     if retained_frags.is_empty() {
         return Ok(RowAddrTreeMap::new());
     }
 
-    let row_id_sequences = load_row_id_sequences(dataset, &retained_frags)
+    let row_id_maps = futures::stream::iter(retained_frags)
+        .map(|fragment| async move {
+            let row_ids = load_row_id_sequence(dataset, fragment.metadata()).await?;
+            // Row-id sequences include deleted rows. Keeping those would retain the old index
+            // entry for an updated stable row ID while also adding its new entry.
+            if let Some(deletion_vector) = fragment.get_deletion_vector().await? {
+                let mut live_row_ids = row_ids.as_ref().clone();
+                live_row_ids.mask(deletion_vector.to_sorted_iter())?;
+                Ok::<_, Error>(RowAddrTreeMap::from(&live_row_ids))
+            } else {
+                Ok(RowAddrTreeMap::from(row_ids.as_ref()))
+            }
+        })
+        .buffer_unordered(dataset.object_store.io_parallelism())
         .try_collect::<Vec<_>>()
         .await?;
-
-    let row_id_maps = row_id_sequences
-        .iter()
-        .map(|(_, seq)| RowAddrTreeMap::from(seq.as_ref()))
-        .collect::<Vec<_>>();
     let row_id_map_refs = row_id_maps.iter().collect::<Vec<_>>();
 
-    // Merge all fragment-local row-id sets into one exact membership structure.
     Ok(<RowAddrTreeMap as RowSetOps>::union_all(&row_id_map_refs))
 }
 
@@ -772,5 +772,92 @@ mod tests {
 
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
         assert_eq!(query_id_count(&dataset, "song-42").await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_optimize_btree_replaces_updated_stable_row_id() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from_iter_values(
+                    (0..256).map(|i| format!("article-{i}")),
+                )),
+                Arc::new(StringArray::from_iter_values(
+                    (0..256).map(|_| "original"),
+                )),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 64,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".into()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let update = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["article-42"])),
+                Arc::new(StringArray::from(vec!["updated"])),
+            ],
+        )
+        .unwrap();
+        let merge_job =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap();
+        let update_reader = Box::new(RecordBatchIterator::new([Ok(update)], schema));
+        let update_stream = reader_to_stream(update_reader);
+        let (dataset, stats) = merge_job.execute(update_stream).await.unwrap();
+        assert_eq!(stats.num_updated_rows, 1);
+        let mut dataset = Arc::unwrap_or_clone(dataset);
+
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+
+        let result = dataset
+            .scan()
+            .filter("id = 'article-42'")
+            .unwrap()
+            .project(&["id", "value"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 1);
+        assert_eq!(
+            result["value"].as_string::<i32>().value(0),
+            "updated"
+        );
     }
 }
